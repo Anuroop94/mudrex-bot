@@ -94,12 +94,15 @@ def main():
         with open(OFFSET_PATH) as f:
             offset = json.load(f)["offset"]
     log("approver started" + ("" if tg.enabled() else " (Telegram not fully configured: idle)"))
-    warned_watcher = 0
+    warned_watcher, started = 0, time.time()
     while True:
         with open(HEARTBEAT_PATH, "w") as f:
             json.dump({"at": time.time()}, f)
         ws = os.path.join(HERE, "watch_status.json")
-        if os.path.exists(ws):
+        if not os.path.exists(ws) and time.time() - started > 900 and warned_watcher != -1:
+            warned_watcher = -1
+            tg.send("Watcher is not running (no status file): no daily plans or cap alerts will arrive.")
+        elif os.path.exists(ws):
             with open(ws) as f:
                 at = json.load(f).get("at", 0)
             if time.time() - at > 900 and warned_watcher < at:

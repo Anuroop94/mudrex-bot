@@ -1,9 +1,14 @@
 """Local fake Mudrex futures server for integration tests. Never contacts the real API.
 
+Realism: orders are accepted as CREATED (202) and only FILL after `fill_after` detail lookups (async);
+history honours `limit` only (no pagination, like the documented API); a stop is attached with POST only when
+none exists, and amended only with PATCH + its stoploss_order_id; leverage is stored and readable.
+Every request is appended to `requests` as (method, path, client_order_id or None) for ordering assertions.
+
 Fault injection: server.faults[key] = [action, ...] consumed one per matching request, key in
-  "order" (create order), "riskorder", "close", "detail", "positions".
-Actions: "timeout" (hang longer than the client timeout, NOT applied), "apply_timeout" (apply, then hang),
-         "500" (not applied), "apply_500" (applied, then 500), "423" (not applied).
+  "order", "riskorder", "close", "detail", "positions", "leverage_get".
+Actions: "timeout" (hang, NOT applied), "apply_timeout" (apply, then hang), "500" (not applied),
+         "apply_500" (applied, then 500), "423" (not applied).
 """
 import json
 import threading
@@ -18,24 +23,23 @@ HANG = 1.5
 class FakeMudrex:
     def __init__(self, prices=None, balance=5000.0):
         self.prices = dict(prices or {})     # own copy: tests move the "live" price without touching the plan
-        self.specs = {}
-        for c, p in self.prices.items():
-            self.specs[c] = dict(quantity_step="0.1", min_contract="0.1", min_notional_value="5",
-                                 price_step="0.0001", price=str(p))
+        self.specs = {c: dict(quantity_step="0.1", min_contract="0.1", min_notional_value="5", price_step="0.0001")
+                      for c in self.prices}
         self.balance = balance
-        self.positions = []          # open positions (dicts in Mudrex shape)
-        self.closed = []             # positions history
-        self.orders = {}             # client_order_id -> order
-        self.faults = {}
-        self.fill_price = {}         # coin -> forced fill price (gap simulation)
+        self.positions, self.closed, self.orders = [], [], {}
+        self.faults, self.fill_price, self.hooks, self.requests = {}, {}, {}, []
         self.riskorder_ok = True
         self.drop_order_stop = False
+        self.no_liq = False
+        self.fill_after = 1                  # detail lookups before a CREATED order becomes FILLED
+        self.never_fill = False
+        self.leverage_store = {}
+        self.leverage_stuck = None           # if set, POST leverage is ignored and this value is reported
         self.submits = 0
-        self.hooks = {}              # "after_fill" -> fn(order)
         self.lock = threading.Lock()
-        seed = dict(id="seed", client_order_id="manual-1", status="FILLED", symbol="XRPUSDT", hedge_rate="102",
-                    created_at="2026-09-01T00:00:00Z", future_position_uuid="old")
-        self.orders["manual-1"] = seed
+        self.orders["manual-1"] = dict(id="seed", client_order_id="manual-1", status="FILLED", symbol="XRPUSDT",
+                                       hedge_rate="102", created_at=_iso(time.time() - 3600),
+                                       future_position_uuid="old")
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -49,9 +53,11 @@ class FakeMudrex:
     def _position(self, coin, side, qty, px, lev=2, stop=None, manual=False):
         liq = px * (1 - 0.9 / lev) if side == "LONG" else px * (1 + 0.9 / lev)
         return dict(id=("manual-" if manual else "") + str(uuid.uuid4()), symbol=coin + "USDT", order_type=side,
-                    quantity=str(qty), entry_price=str(px), leverage=str(lev), liquidation_price=str(liq),
-                    entry_hedge_rate="102", created_at="2026-09-27T00:00:00Z",
-                    stoploss=dict(price=str(stop) if stop else "0"), status="OPEN")
+                    quantity=str(qty), entry_price=str(px), leverage=str(lev),
+                    liquidation_price="" if self.no_liq else str(liq), entry_hedge_rate="102",
+                    created_at=_iso(time.time()),
+                    stoploss=dict(price=str(stop), order_id=str(uuid.uuid4())) if stop else dict(price="0"),
+                    status="OPEN")
 
     def _fault(self, key):
         with self.lock:
@@ -65,21 +71,31 @@ class FakeMudrex:
             self.submits += 1
             if cid in self.orders:
                 return 409, {"success": False, "errors": [{"code": 409, "text": "client order id already exists"}]}
-            coin = symbol.removesuffix("USDT")
-            px = self.fill_price.get(coin, self.prices[coin])
-            qty = float(body["quantity"])
-            stop = float(body["stoploss_price"]) if body.get("is_stoploss") else None
-            if stop is not None and (stop >= px or self.drop_order_stop):
-                stop = None                   # invalid stop not kept / simulated: exchange dropped the stop
-            pos = self._position(coin, "LONG", qty, px, stop=stop)
-            self.positions.append(pos)
             oid = str(uuid.uuid4())
-            self.orders[cid] = dict(id=oid, client_order_id=cid, status="FILLED", symbol=symbol, hedge_rate="102",
-                                    filled_price=str(px), filled_quantity=str(qty), future_position_uuid=pos["id"],
-                                    created_at="2026-09-27T00:00:00Z")
-        if "after_fill" in self.hooks:
-            self.hooks["after_fill"](self.orders[cid])
+            self.orders[cid] = dict(id=oid, client_order_id=cid, status="CREATED", symbol=symbol, hedge_rate="102",
+                                    quantity=body["quantity"], created_at=_iso(time.time()), _body=body, _polls=0)
         return 202, {"success": True, "data": {"order_id": oid, "status": "CREATED", "client_order_id": cid}}
+
+    def _maybe_fill(self, o):
+        if o.get("status") != "CREATED" or self.never_fill:
+            return
+        o["_polls"] += 1
+        if o["_polls"] < self.fill_after:
+            return
+        body, coin = o["_body"], o["symbol"].removesuffix("USDT")
+        px = self.fill_price.get(coin, self.prices[coin])
+        stop = float(body["stoploss_price"]) if body.get("is_stoploss") else None
+        if stop is not None and (stop >= px or self.drop_order_stop):
+            stop = None
+        pos = self._position(coin, "LONG", float(body["quantity"]), px, stop=stop)
+        self.positions.append(pos)
+        o.update(status="FILLED", filled_price=str(px), filled_quantity=body["quantity"],
+                 future_position_uuid=pos["id"])
+        if "after_fill" in self.hooks:
+            self.hooks["after_fill"](o)
+
+    def public(self, o):
+        return {k: v for k, v in o.items() if not k.startswith("_")}
 
     def _handler(self):
         fake = self
@@ -116,41 +132,59 @@ class FakeMudrex:
                     return self._send(500, {"success": False, "errors": [{"text": "internal"}]})
                 return self._send(code, obj)
 
-            def do_GET(self):
+            def _parts(self):
                 u = urlparse(self.path)
-                q = {k: v[0] for k, v in parse_qs(u.query, keep_blank_values=True).items()}
-                p = u.path
+                return u.path, {k: v[0] for k, v in parse_qs(u.query, keep_blank_values=True).items()}
+
+            def _body(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                return json.loads(self.rfile.read(n) or b"{}")
+
+            def do_GET(self):
+                p, q = self._parts()
+                fake.requests.append(("GET", p, q.get("client_order_id")))
+                ok = lambda d: (200, {"success": True, "data": d})     # noqa: E731
                 if p.endswith("/futures/funds"):
-                    return self._send(200, {"success": True, "data": {"balance": str(fake.balance),
-                                                                       "locked_amount": "0"}})
+                    return self._send(*ok({"balance": str(fake.balance), "locked_amount": "0"}))
                 if p.endswith("/futures/positions"):
-                    return self._apply("positions", lambda: (200, {"success": True, "data": fake.positions}))
+                    return self._apply("positions", lambda: ok(fake.positions))
                 if p.endswith("/futures/orders/detail"):
                     def detail():
                         o = fake.orders.get(q.get("client_order_id"))
-                        return (200, {"success": True, "data": o}) if o else \
-                            (404, {"success": False, "errors": [{"text": "order not found"}]})
+                        if not o:
+                            return 404, {"success": False, "errors": [{"text": "order not found"}]}
+                        fake._maybe_fill(o)
+                        return ok(fake.public(o))
                     return self._apply("detail", detail)
+                limit = int(q.get("limit", 20))
                 if p.endswith("/futures/orders/history"):
-                    return self._send(200, {"success": True, "data": list(fake.orders.values())})
+                    rows = sorted(fake.orders.values(), key=lambda o: o["created_at"], reverse=True)[:limit]
+                    return self._send(*ok([fake.public(o) for o in rows]))
                 if p.endswith("/futures/positions/history"):
-                    return self._send(200, {"success": True, "data": fake.closed})
-                sym = p.rsplit("/", 1)[-1]
-                coin = sym.removesuffix("USDT")
+                    return self._send(*ok(list(reversed(fake.closed))[:limit]))
+                if p.endswith("/leverage"):
+                    sym = p.split("/")[-2]
+
+                    def lev():
+                        v = fake.leverage_stuck if fake.leverage_stuck is not None else fake.leverage_store.get(sym)
+                        return (404, {"success": False, "errors": [{"text": "leverage not found"}]}) if v is None \
+                            else ok({"margin_type": "ISOLATED", "leverage": str(v)})
+                    return self._apply("leverage_get", lev)
+                coin = p.rsplit("/", 1)[-1].removesuffix("USDT")
                 if coin in fake.specs:
-                    return self._send(200, {"success": True, "data": dict(fake.specs[coin],
-                                                                           price=str(fake.prices[coin]))})
+                    return self._send(*ok(dict(fake.specs[coin], price=str(fake.prices[coin]))))
                 return self._send(404, {"success": False, "errors": [{"text": "not found"}]})
 
             def do_POST(self):
-                u = urlparse(self.path)
-                q = {k: v[0] for k, v in parse_qs(u.query, keep_blank_values=True).items()}
-                n = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(n) or b"{}")
-                p = u.path
+                p, q = self._parts()
+                body = self._body()
+                fake.requests.append(("POST", p, body.get("client_order_id")))
                 if p.endswith("/futures/order"):
                     return self._apply("order", lambda: fake.create_order(q["symbol"], body))
                 if p.endswith("/leverage"):
+                    fake.leverage_store[p.split("/")[-2]] = body.get("leverage")
+                    if "on_leverage" in fake.hooks:
+                        fake.hooks["on_leverage"]()
                     return self._send(200, {"success": True, "data": {"leverage": body.get("leverage")}})
                 if p.endswith("/riskorder"):
                     pid = p.split("/")[-2]
@@ -159,9 +193,11 @@ class FakeMudrex:
                         pos = next((x for x in fake.positions if x["id"] == pid), None)
                         if pos is None:
                             return 404, {"success": False, "errors": [{"text": "Position not found"}]}
-                        if not fake.riskorder_ok or float(body["stoploss_price"]) <= float(pos["liquidation_price"]):
+                        if float(pos["stoploss"].get("price") or 0) > 0:
+                            return 400, {"success": False, "errors": [{"text": "stop-loss already exists"}]}
+                        if not fake.riskorder_ok or float(body["stoploss_price"]) <= float(pos["liquidation_price"] or 0):
                             return 400, {"success": False, "errors": [{"text": "invalid stop"}]}
-                        pos["stoploss"] = dict(price=body["stoploss_price"])
+                        pos["stoploss"] = dict(price=body["stoploss_price"], order_id=str(uuid.uuid4()))
                         return 200, {"success": True, "data": {"position_id": pid, "status": "CREATED"}}
                     return self._apply("riskorder", risk)
                 if p.endswith("/close"):
@@ -172,8 +208,34 @@ class FakeMudrex:
                         if pos is None:
                             return 404, {"success": False, "errors": [{"text": "Position not found"}]}
                         fake.positions.remove(pos)
-                        fake.closed.append(dict(pos, pnl="0", closed_price=pos["entry_price"]))
+                        fake.closed.append(dict(id=pos["id"], symbol=pos["symbol"], position_type="LONG",
+                                                status="CLOSED", entry_price=pos["entry_price"],
+                                                closed_price=pos["entry_price"], quantity=pos["quantity"], pnl="0"))
                         return 200, {"success": True, "data": {"position_id": pid, "status": "CREATED"}}
                     return self._apply("close", close)
                 return self._send(404, {"success": False})
+
+            def do_PATCH(self):
+                p, _ = self._parts()
+                body = self._body()
+                fake.requests.append(("PATCH", p, None))
+                if p.endswith("/riskorder"):
+                    pid = p.split("/")[-2]
+
+                    def amend():
+                        pos = next((x for x in fake.positions if x["id"] == pid), None)
+                        if pos is None:
+                            return 404, {"success": False, "errors": [{"text": "Position not found"}]}
+                        if body.get("stoploss_order_id") != pos["stoploss"].get("order_id"):
+                            return 400, {"success": False, "errors": [{"text": "risk order id missing"}]}
+                        if not fake.riskorder_ok or float(body["stoploss_price"]) <= float(pos["liquidation_price"] or 0):
+                            return 400, {"success": False, "errors": [{"text": "invalid stop"}]}
+                        pos["stoploss"]["price"] = body["stoploss_price"]
+                        return 200, {"success": True, "data": {"message": "Risk order amended successfully"}}
+                    return self._apply("riskorder", amend)
+                return self._send(404, {"success": False})
         return H
+
+
+def _iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))

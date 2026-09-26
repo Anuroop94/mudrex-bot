@@ -120,12 +120,21 @@ def test_timeout_after_exchange_accepted():
     fake.stop()
 
 
-def test_423_then_success():
+def test_423_then_success_looks_up_before_resubmit():
     tmp, fake, client, con = setup()
     fake.faults["order"] = ["423", "423"]
+    slept = []
     pid = plan(con, ["XRP"])
-    final, _ = ex.execute(con, client, pid, "test", NOSLEEP)
+    final, _ = ex.execute(con, client, pid, "test", slept.append)
     assert final == "COMPLETE" and len(fake.positions) == 1, states(con, pid)
+    cid = con.execute("SELECT client_order_id FROM orders WHERE plan_id=?", (pid,)).fetchone()[0]
+    seq = [(m, p.rsplit("/", 1)[-1]) for m, p, c in fake.requests
+           if (m == "POST" and p.endswith("/futures/order")) or (p.endswith("/orders/detail") and c == cid)]
+    posts = [i for i, (m, _) in enumerate(seq) if m == "POST"]
+    assert len(posts) == 3                                         # 423, 423, accepted
+    for a, b in zip(posts, posts[1:]):
+        assert any(seq[i][0] == "GET" for i in range(a + 1, b)), seq   # lookup between every resubmission
+    assert slept and max(slept) <= 8                                # bounded backoff happened
     fake.stop()
 
 
@@ -236,6 +245,102 @@ def test_wallet_larger_than_allocation_is_capped():
     pos = fake.positions[0]
     notional_inr = float(pos["quantity"]) * float(pos["entry_price"]) * 102
     assert notional_inr <= s1.LEV * s1.CAPITAL_CAP_INR + 1
+    fake.stop()
+
+
+def test_unknown_fill_halts_later_entries():
+    tmp, fake, client, con = setup()
+    fake.never_fill = True                                   # accepted (202) but never reaches a terminal status
+    alerts = []
+    pid = plan(con, ["XRP", "ADA"])
+    final, _ = ex.execute(con, client, pid, "t", NOSLEEP, alerts.append)
+    st = states(con, pid)
+    assert st["XRP"][0] == "RECONCILE_REQUIRED" and "halted" in st["ADA"][1] and fake.submits == 1
+    assert final == "RECONCILE_REQUIRED"
+    fake.stop()
+
+
+def test_exchange_errors_after_fill_halt_and_alert():
+    tmp, fake, client, con = setup()
+    fake.hooks["after_fill"] = lambda o: fake.faults.__setitem__("positions", ["500"] * 50)
+    alerts = []
+    pid = plan(con, ["XRP", "ADA"])
+    final, _ = ex.execute(con, client, pid, "t", NOSLEEP, alerts.append)
+    st = states(con, pid)
+    assert st["XRP"][0] == "RECONCILE_REQUIRED" and "halted" in st["ADA"][1] and fake.submits == 1
+    assert final == "RECONCILE_REQUIRED" and any("reconcile" in a for a in alerts)
+    fake.stop()
+
+
+def test_wrong_existing_stop_is_amended_with_patch():
+    tmp, fake, client, con = setup()
+    fake.fill_price["XRP"] = 1.5 * 0.97                      # order's own stop is now off-target for the fill
+    pid = plan(con, ["XRP"])
+    assert ex.execute(con, client, pid, "t", NOSLEEP)[0] == "COMPLETE"
+    assert any(m == "PATCH" for m, p, c in fake.requests)
+    assert not any(m == "POST" and p.endswith("/riskorder") for m, p, c in fake.requests)
+    fake.stop()
+
+
+def test_wrong_existing_stop_and_failed_amend_halts():
+    tmp, fake, client, con = setup()
+    fake.fill_price["XRP"] = 1.5 * 0.97
+    fake.riskorder_ok = False
+    alerts = []
+    pid = plan(con, ["XRP", "ADA"])
+    ex.execute(con, client, pid, "t", NOSLEEP, alerts.append)
+    st = states(con, pid)
+    assert st["XRP"][0] == "FAILED" and "not verified" in st["XRP"][1] and "halted" in st["ADA"][1]
+    assert fake.submits == 1 and any("UNPROTECTED" in a for a in alerts)
+    fake.stop()
+
+
+def test_leverage_not_verified_refuses_entry():
+    tmp, fake, client, con = setup()
+    fake.leverage_stuck = 5
+    pid = plan(con, ["XRP"])
+    ex.execute(con, client, pid, "t", NOSLEEP)
+    assert "leverage not verified" in states(con, pid)["XRP"][1] and fake.submits == 0
+    fake.stop()
+
+
+def test_stop_arriving_right_before_order_post():
+    tmp, fake, client, con = setup()
+    fake.hooks["on_leverage"] = lambda: open(ex.STOP_PATH, "w").close()
+    pid = plan(con, ["XRP"])
+    ex.execute(con, client, pid, "t", NOSLEEP)
+    assert "STOP" in states(con, pid)["XRP"][1] and fake.submits == 0
+    fake.stop()
+
+
+def test_missing_liquidation_price_fails_closed():
+    tmp, fake, client, con = setup()
+    fake.no_liq = True
+    alerts = []
+    pid = plan(con, ["XRP", "ADA"])
+    ex.execute(con, client, pid, "t", NOSLEEP, alerts.append)
+    st = states(con, pid)
+    assert st["XRP"][0] == "RECONCILE_REQUIRED" and "halted" in st["ADA"][1]
+    assert any("liquidation" in a for a in alerts)
+    fake.stop()
+
+
+def test_unconfirmed_bot_pnl_blocks_entries():
+    tmp, fake, client, con = setup()
+    con.execute("INSERT INTO owned(position_id, coin, client_order_id, opened_at, closed_at) VALUES('gone','XRP','s1-x',1,2)")
+    pid = plan(con, ["ADA"])
+    ex.execute(con, client, pid, "t", NOSLEEP)
+    assert "P&L unconfirmed" in states(con, pid)["ADA"][1] and fake.submits == 0
+    fake.stop()
+
+
+def test_daily_cap_counts_losses_realized_before_restart():
+    tmp, fake, client, con = setup()
+    con.execute("INSERT INTO owned(position_id, coin, client_order_id, opened_at, closed_at, realized_pnl) "
+                "VALUES('p1','XRP','s1-x',?,?,-300)", (int(time.time()) - 60, int(time.time()) - 30))
+    pid = plan(con, ["ADA"])                                  # fresh process/day: no ledger row yet
+    ex.execute(con, client, pid, "t", NOSLEEP)
+    assert "loss cap" in states(con, pid)["ADA"][1] and fake.submits == 0   # -300 today > 5% of 5000
     fake.stop()
 
 

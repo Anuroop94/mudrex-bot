@@ -99,16 +99,21 @@ def plan(client=None, con=None):
     ctx = pf.prepare(uni, pf.zarattini, **s1.SIGNAL_KW)
     _, atrs = pf.trade_lookups(uni)
     btc = [x for x in data.load(2400, "BTC/USDT", "1d", DAY) if x[0] <= last_closed]
-    bot_eq = ex.bot_equity(con, client, positions, rate or config.INR_PER_USDT)
-    caps = ex.caps_state(con, bot_eq)
+    pnl_unknown = None
+    try:
+        bot_eq = ex.bot_equity(con, client, positions, rate or config.INR_PER_USDT)
+    except ex.PnlUnknown as e:
+        bot_eq, pnl_unknown = float(s1.CAPITAL_CAP_INR), str(e)
+    caps = ex.caps_state(con, bot_eq, ex.unrealized_inr(con, positions, rate or config.INR_PER_USDT))
     targets = s1.targets(ctx, closes, last_closed, bot_eq, specs, btc)
     for c in s1.BASKET:
         if targets.get(c, 0) <= 0:
             st["armed"][c] = True
     blocked = ("STOP file present" if os.path.exists(ex.STOP_PATH) else
                "performance guard tripped" if ex.guard_tripped() else
+               f"bot P&L unconfirmed ({pnl_unknown})" if pnl_unknown else
                f"daily {caps['hit']} cap hit" if caps["hit"] else
-               "no current INR hedge rate from Mudrex" if not rate else None)
+               "no recent INR hedge rate from Mudrex" if not rate else None)
     orders = build_orders(targets, owned, manual, {c: closes[c][last_closed] for c in s1.BASKET},
                           {c: atrs[c][last_closed] for c in s1.BASKET}, specs, bot_eq, st["armed"], blocked,
                           rate or config.INR_PER_USDT)

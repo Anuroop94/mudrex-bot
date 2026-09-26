@@ -104,24 +104,23 @@ class Client:
                 return None
             raise
 
-    def history(self, kind, max_pages=50):
-        """All INR 'orders' or 'positions' history, paginated with the epoch-ms created_at cursor."""
-        rows, offset, seen = [], None, set()
-        for _ in range(max_pages):
-            params = {"trade_currency": "INR", "limit": 100}
-            if offset is not None:
-                params["offset"] = offset
-            page = self.get(f"/v1/futures/{kind}/history", params) or []
-            fresh = [r for r in page if r["id"] not in seen]
-            if not fresh:
-                break
-            rows += fresh
-            seen.update(r["id"] for r in fresh)
-            if len(page) < 100:
-                break
-            oldest = min(r["created_at"] for r in fresh)
-            offset = _epoch_ms(oldest)
-        return rows
+    HISTORY_LIMIT = 500
+
+    def history(self, kind):
+        """INR 'orders' or 'positions' history. Mudrex documents only `limit` (no cursor/offset), so this returns
+        (rows, truncated). truncated=True means older rows may be missing: callers must not treat absence as fact."""
+        rows = self.get(f"/v1/futures/{kind}/history", {"trade_currency": "INR", "limit": self.HISTORY_LIMIT}) or []
+        return rows, len(rows) >= self.HISTORY_LIMIT
+
+    def leverage(self, symbol):
+        """Saved (leverage, margin_type) for symbol in INR, or None if not configured (404)."""
+        try:
+            d = self.get(f"/v1/futures/{symbol}/leverage", {"is_symbol": "", "trade_currency": "INR"})
+        except Rejected as e:
+            if e.status == 404:
+                return None
+            raise
+        return float(d["leverage"]), d.get("margin_type")
 
     # ---------- writes (never auto-retried)
     def set_leverage(self, symbol, lev):
@@ -139,11 +138,12 @@ class Client:
         return self.post(f"/v1/futures/positions/{position_id}/close", {})
 
     def set_stoploss(self, position_id, price, sl_cid):
+        """Attach a stop to a position that has none (POST)."""
         return self.post(f"/v1/futures/positions/{position_id}/riskorder",
                          {"is_stoploss": True, "stoploss_price": price, "order_source": "API",
                           "stoploss_client_order_id": sl_cid})
 
-
-def _epoch_ms(iso):
-    from datetime import datetime
-    return int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp() * 1000)
+    def edit_stoploss(self, position_id, sl_order_id, price):
+        """Amend an existing stop (PATCH, requires the stop's own order id)."""
+        return self._raw("PATCH", f"/v1/futures/positions/{position_id}/riskorder",
+                         body={"is_stoploss": True, "stoploss_price": price, "stoploss_order_id": sl_order_id})

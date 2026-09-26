@@ -47,10 +47,11 @@ def log(msg):
 
 
 def notify(msg, buttons=None):
-    """Telegram (if configured) + Windows balloon + log."""
+    """Telegram (if configured) + Windows balloon + log. Returns False only if Telegram is configured and the
+    message could not be delivered (callers that must be sure, like the daily plan, retry on False)."""
     log(f"NOTIFY {msg}")
     import telegram_bot
-    telegram_bot.send(msg, buttons)
+    delivered = (not telegram_bot.enabled()) or telegram_bot.send(msg, buttons) is not None
     safe = msg.replace("'", "").replace('"', "")[:240]
     ps = ("Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; "
           "$n=New-Object System.Windows.Forms.NotifyIcon; $n.Icon=[System.Drawing.SystemIcons]::Information; "
@@ -61,6 +62,9 @@ def notify(msg, buttons=None):
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except OSError:
         pass
+    if not delivered:
+        log("Telegram delivery FAILED for the message above")
+    return delivered
 
 
 def load(path, default):
@@ -87,19 +91,27 @@ def maybe_plan(st, make_plan, now_hm=None, today=None):
     if time.time() < st.get("plan_retry_at", 0):
         return False
     try:
-        p = make_plan()
-        todo = [o for o in p["orders"] if o["action"] in ("OPEN", "CLOSE")]
+        pend = st.get("pending_plan")
+        if pend and pend.get("_day") == today and time.time() - pend.get("created_at", 0) < 3600:
+            p = pend                                  # delivery retry: resend the SAME plan, never make a new one
+        else:
+            p = dict(make_plan(), _day=today)
+            st["pending_plan"] = p
+        todo =[o for o in p["orders"] if o["action"] in ("OPEN", "CLOSE")]
         if todo and p.get("plan_id") and p.get("live_enabled"):
             lines = [f"{o['action']} {o['coin']}" + (f" ~Rs {o['notional_inr']:,.0f}" if o["action"] == "OPEN" else "")
                      for o in todo]
-            notify(f"S1 plan {p['plan_id']}: {len(todo)} order(s) (expires in 3h; stops re-anchored to fills):\n"
-                   + "\n".join(lines),
-                   buttons=[[("Approve", f"approve:{p['plan_id']}"), ("Reject", f"reject:{p['plan_id']}")]])
+            sent = notify(f"S1 plan {p['plan_id']}: {len(todo)} order(s) (expires in 3h; stops re-anchored to fills):\n"
+                          + "\n".join(lines),
+                          buttons=[[("Approve", f"approve:{p['plan_id']}"), ("Reject", f"reject:{p['plan_id']}")]])
         elif todo:
-            notify(f"S1 plan {p['plan_id']}: {len(todo)} order(s), but LIVE_TRADING_ENABLED is false (not placeable).")
+            sent = notify(f"S1 plan {p['plan_id']}: {len(todo)} order(s), but LIVE_TRADING_ENABLED is false.")
         else:
-            notify("S1: no orders today." + (f" New entries blocked: {p['blocked']}." if p.get("blocked") else ""))
-        st["plan_day"], st["plan_fails"], st["plan_retry_at"] = today, 0, 0     # only after generation + send
+            sent = notify("S1: no orders today." + (f" New entries blocked: {p['blocked']}." if p.get("blocked") else ""))
+        if not sent:
+            raise ConnectionError("Telegram delivery failed")                 # retry later; plan_day not saved
+        st["plan_day"], st["plan_fails"], st["plan_retry_at"] = today, 0, 0     # only after generation + delivery
+        st.pop("pending_plan", None)
         return True
     except Exception as e:
         st["plan_fails"] = st.get("plan_fails", 0) + 1
@@ -113,20 +125,21 @@ def maybe_plan(st, make_plan, now_hm=None, today=None):
 # ---------- journal + guard (bot positions only)
 
 def journal_and_guard(st, con, client, bot_open_upnl):
-    hist = {p["id"]: p for p in client.history("positions")}
+    # closed bot positions with confirmed P&L come from the local ledger (execution.sync_owned); timestamps are
+    # our own observation times, because Mudrex position history has no documented timestamps
+    hist = {p["id"]: p for p in client.history("positions")[0]}
     done = set(st.setdefault("journaled", []))
     rows = []
-    for r in con.execute("SELECT position_id, coin FROM owned").fetchall():
-        p = hist.get(r["position_id"])
-        if not p or p["id"] in done:
+    for r in con.execute("SELECT * FROM owned WHERE closed_at IS NOT NULL AND realized_pnl IS NOT NULL").fetchall():
+        if r["position_id"] in done:
             continue
-        ts = lambda s: int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())  # noqa: E731
-        o, c, pnl = ts(p["created_at"]), ts(p["updated_at"]), float(p.get("pnl") or 0)
+        p = hist.get(r["position_id"], {})
+        o, c, pnl = r["opened_at"] or r["closed_at"], r["closed_at"], float(r["realized_pnl"])
         rows.append(dict(coin=r["coin"], opened=time.strftime("%Y-%m-%d", time.gmtime(o)),
                          closed=time.strftime("%Y-%m-%d", time.gmtime(c)), days=round((c - o) / DAY, 1),
-                         entry=p.get("entry_price"), exit=p.get("closed_price"), pnl_inr=round(pnl, 2),
+                         entry=p.get("entry_price", ""), exit=p.get("closed_price", ""), pnl_inr=round(pnl, 2),
                          outcome="win" if pnl > 0 else "loss", btc_mood="", signal=""))
-        done.add(p["id"])
+        done.add(r["position_id"])
     if rows:
         new_file = not os.path.exists(JOURNAL_PATH)
         with open(JOURNAL_PATH, "a", newline="") as f:
@@ -161,6 +174,32 @@ def journal_and_guard(st, con, client, bot_open_upnl):
     return guard
 
 
+STARTED = time.time()
+
+
+def check_approver(st, now=None):
+    """Alert once if the Telegram approver is expected (Telegram configured) but its heartbeat is stale, or
+    missing after a startup grace period. Returns the alert text or None."""
+    import telegram_bot
+    if not telegram_bot.enabled():
+        return None
+    now = now or time.time()
+    hb = load(APPROVER_HEARTBEAT, None)
+    if hb is None:
+        if now - STARTED > STALE_SEC and not st.get("approver_missing_warned"):
+            st["approver_missing_warned"] = True
+            msg = "Telegram approver is not running (no heartbeat). Approve buttons will not work until it starts."
+            notify(msg)
+            return msg
+        return None
+    if now - hb["at"] > STALE_SEC and st.get("approver_stale_warned", 0) < hb["at"]:
+        st["approver_stale_warned"] = hb["at"]
+        msg = "Telegram approver looks stopped (no heartbeat for 15 min). Approvals will not work until it restarts."
+        notify(msg)
+        return msg
+    return None
+
+
 # ---------- one check
 
 def check(st, client=None, con=None, make_plan=None):
@@ -178,8 +217,17 @@ def check(st, client=None, con=None, make_plan=None):
         view.append(dict(id=p["id"], symbol=p["symbol"], side=p["order_type"], qty=float(p["quantity"]),
                          entry=float(p["entry_price"]), price=px, upnl_inr=round(u, 2), bot=p["id"] in owned,
                          sl=float((p.get("stoploss") or {}).get("price") or 0) or None))
-    bot_eq = ex.bot_equity(con, client, positions, rate)
-    caps = ex.caps_state(con, bot_eq)
+    pnl_unknown = None
+    try:
+        bot_eq = ex.bot_equity(con, client, positions, rate)
+    except ex.PnlUnknown as e:
+        pnl_unknown = str(e)
+        bot_eq = s1.CAPITAL_CAP_INR + ex.unrealized_inr(con, positions, rate) + con.execute(
+            "SELECT COALESCE(SUM(realized_pnl), 0) FROM owned WHERE realized_pnl IS NOT NULL").fetchone()[0]
+        if st.get("pnl_unknown_warned") != ist_str("%Y-%m-%d"):
+            st["pnl_unknown_warned"] = ist_str("%Y-%m-%d")
+            notify(f"Bot P&L not confirmed yet ({pnl_unknown}): new entries are blocked until Mudrex shows it.")
+    caps = ex.caps_state(con, bot_eq, ex.unrealized_inr(con, positions, rate))
 
     for v in view:
         coin = v["symbol"].removesuffix("USDT")
@@ -212,11 +260,9 @@ def check(st, client=None, con=None, make_plan=None):
         make_plan = lambda: live_trader.plan(client, con)   # noqa: E731
     maybe_plan(st, make_plan)
 
-    hb = load(APPROVER_HEARTBEAT, None)
-    if hb and time.time() - hb["at"] > STALE_SEC and st.get("approver_stale_warned", 0) < hb["at"]:
-        st["approver_stale_warned"] = hb["at"]
-        notify("Telegram approver looks stopped (no heartbeat for 15 min). Approvals will not work until it restarts.")
+    check_approver(st)
     save(STATUS_PATH, dict(at=time.time(), ok=True, positions=view, guard=guard, check_every_sec=CHECK_SEC,
+                           pnl_unknown=pnl_unknown,
                            bot=dict(equity=round(bot_eq, 2), day=caps["day"], day_start=round(caps["start"], 2),
                                     day_pnl=round(caps["pnl"], 2), cap=round(caps["cap"], 2), cap_hit=caps["hit"]),
                            live_enabled=ex.live_enabled(), stop=os.path.exists(ex.STOP_PATH)))

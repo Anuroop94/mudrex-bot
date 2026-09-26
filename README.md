@@ -56,6 +56,17 @@ short) on an S1 coin, the bot refuses to trade that coin and alerts you. Manual 
 | `MudrexWatcher` | at logon, 24/7: alerts, caps, guard, daily plan | No (only reads; records plans for approval) |
 | `MudrexApprover` | at logon, 24/7 (only if you enable it) | Only on YOUR Telegram Approve tap |
 
+## Known limits (documented, fail-closed where possible)
+- **INR rate**: Mudrex has no documented quote endpoint. The bot uses the most recent rate Mudrex itself applied
+  (open position or INR order, max 7 days old), sizes with 3% headroom, and alerts if an order's applied rate
+  differs by more than 3%. No recent rate -> no entries.
+- **History**: order/position history supports only `limit` (no pagination). The local `owned` table (written on
+  every verified fill) is authoritative; if a closed bot position's P&L is not visible, new entries are blocked.
+- **Daily cap baseline**: allocation + P&L realized before IST midnight + unrealized at the first check of the day.
+  Unrealized moves between midnight and that first check are not counted.
+- **Stops**: entries carry an initial stop; after the fill the stop is moved (PATCH) to fill - 3xATR within a small
+  tolerance and verified. Liquidation price must be known, otherwise the plan halts for reconciliation.
+
 ## Tests
 `python test_core.py` (strategy, backtest, paper parity, planning, Telegram auth) and
 `python test_execution.py` (fake Mudrex server: races, crashes, timeouts, 423/500, manual positions, STOP midway,

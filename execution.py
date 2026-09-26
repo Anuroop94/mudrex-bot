@@ -1,32 +1,41 @@
 """Durable, restart-safe execution for S1 live orders (SQLite journal). REAL MONEY path.
 
 Plan states : PLANNED -> APPROVED -> EXECUTING -> COMPLETE | PARTIAL | FAILED | RECONCILE_REQUIRED
-Order states: PLANNED -> SUBMITTED -> ACCEPTED -> FILLED -> VERIFIED   (or FAILED)
+Order states: PLANNED -> SUBMITTED -> ACCEPTED -> FILLED -> VERIFIED   (or FAILED / RECONCILE_REQUIRED)
 Rules:
   - Exactly one approver wins: claim() takes an exclusive SQLite write lock (BEGIN IMMEDIATE).
   - Every order has a unique client_order_id, written to the journal BEFORE the request is sent.
   - A timeout / transport error / 5xx is UNKNOWN, not failed: look the order up by client_order_id and poll.
-    An order that cannot be confirmed either way becomes RECONCILE_REQUIRED and is NEVER resubmitted blindly.
+    An order that cannot be confirmed becomes RECONCILE_REQUIRED and is NEVER resubmitted blindly.
+    ANY entry that is not definitively VERIFIED or definitively never-sent HALTS all further entries in the plan.
   - 423/429: bounded backoff; look up by client_order_id before any resubmission.
-  - Ownership = Mudrex position UUID recorded from our own filled orders. Never inferred from symbol/direction.
+  - Ownership = Mudrex position UUID recorded from our own fills (local `owned` table is authoritative).
     A basket symbol with any position we do not own (manual long or short) is refused and alerted.
-  - Before the plan and before EVERY order: STOP file, LIVE_TRADING_ENABLED, positions/ownership, free margin,
-    bot caps, guard, asset spec, live price (drift check) and the current INR hedge rate are re-read.
-  - Stops are fill-aware: stop = actual fill - SL_ATR*ATR, validated fill > stop > liquidation, then verified on
-    the exchange. If a stop cannot be verified, no further entries are made and you are alerted.
-  - Daily caps are bot-only: 5% of the bot's day-start equity (Rs 5,000 allocation + bot realized/unrealized
-    P&L). Deposits, withdrawals and manual positions do not count. Caps BLOCK NEW ENTRIES; they never close
-    positions automatically (closing needs a human-approved plan).
+  - STOP and LIVE_TRADING_ENABLED are re-checked immediately before EVERY order-changing request (leverage,
+    entry, close). Protective stop-loss attach/edit is never blocked by STOP.
+  - Before each entry: positions/ownership, free margin, bot caps, guard, asset spec, live price (drift),
+    leverage read back = exactly LEV isolated, and a recent Mudrex hedge rate (sized with a safety buffer).
+  - Stops are fill-aware: target = actual fill - SL_ATR*ATR; VERIFIED only if the exchange stop is within
+    tolerance of the target and fill > stop > liquidation (liquidation must be known). Missing stop -> POST,
+    wrong stop -> PATCH with its stoploss_order_id. Any failure -> alert + halt entries.
+  - Daily caps are bot-only: 5% of the bot's day-start equity (Rs 5,000 allocation + bot realized P&L from the
+    local ledger + bot unrealized). Deposits, withdrawals, manual positions excluded. If bot P&L cannot be
+    confirmed (closed position missing from truncated history), entries are blocked (fail closed).
+    Caps BLOCK NEW ENTRIES only; closing needs a human-approved plan (the watcher offers "Close all").
+  - Hedge rate: Mudrex exposes no quote endpoint, so the most recent rate Mudrex itself applied (open position
+    or INR order) is used; entries are sized with HEDGE_BUFFER headroom and the order's actual hedge_rate is
+    checked after the fill.
 """
 import json
 import math
 import os
 import sqlite3
 import time
+from datetime import datetime
 
 import config
 import s1
-from mudrex_client import Ambiguous, Locked, Rejected
+from mudrex_client import Ambiguous, ApiError, Locked, Rejected
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(HERE, "execution.db")
@@ -34,10 +43,15 @@ STOP_PATH = os.path.join(HERE, "STOP")
 GUARD_PATH = os.path.join(HERE, "guard.json")
 PLAN_MAX_AGE = 3 * 3600
 MAX_DRIFT = 0.02            # refuse an entry if the live price moved >2% from the planned price
+HEDGE_BUFFER = 1.03         # size as if INR were 3% weaker than the last applied rate
+HEDGE_MAX_AGE = 7 * 86400
 POLL_TRIES, LOOKUP_TRIES = 10, 6
 TERMINAL_OK = {"FILLED"}
 TERMINAL_BAD = {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED", "FAILED"}
-FINAL_PLAN = {"COMPLETE", "PARTIAL", "FAILED", "RECONCILE_REQUIRED"}
+
+
+class Halt(Exception):
+    """STOP or live flag changed right before an order-changing request."""
 
 
 def live_enabled():
@@ -58,10 +72,12 @@ def db(path=None):
         atr REAL, qty TEXT, exchange_order_id TEXT, fill_price REAL, filled_qty REAL, stop_price TEXT,
         error TEXT, updated_at INTEGER);
     CREATE TABLE IF NOT EXISTS owned(position_id TEXT PRIMARY KEY, coin TEXT, client_order_id TEXT,
-        opened_at INTEGER, closed_at INTEGER);
+        opened_at INTEGER, closed_at INTEGER, realized_pnl REAL);
     CREATE TABLE IF NOT EXISTS ledger(day TEXT PRIMARY KEY, start_equity REAL);
     CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, at INTEGER, kind TEXT, msg TEXT);
     """)
+    if "realized_pnl" not in {r["name"] for r in con.execute("PRAGMA table_info(owned)")}:
+        con.execute("ALTER TABLE owned ADD COLUMN realized_pnl REAL")
     return con
 
 
@@ -74,6 +90,10 @@ def event(con, kind, msg, alert=None):
 def set_order(con, oid, **kw):
     kw["updated_at"] = int(time.time())
     con.execute(f"UPDATE orders SET {', '.join(k + '=?' for k in kw)} WHERE id=?", (*kw.values(), oid))
+
+
+def order_row(con, oid):
+    return con.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
 
 
 def record_plan(con, decision_day, orders, payload):
@@ -120,7 +140,7 @@ def latest_plan(con):
     return con.execute("SELECT * FROM plans ORDER BY id DESC LIMIT 1").fetchone()
 
 
-# ---------- live account snapshot
+# ---------- account state
 
 def floor_to(x, step):
     return math.floor(x / step + 1e-9) * step
@@ -132,16 +152,28 @@ def fmt_step(x, step):
     return str((decimal.Decimal(str(x)) / q).to_integral_value(rounding=decimal.ROUND_FLOOR) * q)
 
 
+def _ts(s):
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
 def hedge_rate(client, positions):
-    """Current INR per USDT from Mudrex itself (open positions or most recent INR order). None if unknown."""
-    rates = [float(p["entry_hedge_rate"]) for p in positions if p.get("entry_hedge_rate")]
-    if rates:
-        return rates[-1]
-    for o in sorted(client.get("/v1/futures/orders/history", {"trade_currency": "INR", "limit": 20}) or [],
-                    key=lambda o: o["created_at"], reverse=True):
-        if o.get("hedge_rate"):
-            return float(o["hedge_rate"])
-    return None
+    """Most recent INR-per-USDT rate Mudrex itself applied (open position or INR order within HEDGE_MAX_AGE).
+    None if unknown or stale. Mudrex has no documented quote endpoint."""
+    cands = []
+    for p in positions:
+        if p.get("entry_hedge_rate"):
+            cands.append((_ts(p.get("created_at")) or time.time(), float(p["entry_hedge_rate"])))
+    orders, _ = client.history("orders")
+    for o in orders:
+        if o.get("hedge_rate") and _ts(o.get("created_at")):
+            cands.append((_ts(o["created_at"]), float(o["hedge_rate"])))
+    if not cands:
+        return None
+    at, rate = max(cands)
+    return rate if time.time() - at <= HEDGE_MAX_AGE else None
 
 
 def owned_ids(con):
@@ -149,34 +181,77 @@ def owned_ids(con):
 
 
 def recover_ownership(con, client):
-    """Rebuild ownership from ALL order history (paginated): our filled orders carry client_order_id 's1-...'."""
-    for o in client.history("orders"):
+    """Add our filled orders ('s1-...-O') seen in history to the local ownership table (which is authoritative)."""
+    orders, truncated = client.history("orders")
+    for o in orders:
         cid = o.get("client_order_id") or ""
-        if cid.startswith("s1-") and o.get("status") == "FILLED" and o.get("future_position_uuid") \
-                and cid.endswith("-O"):
+        if cid.startswith("s1-") and cid.endswith("-O") and o.get("status") == "FILLED" \
+                and o.get("future_position_uuid"):
             con.execute("INSERT OR IGNORE INTO owned(position_id, coin, client_order_id, opened_at) VALUES(?,?,?,?)",
                         (o["future_position_uuid"], o["symbol"].removesuffix("USDT"), cid, int(time.time())))
+    return truncated
 
 
-def bot_equity(con, client, positions, rate):
-    """Bot-only equity: allocation + realized P&L of our closed positions + unrealized of our open ones."""
-    ours = {r["position_id"] for r in con.execute("SELECT position_id FROM owned")}
-    realized = sum(float(p.get("pnl") or 0) for p in client.history("positions") if p["id"] in ours)
-    unreal = 0.0
+def sync_owned(con, client, positions):
+    """Mark bot positions that disappeared as closed and fill in their realized P&L from history.
+    Returns the number of closed bot positions whose P&L is still unknown."""
+    open_ids = {p["id"] for p in positions}
+    now = int(time.time())
+    for r in con.execute("SELECT position_id FROM owned WHERE closed_at IS NULL").fetchall():
+        if r["position_id"] not in open_ids:
+            con.execute("UPDATE owned SET closed_at=? WHERE position_id=?", (now, r["position_id"]))
+    missing = con.execute("SELECT position_id FROM owned WHERE closed_at IS NOT NULL AND realized_pnl IS NULL"
+                          ).fetchall()
+    if missing:
+        hist = {p["id"]: p for p in client.history("positions")[0]}
+        for r in missing:
+            p = hist.get(r["position_id"])
+            if p is not None and p.get("pnl") is not None:
+                con.execute("UPDATE owned SET realized_pnl=? WHERE position_id=?", (float(p["pnl"]), r["position_id"]))
+    return con.execute("SELECT COUNT(*) FROM owned WHERE closed_at IS NOT NULL AND realized_pnl IS NULL").fetchone()[0]
+
+
+def unrealized_inr(con, positions, rate):
+    ours = owned_ids(con)
+    u = 0.0
     for p in positions:
         if p["id"] in ours:
             px = float(p.get("mark_price") or p.get("last_price") or p["entry_price"])
-            unreal += float(p["quantity"]) * (px - float(p["entry_price"])) * float(p.get("entry_hedge_rate") or rate)
-    return s1.CAPITAL_CAP_INR + realized + unreal
+            u += float(p["quantity"]) * (px - float(p["entry_price"])) * float(p.get("entry_hedge_rate") or rate)
+    return u
 
 
-def caps_state(con, equity, now=None):
-    """Bot day P&L vs 5% caps. Day = IST calendar day; start equity recorded on first check of the day."""
-    day = time.strftime("%Y-%m-%d", time.gmtime((now or time.time()) + config.IST_OFFSET))
+class PnlUnknown(Exception):
+    pass
+
+
+def bot_equity(con, client, positions, rate):
+    """Bot-only equity: allocation + realized P&L of our closed positions (local ledger) + our unrealized.
+    Raises PnlUnknown if a closed bot position's P&L cannot be confirmed (fail closed)."""
+    if sync_owned(con, client, positions):
+        raise PnlUnknown("a closed bot position's P&L is not yet visible in Mudrex history")
+    realized = con.execute("SELECT COALESCE(SUM(realized_pnl), 0) FROM owned WHERE closed_at IS NOT NULL"
+                           ).fetchone()[0]
+    return s1.CAPITAL_CAP_INR + realized + unrealized_inr(con, positions, rate)
+
+
+def ist_day(t=None):
+    return time.strftime("%Y-%m-%d", time.gmtime((t or time.time()) + config.IST_OFFSET))
+
+
+def caps_state(con, equity, unreal=0.0, now=None):
+    """Bot day P&L vs 5% caps (IST day). The day-start baseline = allocation + P&L realized BEFORE today's IST
+    midnight + unrealized at the first check of the day, so realized losses earlier today always count even if
+    the process restarted. (Unrealized moves between midnight and the first check are the one blind spot.)"""
+    now = now or time.time()
+    day = ist_day(now)
     row = con.execute("SELECT start_equity FROM ledger WHERE day=?", (day,)).fetchone()
     if row is None:
-        con.execute("INSERT INTO ledger(day, start_equity) VALUES(?,?)", (day, equity))
-        start = equity
+        midnight = int((now + config.IST_OFFSET) // 86400 * 86400 - config.IST_OFFSET)
+        before = con.execute("SELECT COALESCE(SUM(realized_pnl), 0) FROM owned WHERE closed_at IS NOT NULL "
+                             "AND closed_at < ?", (midnight,)).fetchone()[0]
+        start = s1.CAPITAL_CAP_INR + before + unreal
+        con.execute("INSERT INTO ledger(day, start_equity) VALUES(?,?)", (day, start))
     else:
         start = row["start_equity"]
     cap = s1.DAILY_CAP_PCT * start
@@ -192,16 +267,21 @@ def guard_tripped():
     return False
 
 
-def snapshot(con, client, coin):
-    positions = client.positions()
-    rate = hedge_rate(client, positions)
-    asset = client.asset(coin + "USDT")
-    funds = client.funds()
-    owned = owned_ids(con)
-    manual = [p for p in positions if p["symbol"] == coin + "USDT" and p["id"] not in owned]
-    eq = bot_equity(con, client, positions, rate or config.INR_PER_USDT)
-    return dict(positions=positions, rate=rate, asset=asset, free=float(funds["balance"]), owned=owned,
-                manual=manual, caps=caps_state(con, eq), price=float(asset["price"]))
+# ---------- gates
+
+def preflight():
+    if os.path.exists(STOP_PATH):
+        return "STOP file present"
+    if not live_enabled():
+        return "LIVE_TRADING_ENABLED is not true"
+    return None
+
+
+def gate():
+    """Called immediately before every order-changing request."""
+    why = preflight()
+    if why:
+        raise Halt(why)
 
 
 # ---------- order lifecycle
@@ -220,29 +300,34 @@ def lookup_until_known(client, cid, sleep, tries=LOOKUP_TRIES):
 
 def submit_with_reconcile(con, client, row, send, sleep, alert):
     """Send a create-order request with a pre-journaled client_order_id and classify the outcome.
-    Returns exchange order dict (ACCEPTED) or None; sets FAILED / RECONCILE_REQUIRED itself."""
+    Returns the exchange order dict (ACCEPTED) or None; sets FAILED / RECONCILE_REQUIRED itself.
+    Before ANY resubmission the order is looked up by client_order_id."""
     cid = row["client_order_id"]
     for attempt in range(3):
-        existing = client.order_by_client_id(cid) if attempt else None      # before ANY resubmit: look up
-        if existing:
-            set_order(con, row["id"], state="ACCEPTED", exchange_order_id=existing.get("id") or existing.get("order_id"))
-            return existing
+        if attempt:
+            existing = lookup_until_known(client, cid, sleep, tries=2)
+            if existing:
+                set_order(con, row["id"], state="ACCEPTED",
+                          exchange_order_id=existing.get("id") or existing.get("order_id"))
+                return existing
+        gate()                                                         # STOP / live flag, right before sending
         set_order(con, row["id"], state="SUBMITTED")
         try:
             resp = send()
             set_order(con, row["id"], state="ACCEPTED", exchange_order_id=(resp or {}).get("order_id"))
             return resp or {}
         except Rejected as e:
-            if e.status == 409:                                              # cid already exists: it was accepted
-                o = client.order_by_client_id(cid)
+            if e.status == 409:                                        # cid already exists: it was accepted
+                o = lookup_until_known(client, cid, sleep)
                 set_order(con, row["id"], state="ACCEPTED", exchange_order_id=(o or {}).get("id"))
                 return o or {}
             set_order(con, row["id"], state="FAILED", error=f"rejected {e.status}: {e.errors}")
             return None
         except Locked:
-            sleep(min(2 ** attempt, 8))                                      # bounded; loop looks up first
+            set_order(con, row["id"], state="PLANNED")                 # 423/429: exchange did not take it
+            sleep(min(2 ** attempt, 8))
             continue
-        except Ambiguous as e:                                               # UNKNOWN: never resubmit blindly
+        except Ambiguous as e:                                         # UNKNOWN: never resubmit blindly
             o = lookup_until_known(client, cid, sleep)
             if o:
                 set_order(con, row["id"], state="ACCEPTED", exchange_order_id=o.get("id") or o.get("order_id"))
@@ -273,42 +358,64 @@ def poll_fill(con, client, row, sleep):
     return None
 
 
-def verify_entry(con, client, row, sleep, alert):
-    """Confirm the position, quantity and a valid exchange stop computed from the ACTUAL fill."""
-    row = con.execute("SELECT * FROM orders WHERE id=?", (row["id"],)).fetchone()
+def stop_tolerance(fill, step):
+    return max(2 * step, 0.002 * fill)
+
+
+def verify_entry(con, client, oid, sleep, alert):
+    """Confirm the position, quantity and an exchange stop at the fill-derived target. Returns True if VERIFIED."""
+    row = order_row(con, oid)
     pos = next((p for p in client.positions() if p["id"] == row["position_id"]), None)
     if pos is None:
-        set_order(con, row["id"], state="RECONCILE_REQUIRED", error="filled but position not visible")
+        set_order(con, oid, state="RECONCILE_REQUIRED", error="filled but position not visible")
+        event(con, "reconcile", f"{row['coin']}: filled but position not visible yet", alert)
         return False
     con.execute("INSERT OR IGNORE INTO owned(position_id, coin, client_order_id, opened_at) VALUES(?,?,?,?)",
                 (pos["id"], row["coin"], row["client_order_id"], int(time.time())))
-    fill, liq = row["fill_price"], float(pos.get("liquidation_price") or 0)
-    spec = client.asset(row["coin"] + "USDT")
-    step = float(spec["price_step"])
-    stop = floor_to(fill - s1.SL_ATR * row["atr"], step)
-    if not (liq < stop < fill):
-        set_order(con, row["id"], state="FAILED", error=f"stop {stop} invalid (fill {fill}, liq {liq})")
-        event(con, "stop", f"{row['coin']}: cannot place a valid stop (fill {fill}, liq {liq}). "
+    if row["filled_qty"] and abs(float(pos["quantity"]) - row["filled_qty"]) > 1e-9 * max(1, row["filled_qty"]):
+        event(con, "reconcile", f"{row['coin']}: position qty {pos['quantity']} != filled {row['filled_qty']}", alert)
+    fill = row["fill_price"]
+    try:
+        liq = float(pos.get("liquidation_price"))
+    except (TypeError, ValueError):
+        liq = float("nan")
+    if not (math.isfinite(liq) and 0 < liq < fill):
+        set_order(con, oid, state="RECONCILE_REQUIRED", error=f"liquidation price unknown/invalid ({liq})")
+        event(con, "stop", f"{row['coin']}: liquidation price unknown; stop NOT verified. Check Mudrex now.", alert)
+        return False
+    step = float(client.asset(row["coin"] + "USDT")["price_step"])
+    target = floor_to(fill - s1.SL_ATR * row["atr"], step)
+    tol = stop_tolerance(fill, step)
+    if not (liq < target < fill):
+        set_order(con, oid, state="FAILED", error=f"target stop {target} invalid (fill {fill}, liq {liq})")
+        event(con, "stop", f"{row['coin']}: no valid stop possible (fill {fill}, liq {liq}). "
                            f"POSITION IS UNPROTECTED - add a stop in the Mudrex app now.", alert)
         return False
-    current = float((pos.get("stoploss") or {}).get("price") or 0)
-    if not (liq < current < fill and abs(current - stop) <= 2 * step):
+    ok = lambda sl: liq < sl < fill and abs(sl - target) <= tol     # noqa: E731
+    sl_info = pos.get("stoploss") or {}
+    current = float(sl_info.get("price") or 0)
+    if not ok(current):
         try:
-            client.set_stoploss(pos["id"], fmt_step(stop, step), f"{row['client_order_id']}-SL")
-        except (Rejected, Locked, Ambiguous) as e:
-            event(con, "stop", f"{row['coin']}: stop attach error {e}", None)
+            if current > 0:
+                if not sl_info.get("order_id"):
+                    raise Rejected(0, "existing stop has no order_id to amend")
+                client.edit_stoploss(pos["id"], sl_info["order_id"], fmt_step(target, step))
+            else:
+                client.set_stoploss(pos["id"], fmt_step(target, step), f"{row['client_order_id']}-SL")
+        except ApiError as e:
+            event(con, "stop", f"{row['coin']}: stop attach/edit error {e}", None)
         for _ in range(3):
             sleep(1)
             pos = next((p for p in client.positions() if p["id"] == row["position_id"]), None)
             current = float(((pos or {}).get("stoploss") or {}).get("price") or 0)
-            if liq < current < fill:
+            if ok(current):
                 break
-    if liq < current < fill:
-        set_order(con, row["id"], state="VERIFIED", stop_price=fmt_step(current, step))
+    if ok(current):
+        set_order(con, oid, state="VERIFIED", stop_price=fmt_step(current, step))
         return True
-    set_order(con, row["id"], state="FAILED", error="stop-loss could not be verified on the exchange")
-    event(con, "stop", f"{row['coin']}: stop-loss NOT verified. POSITION MAY BE UNPROTECTED - check Mudrex now.",
-          alert)
+    set_order(con, oid, state="FAILED", error=f"stop-loss not verified (exchange {current}, target {target})")
+    event(con, "stop", f"{row['coin']}: stop-loss NOT at target ({current} vs {target}). "
+                       f"POSITION MAY BE UNPROTECTED - check Mudrex now.", alert)
     return False
 
 
@@ -320,6 +427,7 @@ def run_close(con, client, row, sleep, alert):
         set_order(con, row["id"], state="VERIFIED", error="already closed (stop hit?)")
         con.execute("UPDATE owned SET closed_at=? WHERE position_id=?", (int(time.time()), row["position_id"]))
         return
+    gate()
     set_order(con, row["id"], state="SUBMITTED")
     try:
         client.close_position(row["position_id"])
@@ -328,7 +436,7 @@ def run_close(con, client, row, sleep, alert):
         set_order(con, row["id"], state="FAILED", error=f"close rejected {e.status}: {e.errors}")
         return
     except (Ambiguous, Locked):
-        pass                                                         # outcome unknown: verify by position state
+        pass                                                           # unknown: verify by position state
     for i in range(POLL_TRIES):
         try:
             gone = not any(p["id"] == row["position_id"] for p in client.positions())
@@ -343,58 +451,70 @@ def run_close(con, client, row, sleep, alert):
     event(con, "reconcile", f"{row['coin']}: close not confirmed; check Mudrex", alert)
 
 
+def fail(con, oid, why):
+    set_order(con, oid, state="FAILED", error=why)
+    return True                                    # a definitive, never-sent refusal does not halt other entries
+
+
 def run_open(con, client, row, sleep, alert):
-    """Returns False if the plan must stop making entries (stop verification failure)."""
-    snap = snapshot(con, client, row["coin"])
+    """Returns True if further entries may proceed, False to HALT the plan's entries."""
     sym = row["coin"] + "USDT"
-    if snap["manual"]:
-        set_order(con, row["id"], state="FAILED", error="refused: manual/unowned position on this symbol")
+    positions = client.positions()
+    owned = owned_ids(con)
+    if [p for p in positions if p["symbol"] == sym and p["id"] not in owned]:
         event(con, "manual", f"{row['coin']}: you have a manual position on {sym}; the bot will not trade it.", alert)
-        return True
-    if any(p["symbol"] == sym and p["id"] in snap["owned"] for p in snap["positions"]):
-        set_order(con, row["id"], state="FAILED", error="bot already holds this symbol")
-        return True
-    if snap["caps"]["hit"]:
-        set_order(con, row["id"], state="FAILED", error=f"daily {snap['caps']['hit']} cap hit")
-        return True
+        return fail(con, row["id"], "refused: manual/unowned position on this symbol")
+    if any(p["symbol"] == sym for p in positions):
+        return fail(con, row["id"], "bot already holds this symbol")
+    rate = hedge_rate(client, positions)
+    if not rate:
+        return fail(con, row["id"], "no recent INR hedge rate from Mudrex")
+    try:
+        eq = bot_equity(con, client, positions, rate)
+    except PnlUnknown as e:
+        return fail(con, row["id"], f"bot P&L unconfirmed: {e}")
+    caps = caps_state(con, eq, unrealized_inr(con, positions, rate))
+    if caps["hit"]:
+        return fail(con, row["id"], f"daily {caps['hit']} cap hit")
     if guard_tripped():
-        set_order(con, row["id"], state="FAILED", error="performance guard tripped")
-        return True
-    if not snap["rate"]:
-        set_order(con, row["id"], state="FAILED", error="no current INR hedge rate from Mudrex")
-        return True
-    price, planned = snap["price"], row["planned_price"]
+        return fail(con, row["id"], "performance guard tripped")
+    a = client.asset(sym)
+    price, planned = float(a["price"]), row["planned_price"]
     if planned and abs(price / planned - 1) > MAX_DRIFT:
-        set_order(con, row["id"], state="FAILED", error=f"price drifted {price / planned - 1:+.1%} since plan")
-        return True
-    a = snap["asset"]
+        return fail(con, row["id"], f"price drifted {price / planned - 1:+.1%} since plan")
     step, min_qty, min_notional = float(a["quantity_step"]), float(a["min_contract"]), float(a["min_notional_value"])
     notional_inr = min(row["planned_notional_inr"], s1.LEV * s1.CAPITAL_CAP_INR)
-    qty = floor_to(notional_inr / snap["rate"] / price, step)
+    qty = floor_to(notional_inr / (rate * HEDGE_BUFFER) / price, step)
     if qty < min_qty or qty * price < min_notional:
-        set_order(con, row["id"], state="FAILED", error="below Mudrex minimum at live price")
-        return True
-    if qty * price * snap["rate"] / s1.LEV > snap["free"]:
-        set_order(con, row["id"], state="FAILED", error="not enough free margin")
-        return True
-    initial_stop = fmt_step(floor_to(price - s1.SL_ATR * row["atr"], float(a["price_step"])), float(a["price_step"]))
+        return fail(con, row["id"], "below Mudrex minimum at live price")
+    if qty * price * rate * HEDGE_BUFFER / s1.LEV > float(client.funds()["balance"]):
+        return fail(con, row["id"], "not enough free margin")
+    pstep = float(a["price_step"])
+    initial_stop = fmt_step(floor_to(price - s1.SL_ATR * row["atr"], pstep), pstep)
     qty_s = fmt_step(qty, step)
     set_order(con, row["id"], qty=qty_s)
+    gate()
     try:
         client.set_leverage(sym, s1.LEV)
     except Rejected as e:
-        set_order(con, row["id"], state="FAILED", error=f"leverage rejected: {e.errors}")
-        return True
+        return fail(con, row["id"], f"leverage rejected: {e.errors}")
     except (Locked, Ambiguous):
-        pass                        # setting leverage is idempotent; if it did not apply, the order still uses 1x+
-    accepted = submit_with_reconcile(con, client, con.execute("SELECT * FROM orders WHERE id=?", (row["id"],)).fetchone(),
+        pass                                                           # verified below either way
+    lev = client.leverage(sym)
+    if lev is None or lev[0] != float(s1.LEV) or (lev[1] or "ISOLATED") != "ISOLATED":
+        return fail(con, row["id"], f"leverage not verified as {s1.LEV}x isolated (got {lev})")
+    accepted = submit_with_reconcile(con, client, order_row(con, row["id"]),
                                      lambda: client.place_market_long(sym, qty_s, row["client_order_id"], initial_stop),
                                      sleep, alert)
     if accepted is None:
-        return con.execute("SELECT state FROM orders WHERE id=?", (row["id"],)).fetchone()["state"] != "RECONCILE_REQUIRED"
-    if poll_fill(con, client, row, sleep) is None:
-        return True
-    return verify_entry(con, client, row, sleep, alert)
+        return order_row(con, row["id"])["state"] == "FAILED"        # unknown outcome -> halt
+    o = poll_fill(con, client, row, sleep)
+    if o is None:
+        return order_row(con, row["id"])["state"] == "FAILED"
+    applied = float(o.get("hedge_rate") or 0)
+    if applied and abs(applied / rate - 1) > HEDGE_BUFFER - 1:
+        event(con, "hedge", f"{row['coin']}: applied INR rate {applied} differs >3% from {rate}", alert)
+    return verify_entry(con, client, row["id"], sleep, alert)
 
 
 def plan_outcome(con, plan_id):
@@ -408,14 +528,6 @@ def plan_outcome(con, plan_id):
     return "FAILED"
 
 
-def preflight():
-    if os.path.exists(STOP_PATH):
-        return "STOP file present"
-    if not live_enabled():
-        return "LIVE_TRADING_ENABLED is not true"
-    return None
-
-
 def execute(con, client, plan_id, approver, sleep=time.sleep, alert=None):
     """Claim and run an approved plan. Returns (final_state, [order summaries])."""
     why = preflight()
@@ -426,19 +538,34 @@ def execute(con, client, plan_id, approver, sleep=time.sleep, alert=None):
         return "REFUSED", [why]
     con.execute("UPDATE plans SET state='EXECUTING' WHERE id=?", (plan_id,))
     event(con, "execute", f"plan {plan_id} approved by {approver}")
-    recover_ownership(con, client)
+    try:
+        recover_ownership(con, client)
+    except ApiError:
+        pass                                                           # local ownership table is authoritative
     entries_allowed = True
     for row in con.execute("SELECT * FROM orders WHERE plan_id=? ORDER BY seq", (plan_id,)).fetchall():
-        why = preflight()                                            # re-checked before EVERY order
+        why = preflight()
         if why:
             set_order(con, row["id"], state="FAILED", error=f"halted: {why}")
             continue
-        if row["action"] == "CLOSE":
-            run_close(con, client, row, sleep, alert)
-        elif not entries_allowed:
-            set_order(con, row["id"], state="FAILED", error="halted: earlier stop-loss not verified")
-        else:
-            entries_allowed = run_open(con, client, row, sleep, alert)
+        try:
+            if row["action"] == "CLOSE":
+                run_close(con, client, row, sleep, alert)
+            elif not entries_allowed:
+                set_order(con, row["id"], state="FAILED", error="halted: an earlier entry is unverified")
+            else:
+                entries_allowed = run_open(con, client, row, sleep, alert)
+        except Halt as h:
+            cur = order_row(con, row["id"])["state"]
+            if cur in ("PLANNED", "SUBMITTED"):
+                set_order(con, row["id"], state="FAILED", error=f"halted: {h}")
+        except Exception as e:                                         # anything unexpected: stop and reconcile
+            cur = order_row(con, row["id"])["state"]
+            set_order(con, row["id"], state="FAILED" if cur == "PLANNED" else "RECONCILE_REQUIRED",
+                      error=f"{type(e).__name__}: {e}"[:300])
+            event(con, "error", f"{row['coin']}: unexpected {type(e).__name__} during {row['action']}; "
+                                f"entries halted, reconcile required.", alert)
+            entries_allowed = False
     final = plan_outcome(con, plan_id)
     con.execute("UPDATE plans SET state=? WHERE id=?", (final, plan_id))
     summary = [f"{r['action']} {r['coin']}: {r['state']}" + (f" ({r['error']})" if r["error"] else "")
@@ -458,25 +585,28 @@ def reconcile(con, client, sleep=time.sleep, alert=None, min_age=900):
     marks = ",".join("?" * len(stale))
     for row in con.execute(f"SELECT * FROM orders WHERE plan_id IN ({marks}) AND state IN "
                            "('SUBMITTED','ACCEPTED','FILLED','RECONCILE_REQUIRED')", stale).fetchall():
-        if row["action"] == "CLOSE":
-            if not any(p["id"] == row["position_id"] for p in client.positions()):
-                set_order(con, row["id"], state="VERIFIED")
-                con.execute("UPDATE owned SET closed_at=? WHERE position_id=?", (int(time.time()), row["position_id"]))
-            continue
-        if row["state"] != "FILLED":
-            o = lookup_until_known(client, row["client_order_id"], sleep)
-            if o is None:
-                # never reached the exchange (or genuinely lost): safe to mark FAILED, still no resubmission
-                set_order(con, row["id"], state="FAILED", error="not found on exchange after restart")
+        try:
+            if row["action"] == "CLOSE":
+                if not any(p["id"] == row["position_id"] for p in client.positions()):
+                    set_order(con, row["id"], state="VERIFIED")
+                    con.execute("UPDATE owned SET closed_at=? WHERE position_id=?",
+                                (int(time.time()), row["position_id"]))
                 continue
-            if o.get("status") in TERMINAL_BAD:
-                set_order(con, row["id"], state="FAILED", error=f"order {o['status']}")
-                continue
-            if o.get("status") not in TERMINAL_OK:
-                continue                                              # still working: next reconcile
-            set_order(con, row["id"], state="FILLED", fill_price=float(o["filled_price"]),
-                      filled_qty=float(o["filled_quantity"]), position_id=o.get("future_position_uuid"))
-        verify_entry(con, client, row, sleep, alert)
+            if row["state"] != "FILLED" or not row["fill_price"]:
+                o = lookup_until_known(client, row["client_order_id"], sleep)
+                if o is None:
+                    set_order(con, row["id"], state="FAILED", error="not found on exchange after restart")
+                    continue
+                if o.get("status") in TERMINAL_BAD:
+                    set_order(con, row["id"], state="FAILED", error=f"order {o['status']}")
+                    continue
+                if o.get("status") not in TERMINAL_OK:
+                    continue                                           # still working: next reconcile
+                set_order(con, row["id"], state="FILLED", fill_price=float(o["filled_price"]),
+                          filled_qty=float(o["filled_quantity"]), position_id=o.get("future_position_uuid"))
+            verify_entry(con, client, row["id"], sleep, alert)
+        except ApiError as e:
+            event(con, "reconcile", f"{row['coin']}: reconcile deferred ({e})", alert)
     for pid in stale:
         # orders a crashed run never sent stay unsent: FAILED, never resumed without a new approval
         con.execute("UPDATE orders SET state='FAILED', error='not submitted (run interrupted)' "

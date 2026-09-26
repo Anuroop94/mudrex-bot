@@ -306,7 +306,7 @@ def test_watcher_plan_failure_then_retry():
         return dict(plan_id=None, orders=[], blocked=None, live_enabled=False)
     import tempfile
     orig, orig_log = watcher.notify, watcher.LOG_PATH
-    watcher.notify = lambda *a, **k: None
+    watcher.notify = lambda *a, **k: True
     watcher.LOG_PATH = os.path.join(tempfile.mkdtemp(), "watcher.log")     # never write the real log
     try:
         assert watcher.maybe_plan(st, flaky, now_hm="06:00", today="2026-09-28") is False
@@ -319,6 +319,54 @@ def test_watcher_plan_failure_then_retry():
         assert watcher.maybe_plan({}, flaky, now_hm="05:00", today="2026-09-29") is False   # before the close
     finally:
         watcher.notify, watcher.LOG_PATH = orig, orig_log
+
+
+def test_watcher_undelivered_plan_is_resent_not_regenerated():
+    import tempfile
+    import watcher
+    st, made, sends = {}, [], []
+
+    def make():
+        made.append(1)
+        return dict(plan_id=len(made), created_at=time.time(), live_enabled=True, blocked=None,
+                    orders=[dict(action="OPEN", coin="XRP", notional_inr=1000)])
+    orig, orig_log = watcher.notify, watcher.LOG_PATH
+    watcher.LOG_PATH = os.path.join(tempfile.mkdtemp(), "watcher.log")
+    watcher.notify = lambda msg, buttons=None: sends.append(buttons) or len(sends) > 1   # 1st send fails
+    try:
+        assert watcher.maybe_plan(st, make, now_hm="06:00", today="2026-09-28") is False
+        assert "plan_day" not in st                                  # not marked delivered
+        st["plan_retry_at"] = 0
+        assert watcher.maybe_plan(st, make, now_hm="06:00", today="2026-09-28") is True
+        assert len(made) == 1                                        # same plan resent, no duplicate plan
+        assert sends[0] == sends[1] == [[("Approve", "approve:1"), ("Reject", "reject:1")]]
+    finally:
+        watcher.notify, watcher.LOG_PATH = orig, orig_log
+
+
+def test_watcher_alerts_when_approver_heartbeat_missing_or_stale():
+    import tempfile
+    import telegram_bot as tg
+    import watcher
+    tmp = tempfile.mkdtemp()
+    orig = (watcher.notify, watcher.APPROVER_HEARTBEAT, tg.enabled, watcher.STARTED)
+    watcher.notify = lambda *a, **k: True
+    watcher.APPROVER_HEARTBEAT = os.path.join(tmp, "hb.json")
+    tg.enabled = lambda: True
+    try:
+        st = {}
+        watcher.STARTED = time.time()
+        assert watcher.check_approver(st) is None                    # within startup grace
+        watcher.STARTED = time.time() - 3600
+        assert "not running" in watcher.check_approver(st)           # missing after grace
+        assert watcher.check_approver(st) is None                    # alerted once
+        with open(watcher.APPROVER_HEARTBEAT, "w") as f:
+            f.write('{"at": %f}' % (time.time() - 3600))
+        assert "stopped" in watcher.check_approver({})               # stale heartbeat
+        tg.enabled = lambda: False
+        assert watcher.check_approver({}) is None                    # Telegram off: approver not expected
+    finally:
+        watcher.notify, watcher.APPROVER_HEARTBEAT, tg.enabled, watcher.STARTED = orig
 
 
 def test_s2_model_learns_and_never_peeks():
