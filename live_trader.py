@@ -109,7 +109,9 @@ def plan(client=None, con=None):
     for c in s1.BASKET:
         if targets.get(c, 0) <= 0:
             st["armed"][c] = True
+    mood = s1.btc_mood(btc, last_closed)
     blocked = ("STOP file present" if os.path.exists(ex.STOP_PATH) else
+               "BTC market-mood data missing" if mood is None else
                "performance guard tripped" if ex.guard_tripped() else
                f"bot P&L unconfirmed ({pnl_unknown})" if pnl_unknown else
                f"daily {caps['hit']} cap hit" if caps["hit"] else
@@ -121,7 +123,7 @@ def plan(client=None, con=None):
     decision = time.strftime("%Y-%m-%d", time.gmtime(last_closed))
     plan_id = ex.record_plan(con, decision, todo, dict(orders=orders)) if todo else None
     p = dict(plan_id=plan_id, created_at=now, decision_day=decision, strategy=s1.NAME,
-             mood_ok=s1.btc_mood_ok(btc, last_closed), bot_equity_inr=round(bot_eq, 2), caps=caps,
+             mood_ok=mood is True, bot_equity_inr=round(bot_eq, 2), caps=caps,
              hedge_rate=rate, live_enabled=ex.live_enabled(), blocked=blocked, orders=orders)
     write_json(PLAN_PATH, p)
     write_json(STATE_PATH, st)
@@ -129,7 +131,8 @@ def plan(client=None, con=None):
     print(f"\nS1 plan {plan_id or '(none)'} for today (decision on {decision} close)")
     print(f"Bot equity Rs {bot_eq:,.2f} (allocation Rs {s1.CAPITAL_CAP_INR:,} + bot P&L); "
           f"today {caps['pnl']:+,.0f} vs caps +/-{caps['cap']:,.0f}; INR/USDT {rate or 'UNKNOWN'}")
-    print(f"Market mood (BTC vs 200-day average): {'GOOD' if p['mood_ok'] else 'BAD: S1 holds no positions'}")
+    print(f"Market mood (BTC vs 200-day average): "
+          f"{'GOOD' if mood else 'UNKNOWN: no new entries' if mood is None else 'BAD: S1 holds no positions'}")
     if manual:
         print(f"Manual positions (bot will NOT touch these coins): {', '.join(sorted(manual))}")
     if blocked:

@@ -247,6 +247,20 @@ def test_live_build_orders_safety():
     assert o["XRP"]["action"] == "SKIP" and "stopped out" in o["XRP"]["reason"]
 
 
+def test_btc_mood_fails_closed_on_missing_data():
+    import s1
+    D = 86400
+    up = [[i * D, 0, 0, 0, 100 + i, 0] for i in range(300)]         # steady uptrend: mood GOOD
+    assert s1.btc_mood(up, 299 * D) is True
+    down = up[:250] + [[i * D, 0, 0, 0, 50.0, 0] for i in range(250, 300)]
+    assert s1.btc_mood(down, 299 * D) is False
+    assert s1.btc_mood(up, 400 * D) is None                           # day not in data
+    assert s1.btc_mood(up[:100], 99 * D) is None                      # not enough history
+    gap = up[:280] + up[281:]                                         # a missing day inside the 200-day window
+    assert s1.btc_mood(gap, 299 * D) is None
+    assert s1.entries_only_for_held({"XRP": 0.1, "ADA": 0.1}, {"ADA": {}}) == {"ADA": 0.1}
+
+
 def test_live_execute_requires_yes():
     import tempfile
     import execution as ex

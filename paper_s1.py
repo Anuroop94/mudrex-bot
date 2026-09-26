@@ -79,6 +79,8 @@ def run_variant(name, shared):
     while d + DAY <= last_closed:   # d1 = d+1 must be a CLOSED bar; d2 = d+2 <= today, so its open is known
         eq_inr = S["equity"] * st["start_inr"]
         x_all = s1.targets(ctx, closes, d, eq_inr, specs, btc, basket)
+        if btc is not None and s1.btc_mood(btc, d) is None:
+            x_all = s1.entries_only_for_held(x_all, S["pos"])
         r = pf.trade_day(S, bars, atrs, basket, x_all, d, d + DAY, d + 2 * DAY, cfg["sl"], 0, cfg["lev"])
         st["ledger"].append(dict(date=day_str(d + DAY), ret=r, equity_inr=S["equity"] * st["start_inr"],
                                  positions=len(S["pos"])))
@@ -105,6 +107,8 @@ def run_variant(name, shared):
 
     eq_inr = S["equity"] * st["start_inr"]
     want = s1.targets(ctx, closes, last_closed, eq_inr, specs, btc, basket)
+    if btc is not None and s1.btc_mood(btc, last_closed) is None:
+        want = s1.entries_only_for_held(want, S["pos"])
     plan = []
     for c in basket:
         w, held = want.get(c, 0.0), c in S["pos"]
