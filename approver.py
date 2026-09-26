@@ -51,12 +51,22 @@ def tg_alert(msg):
         raise ConnectionError("Telegram message not delivered")
 
 
-def handle(u, run=None):
-    """Process one Telegram update. run(plan_id, approver) executes a plan (injectable for tests)."""
+def fresh_plan():
+    """A new plan at current prices (read-only on the exchange), sent with its own Approve/Reject buttons."""
+    import live_trader
+    p = live_trader.plan(__import__("mudrex_client").Client(), ex.db())
+    tg.send(*tg.plan_message(p))
+    return p
+
+
+def handle(u, run=None, replan=None):
+    """Process one Telegram update. run(plan_id, approver) executes a plan; replan() makes and sends a fresh
+    plan (both injectable for tests). Approving an expired buy plan never trades: it only sends a fresh plan."""
     if not tg.authorized(u):
         return "ignored"
     run = run or (lambda pid, who: ex.execute(ex.db(), __import__("mudrex_client").Client(), pid, who,
                                               alert=tg_alert))
+    replan = replan or fresh_plan
     cq, msg = u.get("callback_query"), u.get("message")
     if cq:
         action, _, plan_id = (cq.get("data") or "").partition(":")
@@ -78,6 +88,10 @@ def handle(u, run=None):
         final, summary = run(int(plan_id), who)
         tg.edit(m["chat"]["id"], m["message_id"], m.get("text", "") + f"\n\n{final}:\n" + "\n".join(summary))
         log(f"plan {plan_id} approve by {who}: {final}")
+        if final == "REFUSED" and summary and str(summary[0]).startswith("EXPIRED"):
+            replan()                                   # new prices, new plan id, new buttons: tap again to trade
+            log(f"plan {plan_id} expired; fresh plan sent")
+            return "replanned"
         return final
     text = (msg.get("text") or "").strip().lower()
     if text == "/status":
@@ -89,8 +103,11 @@ def handle(u, run=None):
                 "To resume, on the PC run:  python ops.py resume")
     elif text == "/resume":
         tg.send("Resume is only allowed on the PC:  python ops.py resume")
+    elif text == "/plan":
+        replan()
     elif text in ("/start", "/help"):
-        tg.send("Mudrex S1 bot. Daily plans arrive with Approve/Reject buttons.\n/status  /stop")
+        tg.send("Mudrex S1 bot. Daily plans arrive with Approve/Reject buttons.\n"
+                "/status  /plan (fresh plan at current prices)  /stop")
     return "handled"
 
 

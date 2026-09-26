@@ -42,6 +42,7 @@ DB_PATH = os.path.join(HERE, "execution.db")
 STOP_PATH = os.path.join(HERE, "STOP")
 GUARD_PATH = os.path.join(HERE, "guard.json")
 PLAN_MAX_AGE = 3 * 3600
+ENTRY_MAX_AGE = 15 * 60      # a plan that BUYS must be approved within 15 min; after that a fresh plan is made
 MAX_DRIFT = 0.02            # refuse an entry if the live price moved >2% from the planned price
 HEDGE_BUFFER = 1.03         # size as if INR were 3% weaker than the last applied rate
 HEDGE_MAX_AGE = 7 * 86400
@@ -133,17 +134,19 @@ def claim(con, plan_id, approver):
         if row["state"] != "PLANNED":
             con.execute("ROLLBACK")
             return f"plan is already {row['state']}"
-        if time.time() - row["created_at"] > PLAN_MAX_AGE:
+        has_open = con.execute("SELECT 1 FROM orders WHERE plan_id=? AND action='OPEN'", (plan_id,)).fetchone()
+        age = time.time() - row["created_at"]
+        if age > PLAN_MAX_AGE or (has_open and age > ENTRY_MAX_AGE):
             con.execute("UPDATE plans SET state='FAILED', note='expired' WHERE id=?", (plan_id,))
             con.execute("COMMIT")
-            return "plan is older than 3 hours"
+            return (f"EXPIRED: plans with buys are valid {ENTRY_MAX_AGE // 60} minutes (prices move)"
+                    if has_open and age <= PLAN_MAX_AGE else "EXPIRED: plan is older than 3 hours")
         # execution lease: never two plans at once; no new entries while another plan needs reconciling
         busy = con.execute("SELECT id FROM plans WHERE state IN ('APPROVED','EXECUTING') AND id<>?",
                            (plan_id,)).fetchone()
         if busy:
             con.execute("ROLLBACK")
             return f"plan {busy['id']} is still executing"
-        has_open = con.execute("SELECT 1 FROM orders WHERE plan_id=? AND action='OPEN'", (plan_id,)).fetchone()
         unresolved = con.execute("SELECT id FROM plans WHERE state='RECONCILE_REQUIRED' AND id<>?",
                                  (plan_id,)).fetchone()
         if has_open and unresolved:

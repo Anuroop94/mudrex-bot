@@ -343,7 +343,7 @@ def test_watcher_undelivered_plan_is_resent_not_regenerated():
     def make():
         made.append(1)
         return dict(plan_id=len(made), created_at=time.time(), live_enabled=True, blocked=None,
-                    orders=[dict(action="OPEN", coin="XRP", notional_inr=1000)])
+                    orders=[dict(action="OPEN", coin="XRP", notional_inr=1000, planned_price=1.5, est_stop=1.2)])
     orig, orig_log = watcher.notify, watcher.LOG_PATH
     watcher.LOG_PATH = os.path.join(tempfile.mkdtemp(), "watcher.log")
     watcher.notify = lambda msg, buttons=None: sends.append(buttons) or len(sends) > 1   # 1st send fails
@@ -431,15 +431,17 @@ def test_telegram_approval_security():
     tg.edit = lambda *a: sent.append(a)
     tg.send = lambda *a, **k: sent.append(a)
     run = lambda pid, who: ran.append((pid, who)) or ("COMPLETE", [])   # noqa: E731
+    replans = []
+    replan = lambda: replans.append(1)                                  # noqa: E731
 
-    def tap(chat, user, data="approve:7", kind="private", is_bot=False):
+    def tap(chat, user, data="approve:7", kind="private", is_bot=False, runner=None):
         return approver.handle(dict(callback_query=dict(
             id="q", data=data, from_=None, **{"from": dict(id=user, is_bot=is_bot)},
-            message=dict(chat=dict(id=chat, type=kind), message_id=1, text="plan"))), run)
+            message=dict(chat=dict(id=chat, type=kind), message_id=1, text="plan"))), runner or run, replan)
 
     def say(text, chat=111, user=222):
         return approver.handle(dict(message=dict(text=text, chat=dict(id=chat, type="private"),
-                                                 **{"from": dict(id=user)})), run)
+                                                 **{"from": dict(id=user)})), run, replan)
     try:
         assert tap(111, 999) == "ignored" and not ran              # right chat, wrong person
         assert tap(999, 222) == "ignored" and not ran              # right person, wrong chat
@@ -456,6 +458,11 @@ def test_telegram_approval_security():
         os.remove(ex.STOP_PATH)
         say("/stop", user=999)
         assert not os.path.exists(ex.STOP_PATH)                    # strangers cannot even stop it
+        expired = lambda pid, who: ("REFUSED", ["EXPIRED: plans with buys are valid 15 minutes"])   # noqa: E731
+        assert tap(111, 222, runner=expired) == "replanned" and replans == [1]   # stale tap -> fresh plan, no trade
+        say("/plan")
+        say("/plan", user=999)
+        assert replans == [1, 1]                                   # /plan works for the owner only
     finally:
         tg.answer, tg.edit, tg.send = orig
         for k, v in saved.items():

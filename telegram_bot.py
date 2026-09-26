@@ -45,6 +45,24 @@ def send(text, buttons=None):
     return call("sendMessage", **kw)
 
 
+def plan_message(p):
+    """(text, buttons) for a live_trader.plan() result: one bundled approval with totals (Codex #4)."""
+    todo = [o for o in p["orders"] if o["action"] in ("OPEN", "CLOSE")]
+    if not todo:
+        return "S1: no orders today." + (f" New entries blocked: {p['blocked']}." if p.get("blocked") else ""), None
+    if not (p.get("plan_id") and p.get("live_enabled")):
+        return f"S1 plan {p.get('plan_id')}: {len(todo)} order(s), but LIVE_TRADING_ENABLED is false.", None
+    opens = [o for o in todo if o["action"] == "OPEN"]
+    lines = [f"{o['action']} {o['coin']}" + (f" ~Rs {o['notional_inr']:,.0f}, stop ~{o['est_stop']}"
+                                             if o["action"] == "OPEN" else "") for o in todo]
+    risk = sum(o["notional_inr"] * (1 - o["est_stop"] / o["planned_price"]) for o in opens)
+    text = (f"S1 plan {p['plan_id']}: {len(todo)} order(s)\n" + "\n".join(lines) +
+            (f"\nTotal buys Rs {sum(o['notional_inr'] for o in opens):,.0f}; loss if every stop hits ~Rs {risk:,.0f}."
+             f"\nValid 15 min. Later? Tap Approve anyway: you get a fresh plan at current prices." if opens else
+             "\nValid 3 hours."))
+    return text, [[("Approve", f"approve:{p['plan_id']}"), ("Reject", f"reject:{p['plan_id']}")]]
+
+
 def updates(offset, timeout=0):
     return call("getUpdates", offset=offset, timeout=timeout, allowed_updates=["callback_query", "message"]) or []
 

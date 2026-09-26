@@ -444,6 +444,17 @@ def test_total_bot_exposure_capped_across_positions():
     fake.stop()
 
 
+def test_buy_plans_expire_after_15_minutes_close_plans_after_3_hours():
+    tmp, fake, client, con = setup()
+    buy = plan(con, ["XRP"])
+    con.execute("UPDATE plans SET created_at=? WHERE id=?", (int(time.time()) - 16 * 60, buy))
+    assert ex.claim(con, buy, "t").startswith("EXPIRED") and fake.submits == 0
+    close = ex.record_plan(con, "d", [dict(coin="XRP", action="CLOSE", position_id="p")], {})
+    con.execute("UPDATE plans SET created_at=? WHERE id=?", (int(time.time()) - 60 * 60, close))
+    assert ex.claim(con, close, "t") is None                       # a 1-hour-old close plan is still valid
+    fake.stop()
+
+
 def test_cap_close_plan_is_not_superseded_by_an_entry_plan():
     tmp, fake, client, con = setup()
     cap = ex.record_plan(con, "d", [dict(coin="XRP", action="CLOSE", position_id="p")], {"reason": "cap"})

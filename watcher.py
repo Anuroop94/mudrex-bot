@@ -92,22 +92,14 @@ def maybe_plan(st, make_plan, now_hm=None, today=None):
         return False
     try:
         pend = st.get("pending_plan")
-        if pend and pend.get("_day") == today and time.time() - pend.get("created_at", 0) < ex.PLAN_MAX_AGE:
+        if pend and pend.get("_day") == today and time.time() - pend.get("created_at", 0) < ex.ENTRY_MAX_AGE:
             p = pend                                  # delivery retry: resend the SAME plan, never make a new one
         else:
             p = dict(make_plan(), _day=today)
             st["pending_plan"] = p
-        todo =[o for o in p["orders"] if o["action"] in ("OPEN", "CLOSE")]
-        if todo and p.get("plan_id") and p.get("live_enabled"):
-            lines = [f"{o['action']} {o['coin']}" + (f" ~Rs {o['notional_inr']:,.0f}" if o["action"] == "OPEN" else "")
-                     for o in todo]
-            sent = notify(f"S1 plan {p['plan_id']}: {len(todo)} order(s) (expires in 3h; stops re-anchored to fills):\n"
-                          + "\n".join(lines),
-                          buttons=[[("Approve", f"approve:{p['plan_id']}"), ("Reject", f"reject:{p['plan_id']}")]])
-        elif todo:
-            sent = notify(f"S1 plan {p['plan_id']}: {len(todo)} order(s), but LIVE_TRADING_ENABLED is false.")
-        else:
-            sent = notify("S1: no orders today." + (f" New entries blocked: {p['blocked']}." if p.get("blocked") else ""))
+        import telegram_bot
+        text, buttons = telegram_bot.plan_message(p)
+        sent = notify(text, buttons=buttons)
         if not sent:
             raise ConnectionError("Telegram delivery failed")                 # retry later; plan_day not saved
         st["plan_day"], st["plan_fails"], st["plan_retry_at"] = today, 0, 0     # only after generation + delivery
