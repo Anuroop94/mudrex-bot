@@ -92,7 +92,7 @@ def maybe_plan(st, make_plan, now_hm=None, today=None):
         return False
     try:
         pend = st.get("pending_plan")
-        if pend and pend.get("_day") == today and time.time() - pend.get("created_at", 0) < 3600:
+        if pend and pend.get("_day") == today and time.time() - pend.get("created_at", 0) < ex.PLAN_MAX_AGE:
             p = pend                                  # delivery retry: resend the SAME plan, never make a new one
         else:
             p = dict(make_plan(), _day=today)
@@ -229,27 +229,42 @@ def check(st, client=None, con=None, make_plan=None):
             notify(f"Bot P&L not confirmed yet ({pnl_unknown}): new entries are blocked until Mudrex shows it.")
     caps = ex.caps_state(con, bot_eq, ex.unrealized_inr(con, positions, rate))
 
+    verified = {r["position_id"]: r["stop_price"] for r in con.execute(
+        "SELECT position_id, stop_price FROM orders WHERE action='OPEN' AND stop_price IS NOT NULL")}
     for v in view:
         coin = v["symbol"].removesuffix("USDT")
         if not v["bot"] and coin in s1.BASKET and v["id"] not in st.setdefault("warned_manual", []):
             st["warned_manual"].append(v["id"])
             notify(f"Manual {v['side']} on {coin} (an S1 coin): the bot will not trade {coin} while it is open.")
-        if v["bot"] and not v["sl"] and v["id"] not in st.setdefault("warned_sl", []):
-            st["warned_sl"].append(v["id"])
-            notify(f"{coin}: bot position has NO stop-loss on Mudrex. Add one in the app now.")
+        if not v["bot"]:
+            continue
+        want = float(verified[v["id"]]) if verified.get(v["id"]) else None
+        problem = ("has NO stop-loss" if not v["sl"] else
+                   f"stop {v['sl']} is at/above the price {v['price']}" if v["sl"] >= v["price"] else
+                   f"stop moved to {v['sl']} (verified {want})"
+                   if want and abs(v["sl"] - want) > ex.stop_tolerance(v["entry"], 0) else None)
+        key = f"{v['id']}:{problem}"
+        if problem and key not in st.setdefault("warned_sl", []):
+            st["warned_sl"].append(key)
+            notify(f"{coin}: bot position {problem} on Mudrex. Check it in the app now.")
 
     if caps["hit"] and st.get("cap_day") != caps["day"]:
-        st["cap_day"] = caps["day"]
         bot_open = [v for v in view if v["bot"]]
         msg = (f"Daily {caps['hit']} cap hit: bot Rs {caps['pnl']:+,.0f} today (cap {caps['cap']:,.0f}). "
                f"No new entries today.")
         if bot_open:
-            pid = ex.record_plan(con, caps["day"], [dict(coin=v["symbol"].removesuffix("USDT"), action="CLOSE",
-                                                         position_id=v["id"]) for v in bot_open], {"reason": "cap"})
-            notify(msg + f" Close all {len(bot_open)} bot position(s)?",
-                   buttons=[[("Close all", f"approve:{pid}"), ("Keep", f"reject:{pid}")]])
+            pend = st.get("cap_plan")
+            if not pend or pend.get("day") != caps["day"]:
+                pid = ex.record_plan(con, caps["day"], [dict(coin=v["symbol"].removesuffix("USDT"), action="CLOSE",
+                                                             position_id=v["id"]) for v in bot_open], {"reason": "cap"})
+                st["cap_plan"] = pend = dict(day=caps["day"], plan_id=pid, n=len(bot_open))
+            sent = notify(msg + f" Close all {pend['n']} bot position(s)?",
+                          buttons=[[("Close all", f"approve:{pend['plan_id']}"), ("Keep", f"reject:{pend['plan_id']}")]])
         else:
-            notify(msg)
+            sent = notify(msg)
+        if sent:                                      # mark handled only after confirmed delivery (else retry)
+            st["cap_day"] = caps["day"]
+            st.pop("cap_plan", None)
     elif caps["pnl"] <= -0.8 * caps["cap"] and st.get("warned_80") != caps["day"]:
         st["warned_80"] = caps["day"]
         notify(f"Warning: bot down Rs {-caps['pnl']:,.0f} today (loss cap Rs {caps['cap']:,.0f}).")

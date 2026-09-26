@@ -35,6 +35,10 @@ class FakeMudrex:
         self.never_fill = False
         self.leverage_store = {}
         self.leverage_stuck = None           # if set, POST leverage is ignored and this value is reported
+        self.margin_type = "ISOLATED"        # reported margin type (tests: None, "isolated", "CROSS")
+        self.qty_skew = 1.0                  # position quantity = filled quantity * qty_skew
+        self.applied_rate = "102"            # hedge_rate reported on filled orders ("" = missing)
+        self.bad_currency = []               # writes that arrived without trade_currency=INR
         self.submits = 0
         self.lock = threading.Lock()
         self.orders["manual-1"] = dict(id="seed", client_order_id="manual-1", status="FILLED", symbol="XRPUSDT",
@@ -53,7 +57,7 @@ class FakeMudrex:
     def _position(self, coin, side, qty, px, lev=2, stop=None, manual=False):
         liq = px * (1 - 0.9 / lev) if side == "LONG" else px * (1 + 0.9 / lev)
         return dict(id=("manual-" if manual else "") + str(uuid.uuid4()), symbol=coin + "USDT", order_type=side,
-                    quantity=str(qty), entry_price=str(px), leverage=str(lev),
+                    quantity=str(qty), entry_price=str(px), leverage=str(lev), trade_currency="INR",
                     liquidation_price="" if self.no_liq else str(liq), entry_hedge_rate="102",
                     created_at=_iso(time.time()),
                     stoploss=dict(price=str(stop), order_id=str(uuid.uuid4())) if stop else dict(price="0"),
@@ -87,10 +91,10 @@ class FakeMudrex:
         stop = float(body["stoploss_price"]) if body.get("is_stoploss") else None
         if stop is not None and (stop >= px or self.drop_order_stop):
             stop = None
-        pos = self._position(coin, "LONG", float(body["quantity"]), px, stop=stop)
+        pos = self._position(coin, "LONG", float(body["quantity"]) * self.qty_skew, px, stop=stop)
         self.positions.append(pos)
         o.update(status="FILLED", filled_price=str(px), filled_quantity=body["quantity"],
-                 future_position_uuid=pos["id"])
+                 future_position_uuid=pos["id"], hedge_rate=self.applied_rate)
         if "after_fill" in self.hooks:
             self.hooks["after_fill"](o)
 
@@ -168,24 +172,35 @@ class FakeMudrex:
                     def lev():
                         v = fake.leverage_stuck if fake.leverage_stuck is not None else fake.leverage_store.get(sym)
                         return (404, {"success": False, "errors": [{"text": "leverage not found"}]}) if v is None \
-                            else ok({"margin_type": "ISOLATED", "leverage": str(v)})
+                            else ok({"margin_type": fake.margin_type, "leverage": str(v)})
                     return self._apply("leverage_get", lev)
                 coin = p.rsplit("/", 1)[-1].removesuffix("USDT")
                 if coin in fake.specs:
                     return self._send(*ok(dict(fake.specs[coin], price=str(fake.prices[coin]))))
                 return self._send(404, {"success": False, "errors": [{"text": "not found"}]})
 
+            def _currency_ok(self, body, p):
+                if body.get("trade_currency") != "INR":        # real API would silently treat it as USDT
+                    fake.bad_currency.append(p)
+                    self._send(400, {"success": False, "errors": [{"text": "position not found in USDT"}]})
+                    return False
+                return True
+
             def do_POST(self):
                 p, q = self._parts()
                 body = self._body()
                 fake.requests.append(("POST", p, body.get("client_order_id")))
+                if not self._currency_ok(body, p):
+                    return None
                 if p.endswith("/futures/order"):
                     return self._apply("order", lambda: fake.create_order(q["symbol"], body))
                 if p.endswith("/leverage"):
-                    fake.leverage_store[p.split("/")[-2]] = body.get("leverage")
-                    if "on_leverage" in fake.hooks:
-                        fake.hooks["on_leverage"]()
-                    return self._send(200, {"success": True, "data": {"leverage": body.get("leverage")}})
+                    def setlev():
+                        fake.leverage_store[p.split("/")[-2]] = body.get("leverage")
+                        if "on_leverage" in fake.hooks:
+                            fake.hooks["on_leverage"]()
+                        return 200, {"success": True, "data": {"leverage": body.get("leverage")}}
+                    return self._apply("leverage_post", setlev)
                 if p.endswith("/riskorder"):
                     pid = p.split("/")[-2]
 
@@ -219,6 +234,8 @@ class FakeMudrex:
                 p, _ = self._parts()
                 body = self._body()
                 fake.requests.append(("PATCH", p, None))
+                if not self._currency_ok(body, p):
+                    return None
                 if p.endswith("/riskorder"):
                     pid = p.split("/")[-2]
 

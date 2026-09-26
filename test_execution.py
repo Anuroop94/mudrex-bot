@@ -344,6 +344,115 @@ def test_daily_cap_counts_losses_realized_before_restart():
     fake.stop()
 
 
+def test_every_write_names_inr_currency():
+    tmp, fake, client, con = setup()
+    fake.fill_price["XRP"] = 1.5 * 0.97                       # forces a stop PATCH too
+    pid = plan(con, ["XRP", "ADA"])
+    assert ex.execute(con, client, pid, "t", NOSLEEP)[0] == "COMPLETE"
+    close = ex.record_plan(con, "d", [dict(coin="XRP", action="CLOSE", position_id=next(iter(ex.owned_ids(con))))], {})
+    ex.execute(con, client, close, "t", NOSLEEP)
+    kinds = {p.rsplit("/", 1)[-1] for m, p, c in fake.requests if m in ("POST", "PATCH")}
+    assert {"order", "leverage", "riskorder", "close"} <= kinds and fake.bad_currency == []
+    fake.stop()
+
+
+def test_position_mismatch_after_fill_halts():
+    tmp, fake, client, con = setup()
+    fake.qty_skew = 2.0                                      # exchange position is twice what we filled
+    alerts = []
+    pid = plan(con, ["XRP", "ADA"])
+    ex.execute(con, client, pid, "t", NOSLEEP, alerts.append)
+    st = states(con, pid)
+    assert st["XRP"][0] == "RECONCILE_REQUIRED" and "mismatch" in st["XRP"][1] and "halted" in st["ADA"][1]
+    assert float(fake.positions[0]["stoploss"]["price"]) > 0   # still protected by a stop
+    fake.stop()
+
+
+def test_margin_type_must_be_exactly_isolated():
+    for mt in (None, "isolated", "CROSS", ""):
+        tmp, fake, client, con = setup()
+        fake.margin_type = mt
+        pid = plan(con, ["XRP"])
+        ex.execute(con, client, pid, "t", NOSLEEP)
+        assert "leverage not verified" in states(con, pid)["XRP"][1] and fake.submits == 0, mt
+        fake.stop()
+
+
+def test_missing_or_excessive_applied_fx_halts():
+    for rate, why in (("", "rate missing"), ("130", "exceeds")):
+        tmp, fake, client, con = setup()
+        fake.applied_rate = rate
+        alerts = []
+        pid = plan(con, ["XRP", "ADA"])
+        ex.execute(con, client, pid, "t", NOSLEEP, alerts.append)
+        st = states(con, pid)
+        assert st["XRP"][0] == "RECONCILE_REQUIRED" and "halted" in st["ADA"][1], (rate, st)
+        assert any("INR" in a for a in alerts)
+        fake.stop()
+
+
+def test_one_plan_at_a_time_lease_and_supersede():
+    tmp, fake, client, con = setup()
+    old = plan(con, ["XRP"])
+    new = plan(con, ["ADA"])
+    assert con.execute("SELECT state FROM plans WHERE id=?", (old,)).fetchone()[0] == "FAILED"   # superseded
+    assert "already FAILED" in ex.claim(con, old, "late tap")
+    con.execute("UPDATE plans SET state='EXECUTING' WHERE id=?", (new,))
+    third = plan(con, ["DOGE"])
+    con.execute("UPDATE plans SET state='EXECUTING' WHERE id=?", (new,))   # record_plan only supersedes PLANNED
+    assert "still executing" in ex.claim(con, third, "t")
+    fake.stop()
+
+
+def test_unresolved_plan_blocks_entries_but_not_closes():
+    tmp, fake, client, con = setup()
+    stuck = plan(con, ["XRP"])
+    con.execute("UPDATE plans SET state='RECONCILE_REQUIRED' WHERE id=?", (stuck,))
+    entry = plan(con, ["ADA"])
+    assert "reconciliation" in ex.claim(con, entry, "t")
+    close = ex.record_plan(con, "d", [dict(coin="XRP", action="CLOSE", position_id="p")], {})
+    assert ex.claim(con, close, "t") is None
+    fake.stop()
+
+
+def test_alert_failure_never_breaks_execution():
+    tmp, fake, client, con = setup()
+
+    def broken(msg):
+        raise ConnectionError("telegram down")
+    pid = plan(con, ["XRP"])
+    final, _ = ex.execute(con, client, pid, "t", NOSLEEP, broken)
+    assert final == "COMPLETE"
+    assert con.execute("SELECT COUNT(*) FROM events WHERE kind='alert_failed'").fetchone()[0] >= 1
+    fake.stop()
+
+
+def test_watcher_flags_moved_stop_and_retries_cap_close_delivery():
+    import watcher
+    tmp, fake, client, con = setup()
+    pid = plan(con, ["XRP"])
+    assert ex.execute(con, client, pid, "t", NOSLEEP)[0] == "COMPLETE"
+    fake.positions[0]["stoploss"]["price"] = "1.0"            # someone moved the stop far from the verified level
+    con.execute("INSERT INTO owned(position_id, coin, client_order_id, opened_at, closed_at, realized_pnl) "
+                "VALUES('lost','ADA','s1-y',?,?,-400)", (int(time.time()) - 60, int(time.time()) - 30))
+    sent, st = [], {}
+    orig = (watcher.notify, watcher.STATUS_PATH, watcher.LOG_PATH, watcher.JOURNAL_PATH, ex.GUARD_PATH)
+    watcher.STATUS_PATH, watcher.LOG_PATH, watcher.JOURNAL_PATH = (os.path.join(tmp, n) for n in
+                                                                   ("ws.json", "w.log", "j.csv"))
+    watcher.notify = lambda msg, buttons=None: sent.append((msg, buttons)) or len(sent) > 2   # first sends fail
+    try:
+        watcher.check(st, client, con, make_plan=lambda: dict(plan_id=None, orders=[], created_at=time.time()))
+        assert any("stop moved" in m for m, _ in sent)
+        assert "cap_day" not in st and st.get("cap_plan")          # cap-close alert not delivered -> retry kept
+        cap_pid = st["cap_plan"]["plan_id"]
+        watcher.check(st, client, con, make_plan=lambda: dict(plan_id=None, orders=[], created_at=time.time()))
+        assert st.get("cap_day") and any(b and f"approve:{cap_pid}" in str(b) for _, b in sent)
+        assert con.execute("SELECT COUNT(*) FROM plans WHERE payload LIKE '%cap%'").fetchone()[0] == 1   # no dupes
+    finally:
+        watcher.notify, watcher.STATUS_PATH, watcher.LOG_PATH, watcher.JOURNAL_PATH, ex.GUARD_PATH = orig
+    fake.stop()
+
+
 def test_live_disabled_by_default_refuses():
     tmp, fake, client, con = setup()
     os.environ["LIVE_TRADING_ENABLED"] = "false"

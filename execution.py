@@ -82,9 +82,14 @@ def db(path=None):
 
 
 def event(con, kind, msg, alert=None):
+    """Journal an event and (optionally) alert. An alert failure can never interrupt execution."""
     con.execute("INSERT INTO events(at, kind, msg) VALUES(?,?,?)", (int(time.time()), kind, msg))
     if alert:
-        alert(msg)
+        try:
+            alert(msg)
+        except Exception as e:                                   # noqa: BLE001 - delivery must not break trading state
+            con.execute("INSERT INTO events(at, kind, msg) VALUES(?,?,?)",
+                        (int(time.time()), "alert_failed", f"{type(e).__name__}: {e}"[:300]))
 
 
 def set_order(con, oid, **kw):
@@ -102,6 +107,9 @@ def record_plan(con, decision_day, orders, payload):
     cur = con.execute("INSERT INTO plans(created_at, decision_day, state, payload) VALUES(?,?,?,?)",
                       (now, decision_day, "PLANNED", json.dumps(payload)))
     pid = cur.lastrowid
+    # only ONE approvable plan exists at a time: older unapproved plans (and their buttons) become invalid
+    con.execute("UPDATE plans SET state='FAILED', note=? WHERE state='PLANNED' AND id<>?",
+                (f"superseded by plan {pid}", pid))
     for i, o in enumerate(orders):
         cid = f"s1-{pid}-{i}-{o['coin']}-{o['action'][0]}"[:64]
         con.execute("""INSERT INTO orders(plan_id, seq, coin, action, client_order_id, state, position_id,
@@ -127,6 +135,18 @@ def claim(con, plan_id, approver):
             con.execute("UPDATE plans SET state='FAILED', note='expired' WHERE id=?", (plan_id,))
             con.execute("COMMIT")
             return "plan is older than 3 hours"
+        # execution lease: never two plans at once; no new entries while another plan needs reconciling
+        busy = con.execute("SELECT id FROM plans WHERE state IN ('APPROVED','EXECUTING') AND id<>?",
+                           (plan_id,)).fetchone()
+        if busy:
+            con.execute("ROLLBACK")
+            return f"plan {busy['id']} is still executing"
+        has_open = con.execute("SELECT 1 FROM orders WHERE plan_id=? AND action='OPEN'", (plan_id,)).fetchone()
+        unresolved = con.execute("SELECT id FROM plans WHERE state='RECONCILE_REQUIRED' AND id<>?",
+                                 (plan_id,)).fetchone()
+        if has_open and unresolved:
+            con.execute("ROLLBACK")
+            return f"plan {unresolved['id']} needs reconciliation first (python live_trader.py reconcile)"
         con.execute("UPDATE plans SET state='APPROVED', approved_by=?, approved_at=? WHERE id=?",
                     (approver, int(time.time()), plan_id))
         con.execute("COMMIT")
@@ -164,8 +184,8 @@ def hedge_rate(client, positions):
     None if unknown or stale. Mudrex has no documented quote endpoint."""
     cands = []
     for p in positions:
-        if p.get("entry_hedge_rate"):
-            cands.append((_ts(p.get("created_at")) or time.time(), float(p["entry_hedge_rate"])))
+        if p.get("entry_hedge_rate") and _ts(p.get("created_at")):      # undated rates are never trusted as fresh
+            cands.append((_ts(p["created_at"]), float(p["entry_hedge_rate"])))
     orders, _ = client.history("orders")
     for o in orders:
         if o.get("hedge_rate") and _ts(o.get("created_at")):
@@ -372,9 +392,21 @@ def verify_entry(con, client, oid, sleep, alert):
         return False
     con.execute("INSERT OR IGNORE INTO owned(position_id, coin, client_order_id, opened_at) VALUES(?,?,?,?)",
                 (pos["id"], row["coin"], row["client_order_id"], int(time.time())))
-    if row["filled_qty"] and abs(float(pos["quantity"]) - row["filled_qty"]) > 1e-9 * max(1, row["filled_qty"]):
-        event(con, "reconcile", f"{row['coin']}: position qty {pos['quantity']} != filled {row['filled_qty']}", alert)
     fill = row["fill_price"]
+    problems = []
+    if pos.get("symbol") != row["coin"] + "USDT":
+        problems.append(f"symbol {pos.get('symbol')}")
+    if pos.get("order_type") != "LONG":
+        problems.append(f"side {pos.get('order_type')}")
+    if pos.get("trade_currency") not in (None, "INR"):
+        problems.append(f"currency {pos.get('trade_currency')}")
+    try:
+        if float(pos.get("leverage")) != float(s1.LEV):
+            problems.append(f"leverage {pos.get('leverage')}")
+    except (TypeError, ValueError):
+        problems.append(f"leverage {pos.get('leverage')}")
+    if not row["filled_qty"] or abs(float(pos["quantity"]) - row["filled_qty"]) > 1e-9 * max(1, row["filled_qty"]):
+        problems.append(f"qty {pos['quantity']} vs filled {row['filled_qty']}")
     try:
         liq = float(pos.get("liquidation_price"))
     except (TypeError, ValueError):
@@ -410,6 +442,12 @@ def verify_entry(con, client, oid, sleep, alert):
             current = float(((pos or {}).get("stoploss") or {}).get("price") or 0)
             if ok(current):
                 break
+    if ok(current) and problems:                     # protected by a stop, but not the position we approved
+        set_order(con, oid, state="RECONCILE_REQUIRED", stop_price=fmt_step(current, step),
+                  error="position mismatch: " + "; ".join(problems))
+        event(con, "reconcile", f"{row['coin']}: position does not match the order ({'; '.join(problems)}). "
+                                f"Stop is in place; entries halted - check Mudrex.", alert)
+        return False
     if ok(current):
         set_order(con, oid, state="VERIFIED", stop_price=fmt_step(current, step))
         return True
@@ -501,7 +539,7 @@ def run_open(con, client, row, sleep, alert):
     except (Locked, Ambiguous):
         pass                                                           # verified below either way
     lev = client.leverage(sym)
-    if lev is None or lev[0] != float(s1.LEV) or (lev[1] or "ISOLATED") != "ISOLATED":
+    if lev is None or lev[0] != float(s1.LEV) or lev[1] != "ISOLATED":
         return fail(con, row["id"], f"leverage not verified as {s1.LEV}x isolated (got {lev})")
     accepted = submit_with_reconcile(con, client, order_row(con, row["id"]),
                                      lambda: client.place_market_long(sym, qty_s, row["client_order_id"], initial_stop),
@@ -511,10 +549,23 @@ def run_open(con, client, row, sleep, alert):
     o = poll_fill(con, client, row, sleep)
     if o is None:
         return order_row(con, row["id"])["state"] == "FAILED"
-    applied = float(o.get("hedge_rate") or 0)
-    if applied and abs(applied / rate - 1) > HEDGE_BUFFER - 1:
-        event(con, "hedge", f"{row['coin']}: applied INR rate {applied} differs >3% from {rate}", alert)
-    return verify_entry(con, client, row["id"], sleep, alert)
+    protected = verify_entry(con, client, row["id"], sleep, alert)     # stop first: protection before accounting
+    try:
+        applied = float(o.get("hedge_rate") or 0)
+    except (TypeError, ValueError):
+        applied = 0.0
+    allowed = min(row["planned_notional_inr"], s1.LEV * s1.CAPITAL_CAP_INR) * HEDGE_BUFFER
+    actual = float(o["filled_quantity"]) * float(o["filled_price"]) * applied
+    if applied <= 0 or actual > allowed:
+        cur = order_row(con, row["id"])
+        set_order(con, row["id"], state="RECONCILE_REQUIRED",
+                  error=(cur["error"] + "; " if cur["error"] else "") +
+                  (f"applied INR rate missing" if applied <= 0 else f"INR notional {actual:,.0f} > allowed {allowed:,.0f}"))
+        event(con, "hedge", f"{row['coin']}: " + ("Mudrex did not report the INR rate it applied" if applied <= 0 else
+                            f"filled INR notional Rs {actual:,.0f} exceeds the approved Rs {allowed:,.0f}")
+              + ". Entries halted; reduce the position in Mudrex if needed.", alert)
+        return False
+    return protected
 
 
 def plan_outcome(con, plan_id):

@@ -134,16 +134,18 @@ class Client:
             body.update(is_stoploss=True, stoploss_price=stop)
         return self.post(f"/v2/futures/order?symbol={symbol}", body)
 
+    # Every write names trade_currency=INR explicitly: Mudrex defaults POST/PATCH bodies to USDT when omitted.
     def close_position(self, position_id):
-        return self.post(f"/v1/futures/positions/{position_id}/close", {})
+        return self.post(f"/v1/futures/positions/{position_id}/close", {"trade_currency": "INR"})
 
     def set_stoploss(self, position_id, price, sl_cid):
         """Attach a stop to a position that has none (POST)."""
         return self.post(f"/v1/futures/positions/{position_id}/riskorder",
                          {"is_stoploss": True, "stoploss_price": price, "order_source": "API",
-                          "stoploss_client_order_id": sl_cid})
+                          "stoploss_client_order_id": sl_cid, "trade_currency": "INR"})
 
     def edit_stoploss(self, position_id, sl_order_id, price):
         """Amend an existing stop (PATCH, requires the stop's own order id)."""
         return self._raw("PATCH", f"/v1/futures/positions/{position_id}/riskorder",
-                         body={"is_stoploss": True, "stoploss_price": price, "stoploss_order_id": sl_order_id})
+                         body={"is_stoploss": True, "stoploss_price": price, "stoploss_order_id": sl_order_id,
+                               "trade_currency": "INR"})

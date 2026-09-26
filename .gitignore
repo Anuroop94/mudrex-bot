@@ -18,3 +18,5 @@ watch_status.json
 approver_offset.json
 STOP
 .claude/
+*.db-wal
+*.db-shm
