@@ -304,8 +304,10 @@ def test_watcher_plan_failure_then_retry():
         if len(calls) == 1:
             raise ConnectionError("mudrex down")
         return dict(plan_id=None, orders=[], blocked=None, live_enabled=False)
-    orig = watcher.notify
+    import tempfile
+    orig, orig_log = watcher.notify, watcher.LOG_PATH
     watcher.notify = lambda *a, **k: None
+    watcher.LOG_PATH = os.path.join(tempfile.mkdtemp(), "watcher.log")     # never write the real log
     try:
         assert watcher.maybe_plan(st, flaky, now_hm="06:00", today="2026-09-28") is False
         assert "plan_day" not in st and st["plan_fails"] == 1        # failure NOT recorded as done
@@ -316,7 +318,7 @@ def test_watcher_plan_failure_then_retry():
         assert watcher.maybe_plan(st, flaky, now_hm="07:00", today="2026-09-28") is False   # once per day
         assert watcher.maybe_plan({}, flaky, now_hm="05:00", today="2026-09-29") is False   # before the close
     finally:
-        watcher.notify = orig
+        watcher.notify, watcher.LOG_PATH = orig, orig_log
 
 
 def test_s2_model_learns_and_never_peeks():
