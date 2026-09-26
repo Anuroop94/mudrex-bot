@@ -1,0 +1,20 @@
+# secrets
+.env
+# market data cache
+data/
+__pycache__/
+# runtime state, logs, results (machine-local, may contain account data)
+*.log
+*.csv
+*.db
+*.db-journal
+*_state.json
+*_state.json.tmp
+*.tmp
+live_plan.json
+caps.json
+guard.json
+watch_status.json
+approver_offset.json
+STOP
+.claude/
