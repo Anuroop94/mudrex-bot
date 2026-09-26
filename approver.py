@@ -45,12 +45,18 @@ def status_text():
             f"\nPositions:\n{pos}")
 
 
+def tg_alert(msg):
+    """Execution alerts: an undelivered Telegram message raises, so execution.event() journals it as alert_failed."""
+    if tg.send(msg) is None:
+        raise ConnectionError("Telegram message not delivered")
+
+
 def handle(u, run=None):
     """Process one Telegram update. run(plan_id, approver) executes a plan (injectable for tests)."""
     if not tg.authorized(u):
         return "ignored"
     run = run or (lambda pid, who: ex.execute(ex.db(), __import__("mudrex_client").Client(), pid, who,
-                                              alert=tg.send))
+                                              alert=tg_alert))
     cq, msg = u.get("callback_query"), u.get("message")
     if cq:
         action, _, plan_id = (cq.get("data") or "").partition(":")

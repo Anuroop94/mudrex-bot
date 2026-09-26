@@ -244,7 +244,9 @@ def check(st, client=None, con=None, make_plan=None):
                    f"stop moved to {v['sl']} (verified {want})"
                    if want and abs(v["sl"] - want) > ex.stop_tolerance(v["entry"], 0) else None)
         key = f"{v['id']}:{problem}"
-        if problem and key not in st.setdefault("warned_sl", []):
+        if not problem:                               # healthy again: re-arm, so a new failure alerts again
+            st["warned_sl"] = [k for k in st.get("warned_sl", []) if not k.startswith(f"{v['id']}:")]
+        elif key not in st.setdefault("warned_sl", []):
             if notify(f"{coin}: bot position {problem} on Mudrex. Check it in the app now."):
                 st["warned_sl"].append(key)           # handled only once delivered; otherwise retried next check
 
@@ -254,7 +256,8 @@ def check(st, client=None, con=None, make_plan=None):
                f"No new entries today.")
         if bot_open:
             pend = st.get("cap_plan")
-            if not pend or pend.get("day") != caps["day"]:
+            alive = pend and con.execute("SELECT state FROM plans WHERE id=?", (pend.get("plan_id"),)).fetchone()
+            if not pend or pend.get("day") != caps["day"] or not alive or alive[0] != "PLANNED":
                 pid = ex.record_plan(con, caps["day"], [dict(coin=v["symbol"].removesuffix("USDT"), action="CLOSE",
                                                              position_id=v["id"]) for v in bot_open], {"reason": "cap"})
                 st["cap_plan"] = pend = dict(day=caps["day"], plan_id=pid, n=len(bot_open))

@@ -259,7 +259,7 @@ def test_missing_or_failed_stop_attachment_halts_entries():
     pid = plan(con, ["XRP", "ADA"])
     ex.execute(con, client, pid, "t", NOSLEEP, alerts.append)
     st = states(con, pid)
-    assert st["XRP"][0] == "FAILED" and "stop" in st["XRP"][1]
+    assert st["XRP"][0] == "RECONCILE_REQUIRED" and "stop" in st["XRP"][1]   # unprotected fill keeps entries blocked
     assert "halted" in st["ADA"][1] and fake.submits == 1
     assert any("UNPROTECTED" in a or "NOT verified" in a for a in alerts)
     fake.stop()
@@ -318,7 +318,7 @@ def test_wrong_existing_stop_and_failed_amend_halts():
     pid = plan(con, ["XRP", "ADA"])
     ex.execute(con, client, pid, "t", NOSLEEP, alerts.append)
     st = states(con, pid)
-    assert st["XRP"][0] == "FAILED" and "not verified" in st["XRP"][1] and "halted" in st["ADA"][1]
+    assert st["XRP"][0] == "RECONCILE_REQUIRED" and "not verified" in st["XRP"][1] and "halted" in st["ADA"][1]
     assert fake.submits == 1 and any("UNPROTECTED" in a for a in alerts)
     fake.stop()
 
@@ -392,7 +392,65 @@ def test_position_mismatch_after_fill_halts():
     ex.execute(con, client, pid, "t", NOSLEEP, alerts.append)
     st = states(con, pid)
     assert st["XRP"][0] == "RECONCILE_REQUIRED" and "mismatch" in st["XRP"][1] and "halted" in st["ADA"][1]
-    assert float(fake.positions[0]["stoploss"]["price"]) > 0   # still protected by a stop
+    pos_id = fake.positions[0]["id"]
+    assert pos_id not in ex.owned_ids(con)                     # quarantined: never bot-owned
+    assert not any(p.endswith("/riskorder") for m, p, c in fake.requests)   # its stop was never touched
+    ex.recover_ownership(con, client)
+    assert pos_id not in ex.owned_ids(con)                     # history recovery cannot re-own it either
+    close = ex.record_plan(con, "d", [dict(coin="XRP", action="CLOSE", position_id=pos_id)], {})
+    con.execute("UPDATE plans SET state='PLANNED' WHERE id=?", (close,))
+    ex.execute(con, client, close, "t", NOSLEEP)
+    assert "not owned" in states(con, close)["XRP"][1] and fake.positions   # the bot refuses to close it
+    fake.stop()
+
+
+def test_crash_between_stop_check_and_notional_check_is_rechecked():
+    tmp, fake, client, con = setup()
+    real = ex.fill_within_approval
+    ex.fill_within_approval = lambda *a: (_ for _ in ()).throw(RuntimeError("crash"))
+    try:
+        pid = plan(con, ["XRP"])
+        ex.execute(con, client, pid, "t", NOSLEEP)
+    finally:
+        ex.fill_within_approval = real
+    assert states(con, pid)["XRP"][0] != "VERIFIED"               # stop verified alone is not enough
+    con.execute("UPDATE plans SET approved_at=? WHERE id=?", (int(time.time()) - 3600, pid))
+    ex.reconcile(con, client, NOSLEEP)
+    assert states(con, pid)["XRP"][0] == "VERIFIED" and fake.submits == 1
+    fake.stop()
+
+
+def test_closes_run_first_and_unconfirmed_close_halts_entries():
+    tmp, fake, client, con = setup()
+    assert ex.execute(con, client, plan(con, ["XRP"]), "t", NOSLEEP)[0] == "COMPLETE"
+    xrp = next(iter(ex.owned_ids(con)))
+    pid = ex.record_plan(con, "d", [dict(coin="ADA", action="OPEN", planned_price=PRICES["ADA"], notional_inr=1000,
+                                         atr=PRICES["ADA"] * 0.06),
+                                    dict(coin="XRP", action="CLOSE", position_id=xrp)], {})
+    fake.faults["close"] = ["500"]                              # close outcome unknown, position still open
+    before = fake.submits
+    ex.execute(con, client, pid, "t", NOSLEEP)
+    st = states(con, pid)
+    assert st["XRP"][0] == "RECONCILE_REQUIRED" and "unconfirmed" in st["ADA"][1] and fake.submits == before
+    fake.stop()
+
+
+def test_total_bot_exposure_capped_across_positions():
+    tmp, fake, client, con = setup()
+    assert ex.execute(con, client, plan(con, ["XRP"], notional=6000), "t", NOSLEEP)[0] == "COMPLETE"
+    pid = plan(con, ["ADA"], notional=6000)
+    ex.execute(con, client, pid, "t", NOSLEEP)
+    assert "allocation cap" in states(con, pid)["ADA"][1] and len(fake.positions) == 1
+    fake.stop()
+
+
+def test_cap_close_plan_is_not_superseded_by_an_entry_plan():
+    tmp, fake, client, con = setup()
+    cap = ex.record_plan(con, "d", [dict(coin="XRP", action="CLOSE", position_id="p")], {"reason": "cap"})
+    plan(con, ["ADA"])
+    assert con.execute("SELECT state FROM plans WHERE id=?", (cap,)).fetchone()[0] == "PLANNED"
+    newer_cap = ex.record_plan(con, "d", [dict(coin="XRP", action="CLOSE", position_id="p")], {"reason": "cap"})
+    assert con.execute("SELECT state FROM plans WHERE id=?", (cap,)).fetchone()[0] == "FAILED" and newer_cap
     fake.stop()
 
 
@@ -479,6 +537,12 @@ def test_watcher_flags_moved_stop_and_retries_cap_close_delivery():
         assert sum("stop moved" in m for m, _ in sent) == 2          # undelivered stop alert was retried
         watcher.check(st, client, con, make_plan=lambda: dict(plan_id=None, orders=[], created_at=time.time()))
         assert sum("stop moved" in m for m, _ in sent) == 2          # delivered once -> not repeated
+        good = fake.positions[0]["stoploss"]["price"] = con.execute(
+            "SELECT stop_price FROM orders WHERE plan_id=?", (pid,)).fetchone()[0]
+        watcher.check(st, client, con, make_plan=lambda: dict(plan_id=None, orders=[], created_at=time.time()))
+        fake.positions[0]["stoploss"]["price"] = "1.0"            # the same problem comes back later
+        watcher.check(st, client, con, make_plan=lambda: dict(plan_id=None, orders=[], created_at=time.time()))
+        assert good and sum("stop moved" in m for m, _ in sent) == 3   # re-armed after the healthy check
     finally:
         watcher.notify, watcher.STATUS_PATH, watcher.LOG_PATH, watcher.JOURNAL_PATH, ex.GUARD_PATH = orig
     fake.stop()

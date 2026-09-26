@@ -107,9 +107,11 @@ def record_plan(con, decision_day, orders, payload):
     cur = con.execute("INSERT INTO plans(created_at, decision_day, state, payload) VALUES(?,?,?,?)",
                       (now, decision_day, "PLANNED", json.dumps(payload)))
     pid = cur.lastrowid
-    # only ONE approvable plan exists at a time: older unapproved plans (and their buttons) become invalid
-    con.execute("UPDATE plans SET state='FAILED', note=? WHERE state='PLANNED' AND id<>?",
-                (f"superseded by plan {pid}", pid))
+    # only ONE approvable plan exists at a time: older unapproved plans (and their buttons) become invalid,
+    # except a pending cap-hit "Close all" plan, which only another cap plan may replace
+    con.execute("UPDATE plans SET state='FAILED', note=? WHERE state='PLANNED' AND id<>? AND "
+                "(? OR COALESCE(json_extract(payload, '$.reason'), '') <> 'cap')",
+                (f"superseded by plan {pid}", pid, payload.get("reason") == "cap"))
     for i, o in enumerate(orders):
         cid = f"s1-{pid}-{i}-{o['coin']}-{o['action'][0]}"[:64]
         con.execute("""INSERT INTO orders(plan_id, seq, coin, action, client_order_id, state, position_id,
@@ -200,13 +202,19 @@ def owned_ids(con):
     return {r["position_id"] for r in con.execute("SELECT position_id FROM owned WHERE closed_at IS NULL")}
 
 
+def quarantined(con, position_id):
+    """A position that did not match its order: never owned, amended or closed by the bot."""
+    return con.execute("SELECT 1 FROM orders WHERE position_id=? AND error LIKE 'position mismatch%'",
+                       (position_id,)).fetchone() is not None
+
+
 def recover_ownership(con, client):
     """Add our filled orders ('s1-...-O') seen in history to the local ownership table (which is authoritative)."""
     orders, truncated = client.history("orders")
     for o in orders:
         cid = o.get("client_order_id") or ""
         if cid.startswith("s1-") and cid.endswith("-O") and o.get("status") == "FILLED" \
-                and o.get("future_position_uuid"):
+                and o.get("future_position_uuid") and not quarantined(con, o["future_position_uuid"]):
             con.execute("INSERT OR IGNORE INTO owned(position_id, coin, client_order_id, opened_at) VALUES(?,?,?,?)",
                         (o["future_position_uuid"], o["symbol"].removesuffix("USDT"), cid, int(time.time())))
     return truncated
@@ -388,16 +396,24 @@ def stop_tolerance(fill, step):
     return max(2 * step, 0.002 * fill)
 
 
+def unprotected(con, oid, row, why, alert):
+    """A filled position whose protection is not confirmed: never FAILED (that would release the entry block)."""
+    set_order(con, oid, state="RECONCILE_REQUIRED", error=why)
+    event(con, "stop", f"{row['coin']}: {why}. POSITION MAY BE UNPROTECTED - check Mudrex now. "
+                       f"New entries are blocked until this is resolved.", alert)
+    return False
+
+
 def verify_entry(con, client, oid, sleep, alert):
-    """Confirm the position, quantity and an exchange stop at the fill-derived target. Returns True if VERIFIED."""
+    """Confirm the position identity, quantity and an exchange stop at the fill-derived target.
+    Returns True when protected; the caller sets VERIFIED only after the approved-notional check also passes,
+    so a crash in between leaves the order FILLED (re-checked by reconcile), never VERIFIED unchecked."""
     row = order_row(con, oid)
     pos = next((p for p in client.positions() if p["id"] == row["position_id"]), None)
     if pos is None:
         set_order(con, oid, state="RECONCILE_REQUIRED", error="filled but position not visible")
         event(con, "reconcile", f"{row['coin']}: filled but position not visible yet", alert)
         return False
-    con.execute("INSERT OR IGNORE INTO owned(position_id, coin, client_order_id, opened_at) VALUES(?,?,?,?)",
-                (pos["id"], row["coin"], row["client_order_id"], int(time.time())))
     fill = row["fill_price"]
     problems = []
     if pos.get("symbol") != row["coin"] + "USDT":
@@ -413,22 +429,25 @@ def verify_entry(con, client, oid, sleep, alert):
         problems.append(f"leverage {pos.get('leverage')}")
     if not row["filled_qty"] or abs(float(pos["quantity"]) - row["filled_qty"]) > 1e-9 * max(1, row["filled_qty"]):
         problems.append(f"qty {pos['quantity']} vs filled {row['filled_qty']}")
+    if problems:                                     # not the position we approved: no ownership, no writes to it
+        set_order(con, oid, state="RECONCILE_REQUIRED", error="position mismatch: " + "; ".join(problems))
+        con.execute("DELETE FROM owned WHERE position_id=? AND closed_at IS NULL", (pos["id"],))
+        event(con, "reconcile", f"{row['coin']}: position does not match the order ({'; '.join(problems)}). "
+                                f"The bot will not touch it. Check its stop-loss in Mudrex now; entries halted.", alert)
+        return False
+    con.execute("INSERT OR IGNORE INTO owned(position_id, coin, client_order_id, opened_at) VALUES(?,?,?,?)",
+                (pos["id"], row["coin"], row["client_order_id"], int(time.time())))
     try:
         liq = float(pos.get("liquidation_price"))
     except (TypeError, ValueError):
         liq = float("nan")
     if not (math.isfinite(liq) and 0 < liq < fill):
-        set_order(con, oid, state="RECONCILE_REQUIRED", error=f"liquidation price unknown/invalid ({liq})")
-        event(con, "stop", f"{row['coin']}: liquidation price unknown; stop NOT verified. Check Mudrex now.", alert)
-        return False
+        return unprotected(con, oid, row, f"liquidation price unknown/invalid ({liq}); stop NOT verified", alert)
     step = float(client.asset(row["coin"] + "USDT")["price_step"])
     target = floor_to(fill - s1.SL_ATR * row["atr"], step)
     tol = stop_tolerance(fill, step)
     if not (liq < target < fill):
-        set_order(con, oid, state="FAILED", error=f"target stop {target} invalid (fill {fill}, liq {liq})")
-        event(con, "stop", f"{row['coin']}: no valid stop possible (fill {fill}, liq {liq}). "
-                           f"POSITION IS UNPROTECTED - add a stop in the Mudrex app now.", alert)
-        return False
+        return unprotected(con, oid, row, f"no valid stop possible (target {target}, fill {fill}, liq {liq})", alert)
     ok = lambda sl: liq < sl < fill and abs(sl - target) <= tol     # noqa: E731
     sl_info = pos.get("stoploss") or {}
     current = float(sl_info.get("price") or 0)
@@ -448,18 +467,19 @@ def verify_entry(con, client, oid, sleep, alert):
             current = float(((pos or {}).get("stoploss") or {}).get("price") or 0)
             if ok(current):
                 break
-    if ok(current) and problems:                     # protected by a stop, but not the position we approved
-        set_order(con, oid, state="RECONCILE_REQUIRED", stop_price=fmt_step(current, step),
-                  error="position mismatch: " + "; ".join(problems))
-        event(con, "reconcile", f"{row['coin']}: position does not match the order ({'; '.join(problems)}). "
-                                f"Stop is in place; entries halted - check Mudrex.", alert)
-        return False
     if ok(current):
-        set_order(con, oid, state="VERIFIED", stop_price=fmt_step(current, step))
+        set_order(con, oid, stop_price=fmt_step(current, step))
         return True
-    set_order(con, oid, state="FAILED", error=f"stop-loss not verified (exchange {current}, target {target})")
-    event(con, "stop", f"{row['coin']}: stop-loss NOT at target ({current} vs {target}). "
-                       f"POSITION MAY BE UNPROTECTED - check Mudrex now.", alert)
+    return unprotected(con, oid, row, f"stop-loss not verified (exchange {current}, target {target})", alert)
+
+
+def protect_and_check(con, client, row, o, sleep, alert):
+    """Stop first (protection before accounting), then the approved-notional check; VERIFIED only if both pass."""
+    protected = verify_entry(con, client, row["id"], sleep, alert)
+    within = fill_within_approval(con, order_row(con, row["id"]), o, alert)
+    if protected and within:
+        set_order(con, row["id"], state="VERIFIED")
+        return True
     return False
 
 
@@ -528,6 +548,10 @@ def run_open(con, client, row, sleep, alert):
         return fail(con, row["id"], f"price drifted {price / planned - 1:+.1%} since plan")
     step, min_qty, min_notional = float(a["quantity_step"]), float(a["min_contract"]), float(a["min_notional_value"])
     notional_inr = min(row["planned_notional_inr"], s1.LEV * s1.CAPITAL_CAP_INR)
+    held = sum(float(p["quantity"]) * float(p["entry_price"]) * rate for p in positions if p["id"] in owned)
+    if held + notional_inr > s1.LEV * s1.CAPITAL_CAP_INR:
+        return fail(con, row["id"], f"allocation cap: bot holds Rs {held:,.0f}, +Rs {notional_inr:,.0f} would exceed "
+                                    f"Rs {s1.LEV * s1.CAPITAL_CAP_INR:,.0f}")
     qty = floor_to(notional_inr / (rate * HEDGE_BUFFER) / price, step)
     if qty < min_qty or qty * price < min_notional:
         return fail(con, row["id"], "below Mudrex minimum at live price")
@@ -555,8 +579,7 @@ def run_open(con, client, row, sleep, alert):
     o = poll_fill(con, client, row, sleep)
     if o is None:
         return order_row(con, row["id"])["state"] == "FAILED"
-    protected = verify_entry(con, client, row["id"], sleep, alert)     # stop first: protection before accounting
-    return fill_within_approval(con, row, o, alert) and protected
+    return protect_and_check(con, client, row, o, sleep, alert)
 
 
 def fill_within_approval(con, row, o, alert):
@@ -606,7 +629,8 @@ def execute(con, client, plan_id, approver, sleep=time.sleep, alert=None):
     except ApiError:
         pass                                                           # local ownership table is authoritative
     entries_allowed = True
-    for row in con.execute("SELECT * FROM orders WHERE plan_id=? ORDER BY seq", (plan_id,)).fetchall():
+    # closes first; any close that is not confirmed halts every entry (exposure would exceed the allocation)
+    for row in con.execute("SELECT * FROM orders WHERE plan_id=? ORDER BY action='OPEN', seq", (plan_id,)).fetchall():
         why = preflight()
         if why:
             set_order(con, row["id"], state="FAILED", error=f"halted: {why}")
@@ -614,8 +638,10 @@ def execute(con, client, plan_id, approver, sleep=time.sleep, alert=None):
         try:
             if row["action"] == "CLOSE":
                 run_close(con, client, row, sleep, alert)
+                if order_row(con, row["id"])["state"] != "VERIFIED":
+                    entries_allowed = False
             elif not entries_allowed:
-                set_order(con, row["id"], state="FAILED", error="halted: an earlier entry is unverified")
+                set_order(con, row["id"], state="FAILED", error="halted: an earlier order is unconfirmed")
             else:
                 entries_allowed = run_open(con, client, row, sleep, alert)
         except Halt as h:
@@ -667,8 +693,7 @@ def reconcile(con, client, sleep=time.sleep, alert=None, min_age=900):
             if row["state"] != "FILLED" or not row["fill_price"]:
                 set_order(con, row["id"], state="FILLED", fill_price=float(o["filled_price"]),
                           filled_qty=float(o["filled_quantity"]), position_id=o.get("future_position_uuid"))
-            if verify_entry(con, client, row["id"], sleep, alert):
-                fill_within_approval(con, order_row(con, row["id"]), o, alert)
+            protect_and_check(con, client, row, o, sleep, alert)
         except ApiError as e:
             event(con, "reconcile", f"{row['coin']}: reconcile deferred ({e})", alert)
     for pid in stale:
