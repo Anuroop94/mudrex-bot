@@ -1,35 +1,37 @@
-"""Minimal Telegram Bot API client (stdlib). Reads TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID from .env.
+"""Minimal Telegram Bot API client (stdlib). Reads TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_USER_ID from .env.
 
 Setup (you do this once):
-  1. In Telegram, message @BotFather -> /newbot -> copy the token into .env as TELEGRAM_BOT_TOKEN=...
-  2. Send any message (e.g. /start) to your new bot.
-  3. Run  python telegram_bot.py setup   -> it prints your chat id; put it in .env as TELEGRAM_CHAT_ID=...
-Only messages and button taps from TELEGRAM_CHAT_ID are ever accepted.
+  1. In Telegram, message @BotFather -> /newbot -> put the token in .env as TELEGRAM_BOT_TOKEN=...
+  2. Send /start to your new bot from your own account (a private chat, not a group).
+  3. Run  python telegram_bot.py setup  -> prints your chat id and user id; add both to .env as
+     TELEGRAM_CHAT_ID=...  and  TELEGRAM_USER_ID=...
+Requests are POSTs with a JSON body. The token is part of the URL path because the Telegram API requires it;
+it is never logged. Only a private chat whose chat id AND sender id match .env is ever accepted.
 """
 import json
 import os
 import sys
 import urllib.error
-import urllib.parse
 import urllib.request
 
 import config  # noqa: F401  (loads .env)
 
 
 def enabled():
-    return bool(os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID"))
+    return all(os.environ.get(k) for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "TELEGRAM_USER_ID"))
 
 
 def call(method, **params):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         return None
-    q = urllib.parse.urlencode({k: json.dumps(v) if isinstance(v, (dict, list)) else v for k, v in params.items()})
+    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/{method}", method="POST",
+                                 data=json.dumps(params).encode(), headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/{method}?{q}", timeout=40) as r:
+        with urllib.request.urlopen(req, timeout=40) as r:
             body = json.load(r)
         return body.get("result") if body.get("ok") else None
-    except (urllib.error.URLError, TimeoutError, ValueError):
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
         return None
 
 
@@ -55,9 +57,28 @@ def edit(chat_id, message_id, text):
     call("editMessageText", chat_id=chat_id, message_id=message_id, text=text[:4000])
 
 
+def authorized(update):
+    """True only for a private chat == TELEGRAM_CHAT_ID from sender == TELEGRAM_USER_ID."""
+    chat_id, user_id = os.environ.get("TELEGRAM_CHAT_ID", ""), os.environ.get("TELEGRAM_USER_ID", "")
+    if not (chat_id and user_id):
+        return False
+    cq, msg = update.get("callback_query"), update.get("message")
+    if cq:
+        chat, sender = (cq.get("message") or {}).get("chat", {}), cq.get("from", {})
+    elif msg:
+        chat, sender = msg.get("chat", {}), msg.get("from", {})
+    else:
+        return False
+    return (str(chat.get("id")) == chat_id and chat.get("type") == "private"
+            and str(sender.get("id")) == user_id and not sender.get("is_bot"))
+
+
 if __name__ == "__main__" and sys.argv[1:] == ["setup"]:
     if not os.environ.get("TELEGRAM_BOT_TOKEN"):
         sys.exit("put TELEGRAM_BOT_TOKEN=... in .env first (from @BotFather)")
-    seen = {(u.get("message") or {}).get("chat", {}).get("id") for u in updates(0)}
-    seen.discard(None)
-    print("chat ids that messaged your bot:", seen or "none yet: send /start to your bot, then run this again")
+    seen = {((u.get("message") or {}).get("chat", {}).get("id"), (u.get("message") or {}).get("from", {}).get("id"),
+             (u.get("message") or {}).get("chat", {}).get("type")) for u in updates(0) if u.get("message")}
+    if not seen:
+        print("none yet: send /start to your bot from your own account, then run this again")
+    for chat, user, kind in seen:
+        print(f"chat id {chat} ({kind}), user id {user}")

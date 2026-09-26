@@ -216,15 +216,17 @@ async function tick(){
   const L=s.limits; document.getElementById("limits").innerHTML=[["Risk per trade",pct(L.risk_per_trade)],["Max leverage",L.leverage+"x"],
     ["Daily loss stop",pct(L.daily_loss_cap)],["Halve risk at drawdown",pct(L.dd_halve)],["Halt at drawdown",pct(L.dd_halt)],
     ["Fee (+GST)",pct(L.taker_fee,3)+" + "+pct(L.gst,0)],["INR / USDT",L.inr_per_usdt]].map(([k,v])=>`<span class="muted">${k}</span><b>${v}</b>`).join("");
-  if(s.watch){ const W=s.watch, age=Date.now()/1000-W.at, alive=age<2*W.check_every_sec+60, rup=x=>"₹"+(+x).toLocaleString(undefined,{maximumFractionDigits:0});
-    const bar=(v,cap,col)=>`<div class="bar" style="width:220px"><i style="width:${Math.min(100,Math.max(0,100*v/cap))}%;background:var(--${col})"></i></div>`;
+  if(s.watch){ const W=s.watch, B=W.bot||{}, age=Date.now()/1000-W.at, alive=age<2*W.check_every_sec+60, rup=x=>"₹"+(+x||0).toLocaleString(undefined,{maximumFractionDigits:0});
+    const bar=(v,cap,col)=>`<div class="bar" style="width:220px"><i style="width:${Math.min(100,Math.max(0,100*v/(cap||1)))}%;background:var(--${col})"></i></div>`;
+    const status=W.stop?["KILL SWITCH ON","bad","no orders until: python ops.py resume"]:!W.live_enabled?["LIVE OFF","bad","LIVE_TRADING_ENABLED=false"]:
+      B.cap_hit?["CAP HIT ("+esc(B.cap_hit)+")","bad","no new entries until tomorrow"]:["trading allowed","good","new entries allowed today"];
     document.getElementById("watch").innerHTML=`<div style="display:flex;gap:32px;flex-wrap:wrap">
       <div><div class="muted">Watcher</div><div class="big ${alive?"good":"bad"}">${alive?"RUNNING":"STOPPED"}</div><div class="muted">last check ${ago(W.at)}${W.ok===false?' · <span class="bad">'+esc(W.error||"error")+"</span>":""}</div></div>
-      <div><div class="muted">Equity</div><div class="big">${rup(W.equity_inr)}</div><div class="muted">day start ${rup(W.day_start_equity)}</div></div>
-      <div><div class="muted">Today P&amp;L (IST ${esc(W.day)})</div><div class="big ${sign(W.day_pnl)}">${W.day_pnl>=0?"+":""}${rup(W.day_pnl)}</div>
-        <div class="muted">profit cap ${rup(W.profit_cap)}</div>${bar(Math.max(W.day_pnl,0),W.profit_cap,"good")}
-        <div class="muted">loss cap ${rup(W.loss_cap)}</div>${bar(Math.max(-W.day_pnl,0),W.loss_cap,"bad")}</div>
-      <div><div class="muted">Status</div><div class="big ${W.cap_hit?"bad":"good"}">${W.cap_hit?"CAP HIT ("+esc(W.cap_hit)+")":"trading allowed"}</div><div class="muted">${W.cap_hit?"no new trades until tomorrow":"new trades allowed today"}</div></div></div>`+
+      <div><div class="muted">Bot equity</div><div class="big">${rup(B.equity)}</div><div class="muted">Rs 5,000 allocation + bot P&amp;L · day start ${rup(B.day_start)}</div></div>
+      <div><div class="muted">Bot P&amp;L today (IST ${esc(B.day||"")})</div><div class="big ${sign(B.day_pnl)}">${B.day_pnl>=0?"+":""}${rup(B.day_pnl)}</div>
+        <div class="muted">profit cap ${rup(B.cap)}</div>${bar(Math.max(B.day_pnl,0),B.cap,"good")}
+        <div class="muted">loss cap ${rup(B.cap)}</div>${bar(Math.max(-B.day_pnl,0),B.cap,"bad")}</div>
+      <div><div class="muted">Status</div><div class="big ${status[1]}">${status[0]}</div><div class="muted">${status[2]}</div></div></div>`+
       (W.positions.length?table([["Coin",p=>esc(p.symbol)],["Side",p=>esc(p.side)],["Qty",p=>p.qty],["Entry",p=>(+p.entry).toPrecision(5)],["Now",p=>(+p.price).toPrecision(5)],
         ["Stop-loss",p=>p.sl?(+p.sl).toPrecision(5):'<span class="bad">NONE</span>'],["P&L",p=>`<span class="${sign(p.upnl_inr)}">${rup(p.upnl_inr)}</span>`],["Owner",p=>p.bot?"bot (S1)":"manual"]],W.positions):
         `<div class="muted" style="margin-top:8px">no open positions</div>`) }

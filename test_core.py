@@ -229,57 +229,94 @@ def test_live_build_orders_safety():
     prices = {c: 1.5 for c in s1.BASKET}
     atrs = {c: 0.1 for c in s1.BASKET}
     targets = {"XRP": 0.2, "ADA": 0.2}
-    o = {x["coin"]: x for x in lt.build_orders(targets, {}, prices, atrs, specs, 20000, 20000, {}, False)}
-    # sized on the Rs 5,000 cap even though equity is Rs 20,000: 0.2 * 2x * 5000 = Rs 2000 notional
-    assert o["XRP"]["action"] == "OPEN" and abs(o["XRP"]["notional_inr"] - 2000) <= 1.5 * config.INR_PER_USDT * 0.1
-    assert o["XRP"]["notional_inr"] <= 2000 and o["XRP"]["margin_inr"] == round(o["XRP"]["notional_inr"] / 2)
-    assert 1.2 - 0.0001 <= float(o["XRP"]["stop"]) <= 1.2   # 3x ATR below, rounded down to price step
-    # loss stop: no entries, exits still allowed
-    held = {"LINK": dict(id="p1", qty=1.0, entry=1.4, sl=1.2)}
-    o = {x["coin"]: x for x in lt.build_orders(targets, held, prices, atrs, specs, 5000, 5000, {}, True)}
-    assert o["XRP"]["action"] == "SKIP" and o["LINK"]["action"] == "CLOSE"
-    # stopped-out coin is not re-bought; margin budget respected; held + still up = HOLD
-    o = {x["coin"]: x for x in lt.build_orders(targets, {"ADA": dict(id="p2", qty=1, entry=1, sl=0.9)}, prices,
-                                               atrs, specs, 5000, 500, {"XRP": False}, False)}
-    assert o["XRP"]["action"] == "SKIP" and o["ADA"]["action"] == "HOLD"
-    o = {x["coin"]: x for x in lt.build_orders(targets, {}, prices, atrs, specs, 5000, 500, {}, False)}
-    assert o["XRP"]["action"] == "SKIP" and "margin" in o["XRP"]["reason"]
+    o = {x["coin"]: x for x in lt.build_orders(targets, {}, set(), prices, atrs, specs, 20000, {}, None, 102)}
+    # sized on the Rs 5,000 allocation even though bot equity says Rs 20,000: 0.2 * 2x * 5000 = Rs 2000
+    assert o["XRP"]["action"] == "OPEN" and o["XRP"]["notional_inr"] == 2000
+    assert abs(o["XRP"]["est_stop"] - 1.2) < 1e-9                   # 3x ATR (final stop re-anchored to the fill)
+    # entries blocked (cap/guard/STOP): no entries, exits of BOT-OWNED positions still planned
+    o = {x["coin"]: x for x in lt.build_orders(targets, {"LINK": "pos-1"}, set(), prices, atrs, specs, 5000, {},
+                                               "daily loss cap hit", 102)}
+    assert o["XRP"]["action"] == "SKIP" and o["LINK"] == dict(action="CLOSE", coin="LINK", position_id="pos-1",
+                                                             reason="trend exit / market mood")
+    # manual position on a coin: nothing planned on it at all; stopped-out coin not re-bought; owned + up = HOLD
+    o = {x["coin"]: x for x in lt.build_orders(targets, {"ADA": "p2"}, {"XRP"}, prices, atrs, specs, 5000,
+                                               {"XRP": False}, None, 102)}
+    assert o["XRP"]["action"] == "SKIP" and "manual" in o["XRP"]["reason"] and o["ADA"]["action"] == "HOLD"
+    o = {x["coin"]: x for x in lt.build_orders(targets, {}, set(), prices, atrs, specs, 5000, {"XRP": False},
+                                               None, 102)}
+    assert o["XRP"]["action"] == "SKIP" and "stopped out" in o["XRP"]["reason"]
 
 
 def test_live_execute_requires_yes():
-    import builtins
     import tempfile
+    import execution as ex
     import live_trader as lt
     tmp = tempfile.mkdtemp()
-    lt.PLAN_PATH, lt.STATE_PATH, lt.STOP_PATH = (os.path.join(tmp, n) for n in ("plan.json", "state.json", "STOP"))
-    lt.write_json(lt.PLAN_PATH, dict(created_at=time.time(), executed=False, strategy="t", decision_day="x",
-                                     orders=[dict(action="OPEN", coin="XRP", qty="1", notional_inr=100, stop="1")]))
-    called = []
-    orig_api, orig_input = lt.api, builtins.input
-    lt.api = lambda *a, **k: called.append(a)
-    builtins.input = lambda *_: "yes please"
+    ex.STOP_PATH = os.path.join(tmp, "STOP")
+    con = ex.db(os.path.join(tmp, "e.db"))
+    ex.record_plan(con, "x", [dict(coin="XRP", action="OPEN", planned_price=1.5, notional_inr=1000, atr=0.1)], {})
+    ran = []
+    orig, env = ex.execute, os.environ.get("LIVE_TRADING_ENABLED")
+    ex.execute = lambda *a, **k: ran.append(a) or ("COMPLETE", [])
+    os.environ["LIVE_TRADING_ENABLED"] = "true"
     try:
-        lt.execute()
-        raise AssertionError("execute must abort without exact YES")
-    except SystemExit:
-        pass
+        for answer in ("yes", "y", "YES please", ""):
+            try:
+                lt.execute(client=object(), con=con, confirm=lambda *_: answer)
+                raise AssertionError("execute must abort without exact YES")
+            except SystemExit:
+                pass
+        assert not ran
+        open(ex.STOP_PATH, "w").close()          # kill switch blocks before even asking
+        try:
+            lt.execute(client=object(), con=con, confirm=lambda *_: "YES")
+            raise AssertionError("STOP must block")
+        except SystemExit as e:
+            assert "STOP" in str(e) and not ran
+        os.remove(ex.STOP_PATH)
+        os.environ["LIVE_TRADING_ENABLED"] = "false"   # live flag off (the default) blocks too
+        try:
+            lt.execute(client=object(), con=con, confirm=lambda *_: "YES")
+            raise AssertionError("LIVE_TRADING_ENABLED=false must block")
+        except SystemExit as e:
+            assert "LIVE_TRADING_ENABLED" in str(e) and not ran
     finally:
-        lt.api, builtins.input = orig_api, orig_input
-    assert not called
-    open(lt.STOP_PATH, "w").close()      # kill switch blocks even before asking
-    try:
-        lt.execute()
-        raise AssertionError("STOP file must block")
-    except SystemExit as e:
-        assert "STOP" in str(e)
+        ex.execute = orig
+        if env is None:
+            os.environ.pop("LIVE_TRADING_ENABLED", None)
+        else:
+            os.environ["LIVE_TRADING_ENABLED"] = env
 
 
 def test_watcher_is_read_only():
     src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "watcher.py")).read()
-    for banned in ("/v2/futures/order", "futures/order?", "/close", "POST", "PATCH", "DELETE", "execute(",
-                   "riskorder", "leverage?", "method="):
+    for banned in ("place_market_long", "close_position", "set_stoploss", "set_leverage", ".post(", "ex.execute(",
+                   "urllib.request", "claim("):
         assert banned not in src, banned
-    assert "urllib.request.Request(API + path, headers=" in src     # the only HTTP call: a plain GET
+
+
+def test_watcher_plan_failure_then_retry():
+    import watcher
+    st, calls = {}, []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise ConnectionError("mudrex down")
+        return dict(plan_id=None, orders=[], blocked=None, live_enabled=False)
+    orig = watcher.notify
+    watcher.notify = lambda *a, **k: None
+    try:
+        assert watcher.maybe_plan(st, flaky, now_hm="06:00", today="2026-09-28") is False
+        assert "plan_day" not in st and st["plan_fails"] == 1        # failure NOT recorded as done
+        assert watcher.maybe_plan(st, flaky, now_hm="06:00", today="2026-09-28") is False   # backoff: not yet
+        st["plan_retry_at"] = 0
+        assert watcher.maybe_plan(st, flaky, now_hm="06:00", today="2026-09-28") is True
+        assert st["plan_day"] == "2026-09-28" and len(calls) == 2
+        assert watcher.maybe_plan(st, flaky, now_hm="07:00", today="2026-09-28") is False   # once per day
+        assert watcher.maybe_plan({}, flaky, now_hm="05:00", today="2026-09-29") is False   # before the close
+    finally:
+        watcher.notify = orig
 
 
 def test_s2_model_learns_and_never_peeks():
@@ -318,40 +355,50 @@ def test_s2_model_learns_and_never_peeks():
 def test_telegram_approval_security():
     import tempfile
     import approver
-    import live_trader as lt
+    import execution as ex
     import telegram_bot as tg
     tmp = tempfile.mkdtemp()
-    lt.PLAN_PATH, lt.STATE_PATH, lt.STOP_PATH = (os.path.join(tmp, n) for n in ("plan.json", "state.json", "STOP"))
-    plan = dict(created_at=int(time.time()), executed=False, strategy="t", decision_day="x",
-                orders=[dict(action="OPEN", coin="XRP", qty="1", notional_inr=100, stop="1")])
-    lt.write_json(lt.PLAN_PATH, plan)
-    placed, sent = [], []
-    orig = (lt.place, tg.answer, tg.edit, tg.send)
-    lt.place = lambda p, todo, approved_by: placed.append(approved_by) or ["ok"]
+    ex.STOP_PATH = os.path.join(tmp, "STOP")
+    saved = {k: os.environ.get(k) for k in ("TELEGRAM_CHAT_ID", "TELEGRAM_USER_ID")}
+    os.environ.update(TELEGRAM_CHAT_ID="111", TELEGRAM_USER_ID="222")
+    ran, sent = [], []
+    orig = (tg.answer, tg.edit, tg.send)
     tg.answer = lambda *a: sent.append(a)
     tg.edit = lambda *a: sent.append(a)
     tg.send = lambda *a, **k: sent.append(a)
+    run = lambda pid, who: ran.append((pid, who)) or ("COMPLETE", [])   # noqa: E731
 
-    def tap(chat, data):
-        approver.handle(dict(callback_query=dict(id="q", data=data, message=dict(chat=dict(id=chat), message_id=1,
-                                                                                text="plan"))), "111")
+    def tap(chat, user, data="approve:7", kind="private", is_bot=False):
+        return approver.handle(dict(callback_query=dict(
+            id="q", data=data, from_=None, **{"from": dict(id=user, is_bot=is_bot)},
+            message=dict(chat=dict(id=chat, type=kind), message_id=1, text="plan"))), run)
+
+    def say(text, chat=111, user=222):
+        return approver.handle(dict(message=dict(text=text, chat=dict(id=chat, type="private"),
+                                                 **{"from": dict(id=user)})), run)
     try:
-        tap(999, f"approve:{plan['created_at']}")          # stranger: ignored
-        assert not placed
-        tap(111, "approve:123")                             # wrong plan id: refused
-        assert not placed
-        open(lt.STOP_PATH, "w").close()
-        tap(111, f"approve:{plan['created_at']}")           # kill switch: refused
-        assert not placed
-        os.remove(lt.STOP_PATH)
-        tap(111, f"approve:{plan['created_at']}")           # owner, right plan: placed once
-        assert placed == ["telegram chat 111"]
-        plan["executed"] = True
-        lt.write_json(lt.PLAN_PATH, plan)
-        tap(111, f"approve:{plan['created_at']}")           # second tap: already executed
-        assert len(placed) == 1
+        assert tap(111, 999) == "ignored" and not ran              # right chat, wrong person
+        assert tap(999, 222) == "ignored" and not ran              # right person, wrong chat
+        assert tap(111, 222, kind="group") == "ignored" and not ran   # not a private chat
+        assert tap(111, 222, is_bot=True) == "ignored" and not ran
+        assert tap(111, 222, data="approve:x") == "ignored" and not ran
+        tap(111, 222)                                              # owner: handed to execution (which locks/checks)
+        assert ran == [(7, "telegram user 222")]
+        say("/stop")
+        assert os.path.exists(ex.STOP_PATH)                        # remote kill switch works
+        say("/resume")
+        assert os.path.exists(ex.STOP_PATH)                        # remote resume refused (local only)
+        say("/stop", user=999)
+        os.remove(ex.STOP_PATH)
+        say("/stop", user=999)
+        assert not os.path.exists(ex.STOP_PATH)                    # strangers cannot even stop it
     finally:
-        lt.place, tg.answer, tg.edit, tg.send = orig
+        tg.answer, tg.edit, tg.send = orig
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def test_closed_only_and_gaps():
