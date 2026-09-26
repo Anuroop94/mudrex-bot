@@ -245,8 +245,8 @@ def check(st, client=None, con=None, make_plan=None):
                    if want and abs(v["sl"] - want) > ex.stop_tolerance(v["entry"], 0) else None)
         key = f"{v['id']}:{problem}"
         if problem and key not in st.setdefault("warned_sl", []):
-            st["warned_sl"].append(key)
-            notify(f"{coin}: bot position {problem} on Mudrex. Check it in the app now.")
+            if notify(f"{coin}: bot position {problem} on Mudrex. Check it in the app now."):
+                st["warned_sl"].append(key)           # handled only once delivered; otherwise retried next check
 
     if caps["hit"] and st.get("cap_day") != caps["day"]:
         bot_open = [v for v in view if v["bot"]]

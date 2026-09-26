@@ -307,14 +307,20 @@ def gate():
 # ---------- order lifecycle
 
 def lookup_until_known(client, cid, sleep, tries=LOOKUP_TRIES):
+    """The order, or None only if Mudrex definitively answered 'not found' (404).
+    Raises Ambiguous if every lookup failed: an unanswered lookup must never be read as 'not placed'."""
+    answered = False
     for i in range(tries):
         try:
             o = client.order_by_client_id(cid)
             if o is not None:
                 return o
+            answered = True
         except (Ambiguous, Locked):
             pass
         sleep(min(2 ** i, 8))
+    if not answered:
+        raise Ambiguous(0, f"lookup of {cid} inconclusive after {tries} tries")
     return None
 
 
@@ -550,22 +556,28 @@ def run_open(con, client, row, sleep, alert):
     if o is None:
         return order_row(con, row["id"])["state"] == "FAILED"
     protected = verify_entry(con, client, row["id"], sleep, alert)     # stop first: protection before accounting
+    return fill_within_approval(con, row, o, alert) and protected
+
+
+def fill_within_approval(con, row, o, alert):
+    """Hard check: filled INR notional (at the rate Mudrex applied) must not exceed the approved notional.
+    Sizing already leaves HEDGE_BUFFER headroom, so no extra allowance is added here."""
     try:
         applied = float(o.get("hedge_rate") or 0)
-    except (TypeError, ValueError):
-        applied = 0.0
-    allowed = min(row["planned_notional_inr"], s1.LEV * s1.CAPITAL_CAP_INR) * HEDGE_BUFFER
-    actual = float(o["filled_quantity"]) * float(o["filled_price"]) * applied
-    if applied <= 0 or actual > allowed:
-        cur = order_row(con, row["id"])
-        set_order(con, row["id"], state="RECONCILE_REQUIRED",
-                  error=(cur["error"] + "; " if cur["error"] else "") +
-                  (f"applied INR rate missing" if applied <= 0 else f"INR notional {actual:,.0f} > allowed {allowed:,.0f}"))
-        event(con, "hedge", f"{row['coin']}: " + ("Mudrex did not report the INR rate it applied" if applied <= 0 else
-                            f"filled INR notional Rs {actual:,.0f} exceeds the approved Rs {allowed:,.0f}")
-              + ". Entries halted; reduce the position in Mudrex if needed.", alert)
-        return False
-    return protected
+        actual = float(o["filled_quantity"]) * float(o["filled_price"]) * applied
+    except (KeyError, TypeError, ValueError):
+        applied = actual = 0.0
+    allowed = min(row["planned_notional_inr"], s1.LEV * s1.CAPITAL_CAP_INR)
+    if applied > 0 and actual <= allowed:
+        return True
+    cur = order_row(con, row["id"])
+    set_order(con, row["id"], state="RECONCILE_REQUIRED",
+              error=(cur["error"] + "; " if cur["error"] else "") +
+              ("applied INR rate missing" if applied <= 0 else f"INR notional {actual:,.0f} > allowed {allowed:,.0f}"))
+    event(con, "hedge", f"{row['coin']}: " + ("Mudrex did not report the INR rate it applied" if applied <= 0 else
+                        f"filled INR notional Rs {actual:,.0f} exceeds the approved Rs {allowed:,.0f}")
+          + ". Entries halted; reduce the position in Mudrex if needed.", alert)
+    return False
 
 
 def plan_outcome(con, plan_id):
@@ -643,19 +655,20 @@ def reconcile(con, client, sleep=time.sleep, alert=None, min_age=900):
                     con.execute("UPDATE owned SET closed_at=? WHERE position_id=?",
                                 (int(time.time()), row["position_id"]))
                 continue
+            o = lookup_until_known(client, row["client_order_id"], sleep)   # raises if inconclusive -> deferred
+            if o is None:
+                set_order(con, row["id"], state="FAILED", error="not found on exchange after restart")
+                continue
+            if o.get("status") in TERMINAL_BAD:
+                set_order(con, row["id"], state="FAILED", error=f"order {o['status']}")
+                continue
+            if o.get("status") not in TERMINAL_OK:
+                continue                                               # still working: next reconcile
             if row["state"] != "FILLED" or not row["fill_price"]:
-                o = lookup_until_known(client, row["client_order_id"], sleep)
-                if o is None:
-                    set_order(con, row["id"], state="FAILED", error="not found on exchange after restart")
-                    continue
-                if o.get("status") in TERMINAL_BAD:
-                    set_order(con, row["id"], state="FAILED", error=f"order {o['status']}")
-                    continue
-                if o.get("status") not in TERMINAL_OK:
-                    continue                                           # still working: next reconcile
                 set_order(con, row["id"], state="FILLED", fill_price=float(o["filled_price"]),
                           filled_qty=float(o["filled_quantity"]), position_id=o.get("future_position_uuid"))
-            verify_entry(con, client, row["id"], sleep, alert)
+            if verify_entry(con, client, row["id"], sleep, alert):
+                fill_within_approval(con, order_row(con, row["id"]), o, alert)
         except ApiError as e:
             event(con, "reconcile", f"{row['coin']}: reconcile deferred ({e})", alert)
     for pid in stale:

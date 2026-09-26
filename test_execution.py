@@ -100,7 +100,7 @@ def test_crash_after_submission_and_after_202():
         tmp, fake, client, con = setup()
         pid = plan(con, ["XRP"])
         row = con.execute("SELECT * FROM orders WHERE plan_id=?", (pid,)).fetchone()
-        fake.create_order("XRPUSDT", dict(client_order_id=row["client_order_id"], quantity="600"))  # it DID land
+        fake.create_order("XRPUSDT", dict(client_order_id=row["client_order_id"], quantity="6"))    # it DID land
         _simulate_crash(con, pid, journal_state)
         ex.reconcile(con, client, NOSLEEP)
         st = states(con, pid)["XRP"]
@@ -160,6 +160,34 @@ def test_restart_reconciliation_by_client_order_id():
     con.execute("UPDATE plans SET approved_at=? WHERE id=?", (int(time.time()) - 3600, pid))
     ex.reconcile(con, client, NOSLEEP)                             # restart: lookup says it never landed
     assert states(con, pid)["XRP"][0] == "FAILED" and not fake.positions
+    fake.stop()
+
+
+def test_inconclusive_lookup_never_releases_an_unknown_order():
+    tmp, fake, client, con = setup()
+    fake.faults["order"] = ["timeout"]
+    pid = plan(con, ["XRP"])
+    assert ex.execute(con, client, pid, "t", NOSLEEP)[0] == "RECONCILE_REQUIRED"
+    con.execute("UPDATE plans SET approved_at=? WHERE id=?", (int(time.time()) - 3600, pid))
+    fake.faults["detail"] = ["500"] * 100                          # exchange cannot answer the lookup
+    ex.reconcile(con, client, NOSLEEP)
+    assert states(con, pid)["XRP"][0] == "RECONCILE_REQUIRED"      # deferred, not "not found"
+    assert "reconciliation" in ex.claim(con, plan(con, ["ADA"]), "t")   # entries stay blocked
+    fake.stop()
+
+
+def test_recovery_checks_fill_against_approved_notional():
+    tmp, fake, client, con = setup()
+    fake.applied_rate = "130"
+    pid = plan(con, ["XRP"])
+    row = con.execute("SELECT * FROM orders WHERE plan_id=?", (pid,)).fetchone()
+    fake.create_order("XRPUSDT", dict(client_order_id=row["client_order_id"], quantity="6"))
+    _simulate_crash(con, pid, "ACCEPTED")                          # crashed after fill, before the notional check
+    alerts = []
+    ex.reconcile(con, client, NOSLEEP, alerts.append)
+    st = states(con, pid)["XRP"]
+    assert st[0] == "RECONCILE_REQUIRED" and "allowed" in st[1], st
+    assert any("exceeds the approved" in a for a in alerts)
     fake.stop()
 
 
@@ -448,6 +476,9 @@ def test_watcher_flags_moved_stop_and_retries_cap_close_delivery():
         watcher.check(st, client, con, make_plan=lambda: dict(plan_id=None, orders=[], created_at=time.time()))
         assert st.get("cap_day") and any(b and f"approve:{cap_pid}" in str(b) for _, b in sent)
         assert con.execute("SELECT COUNT(*) FROM plans WHERE payload LIKE '%cap%'").fetchone()[0] == 1   # no dupes
+        assert sum("stop moved" in m for m, _ in sent) == 2          # undelivered stop alert was retried
+        watcher.check(st, client, con, make_plan=lambda: dict(plan_id=None, orders=[], created_at=time.time()))
+        assert sum("stop moved" in m for m, _ in sent) == 2          # delivered once -> not repeated
     finally:
         watcher.notify, watcher.STATUS_PATH, watcher.LOG_PATH, watcher.JOURNAL_PATH, ex.GUARD_PATH = orig
     fake.stop()

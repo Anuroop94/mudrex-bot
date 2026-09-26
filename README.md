@@ -10,7 +10,7 @@ Backtests are not guarantees. **Every real order needs a human approval** (termi
 | `LIVE_TRADING_ENABLED` | `.env` (absent = `false`) | Must be exactly `true` or nothing is ever sent to Mudrex |
 | `STOP` file | this folder | Kill switch: blocks every order, checked before the plan AND before each order |
 | Performance guard | `guard.json` (`tripped`) | Set by the watcher when live results break backtest limits; blocks new entries |
-| Daily caps | `execution.db` ledger | 5% of the bot's day-start equity; blocks new entries. Caps never close by themselves: the watcher sends a *Close all* plan for you to approve |
+| Daily caps | `execution.db` ledger | 5% of the bot's day-start equity; blocks new entries. Caps never close by themselves: the watcher sends a *Close all* plan for you to approve. So 5% is an entry-halt line, NOT a maximum loss: losses can run past it before you approve, or through a stop that gaps |
 
 ## Modes
 - **Backtest / research**: `python research_small.py`, `python research_rules.py` (no account access).
