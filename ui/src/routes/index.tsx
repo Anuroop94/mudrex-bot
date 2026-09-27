@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 import { sign, useLive, type Live } from "../lib/live";
+import { LogsView, PaperView } from "../components/PaperView";
 import {
   Area,
   AreaChart,
@@ -85,6 +86,7 @@ function age(sec: number | null) {
 
 function MudrexDashboard() {
   const [range, setRange] = useState<Range>("1D");
+  const [view, setView] = useState<"live" | "paper" | "logs">("live");
   const { data, error, updated } = useLive();
   if (!data) return <Connecting error={error} />;
   const status = data.status;
@@ -173,6 +175,18 @@ function MudrexDashboard() {
           </div>
         </div>
 
+        <div className="range-tabs view-tabs" role="tablist" aria-label="Dashboard section">
+          {([["live", "Live trading"], ["paper", "Paper trading"], ["logs", "Logs"]] as const).map(([key, label]) => (
+            <button key={key} type="button" role="tab" aria-selected={view === key}
+              className={view === key ? "range-active" : ""} onClick={() => setView(key)}>
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {view === "paper" && <PaperView paper={data.paper} />}
+        {view === "logs" && <LogsView logs={data.paper.logs} />}
+        {view === "live" && (
         <div className="dashboard-grid">
           <section className={`card action-card ${plan.needsAction ? "action-waiting" : ""}`} aria-labelledby="action-title">
             <div className="action-symbol" aria-hidden="true">
@@ -462,6 +476,7 @@ function MudrexDashboard() {
             </div>
           </details>
         </div>
+        )}
 
         <footer className="page-footer">
           <span><span className="footer-status" />Your dashboard is read-only</span>

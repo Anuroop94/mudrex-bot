@@ -66,6 +66,61 @@ def _curve(marks, since, bucket, fmt):
                 points=[dict(label=_ist(t, fmt), value=round(e, 2)) for t, e in pts])
 
 
+def _tail(name, lines=40):
+    try:
+        with open(os.path.join(HERE, name), "rb") as f:
+            raw = f.read()
+    except OSError:
+        return []
+    enc = "utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"      # PowerShell redirects add BOMs
+    return raw.decode(enc, errors="replace").splitlines()[-lines:]
+
+
+def _pct(x):
+    return f"{x:+.2%}"
+
+
+def paper_ui():
+    """Paper trading (no real money): S1 challengers, S3 set trader, older research bots, recent logs."""
+    import paper_portfolio
+    import paper_s1
+    s1p = (_json("s1_paper_state.json") or {}).get("snapshot") or {}
+    rows = [dict(name=r["name"], desc=r["desc"], champion=r["champion"], days=r["days"], total=_pct(r["total"]),
+                 maxDd=f"{r['max_dd']:.1%}", trades=r["trades"],
+                 t="—" if r["champion"] else f"{r['vs_champion_t']:.2f}",
+                 verdict="champion" if r["champion"] else "PROMOTE?" if r.get("promote") else
+                 f"collecting ({r['overlap_days']}/{paper_s1.PROMOTE_DAYS} days)")
+            for r in paper_s1.leaderboard()]
+    s3 = _json("s3_paper_state.json") or {}
+    s3_eq, s3_start = float(s3.get("equity_inr") or 0), float(s3.get("start_inr") or 0) or 1
+    research = [dict(name=r["name"], desc=r["desc"], days=r["days"], total=_pct(r["total"]),
+                     maxDd=f"{r['max_dd']:.1%}") for r in paper_portfolio.leaderboard()]
+    t1 = _json("paper_state.json")
+    if t1 and t1.get("start_equity"):
+        research.append(dict(name="T1", desc="Donchian breakout + ATR trail (first research bot)",
+                             days=len({c.get("day") for c in t1.get("closed", [])}), maxDd="—",
+                             total=_pct(t1["equity"] / t1["start_equity"] - 1)))
+    return dict(
+        s1=dict(rows=rows, equity=_rs(s1p.get("equity_inr") or 0), decision=s1p.get("decision") or "—",
+                plan=s1p.get("plan") or [],
+                rule=(f"A challenger replaces S1 only after {paper_s1.PROMOTE_DAYS}+ days side by side, "
+                      f"{paper_s1.PROMOTE_TRADES}+ closed trades, weekly t ≥ {paper_s1.PROMOTE_T:.2f} and a drawdown "
+                      f"no worse than S1's + 2 points, and then only with your OK."),
+                positions=[dict(coin=c, entry=f"{p['entry']:g}", stop=f"{p['sl']:.6g}", value=_rs(p["value_inr"]),
+                                since=p["since"]) for c, p in (s1p.get("positions") or {}).items()]),
+        s3=dict(variant="1h breakout sets: target +1×ATR, stop 0.5×ATR, max 48 h (daily ATR)",
+                start=_rs(s3_start), equity=_rs(s3_eq), total=_pct(s3_eq / s3_start - 1),
+                setsTotal=s3.get("sets_total", 0), setsToday=s3.get("sets_today", 0),
+                blocked=bool(s3.get("blocked_today")), updated=_ist(s3["at"], "%d %b %H:%M IST") if s3.get("at") else "never",
+                open=[dict(coin=p.get("coin", "?"), detail=", ".join(f"{k} {v}" for k, v in p.items() if k != "coin"))
+                      for p in s3.get("open_set", [])],
+                trades=[dict(coin=t["coin"], opened=t["opened"], closed=t["closed"], why=t["why"],
+                             pnl=_rs(t["pnl_inr"], True)) for t in reversed(s3.get("trades", [])[-20:])]),
+        research=research,
+        logs={n: _tail(n) for n in ("watcher.log", "approver.log", "s1_paper.log", "s3_paper.log")},
+    )
+
+
 EVENT_ICON = {"stop": ("ShieldAlert", "amber"), "execute": ("Activity", "blue"),
               "reconcile": ("ShieldCheck", "green"), "cap": ("ShieldAlert", "amber")}
 
@@ -202,6 +257,7 @@ def ui():
                   for e in events],
         notifications=[dict(icon="ShieldAlert", text=t) for t in issues]
         + ([dict(icon="Activity", text=msg)] if needs else []),
+        paper=paper_ui(),
     )
 
 

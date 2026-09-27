@@ -300,3 +300,8 @@ button:focus-visible, summary:focus-visible, a:focus-visible { outline: 3px soli
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+
+/* live dashboard additions */
+.view-tabs { width: fit-content; margin: 0 0 16px; }
+.log-lines { margin: 0; max-height: 420px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; color: var(--text); }

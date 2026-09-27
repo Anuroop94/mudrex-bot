@@ -14,6 +14,42 @@ export type Live = typeof demo & {
   };
   plan: typeof demo.plan & { id: number | null; state: string | null; needsAction: boolean; message: string };
   strategy: typeof demo.strategy & { target: string; tradeRisk: string };
+  paper: Paper;
+};
+
+export type Paper = {
+  s1: {
+    rows: {
+      name: string;
+      desc: string;
+      champion: boolean;
+      days: number;
+      total: string;
+      maxDd: string;
+      trades: number;
+      t: string;
+      verdict: string;
+    }[];
+    equity: string;
+    decision: string;
+    plan: string[];
+    rule: string;
+    positions: { coin: string; entry: string; stop: string; value: string; since: string }[];
+  };
+  s3: {
+    variant: string;
+    start: string;
+    equity: string;
+    total: string;
+    setsTotal: number;
+    setsToday: number;
+    blocked: boolean;
+    updated: string;
+    open: { coin: string; detail: string }[];
+    trades: { coin: string; opened: string; closed: string; why: string; pnl: string }[];
+  };
+  research: { name: string; desc: string; days: number; total: string; maxDd: string }[];
+  logs: Record<string, string[]>;
 };
 
 export function useLive(everyMs = 30000) {
