@@ -28,8 +28,8 @@ def setup(prices=PRICES):
     return tmp, fake, client, con
 
 
-def plan(con, coins, notional=1000.0, action="OPEN", position_ids=None):
-    orders = [dict(coin=c, action=action, planned_price=PRICES[c], notional_inr=notional, atr=PRICES[c] * 0.06,
+def plan(con, coins, notional=1000.0, action="OPEN", position_ids=None, atr_pct=0.06):
+    orders = [dict(coin=c, action=action, planned_price=PRICES[c], notional_inr=notional, atr=PRICES[c] * atr_pct,
                    position_id=(position_ids or {}).get(c)) for c in coins]
     return ex.record_plan(con, "2026-09-26", orders, {})
 
@@ -173,6 +173,12 @@ def test_inconclusive_lookup_never_releases_an_unknown_order():
     ex.reconcile(con, client, NOSLEEP)
     assert states(con, pid)["XRP"][0] == "RECONCILE_REQUIRED"      # deferred, not "not found"
     assert "reconciliation" in ex.claim(con, plan(con, ["ADA"]), "t")   # entries stay blocked
+    fake.faults["detail"] = ["500"] * 4                            # ONE failed lookup mixed with 404s
+    ex.reconcile(con, client, NOSLEEP)
+    assert states(con, pid)["XRP"][0] == "RECONCILE_REQUIRED"      # still unknown, never "safely absent"
+    fake.faults["detail"] = []
+    ex.reconcile(con, client, NOSLEEP)                             # every lookup answers 404: absent
+    assert states(con, pid)["XRP"][0] == "FAILED"
     fake.stop()
 
 
@@ -268,7 +274,8 @@ def test_missing_or_failed_stop_attachment_halts_entries():
 def test_wallet_larger_than_allocation_is_capped():
     tmp, fake, client, con = setup()
     fake.balance = 500000.0
-    pid = plan(con, ["XRP"], notional=10 ** 7)
+    pid = ex.record_plan(con, "d", [dict(coin="XRP", action="OPEN", planned_price=1.5, notional_inr=10 ** 7,
+                                         atr=0.003)], {})                   # tight stop: loss budget not binding
     ex.execute(con, client, pid, "t", NOSLEEP)
     pos = fake.positions[0]
     notional_inr = float(pos["quantity"]) * float(pos["entry_price"]) * 102
@@ -437,8 +444,8 @@ def test_closes_run_first_and_unconfirmed_close_halts_entries():
 
 def test_total_bot_exposure_capped_across_positions():
     tmp, fake, client, con = setup()
-    assert ex.execute(con, client, plan(con, ["XRP"], notional=6000), "t", NOSLEEP)[0] == "COMPLETE"
-    pid = plan(con, ["ADA"], notional=6000)
+    assert ex.execute(con, client, plan(con, ["XRP"], notional=6000, atr_pct=0.005), "t", NOSLEEP)[0] == "COMPLETE"
+    pid = plan(con, ["ADA"], notional=6000, atr_pct=0.005)
     ex.execute(con, client, pid, "t", NOSLEEP)
     assert "allocation cap" in states(con, pid)["ADA"][1] and len(fake.positions) == 1
     fake.stop()
@@ -510,6 +517,34 @@ def test_watcher_reoffers_expired_cap_close_and_flags_stuck_orders():
         assert any("unfinished order" in m for m, _ in sent)
     finally:
         watcher.notify, watcher.STATUS_PATH, watcher.LOG_PATH, watcher.JOURNAL_PATH = orig
+    fake.stop()
+
+
+def test_loss_budgets_per_trade_and_total():
+    tmp, fake, client, con = setup()
+    wide = ex.record_plan(con, "d", [dict(coin="XRP", action="OPEN", planned_price=1.5, notional_inr=2000,
+                                          atr=0.1)], {})                     # stop 0.3 below: 20% x Rs 2000 = Rs 400
+    ex.execute(con, client, wide, "t", NOSLEEP)
+    assert "loss budget" in states(con, wide)["XRP"][1] and fake.submits == 0   # > 6% of Rs 5,000
+    for c in ["XRP", "ADA", "DOGE", "LINK", "AVAX"]:                        # each ~Rs 970 at 18% stop = ~Rs 175
+        pid = ex.record_plan(con, "d", [dict(coin=c, action="OPEN", planned_price=PRICES[c], notional_inr=1000,
+                                             atr=PRICES[c] * 0.06)], {})
+        ex.execute(con, client, pid, "t", NOSLEEP)
+    last = states(con, pid)[c]
+    assert last[0] == "FAILED" and "all stops" in last[1], last             # 5th would pass 15% of Rs 5,000
+    assert len(fake.positions) == 4
+    fake.stop()
+
+
+def test_nothing_to_do_plan_invalidates_older_approvals():
+    tmp, fake, client, con = setup()
+    old = plan(con, ["XRP"])
+    cap = ex.record_plan(con, "d", [dict(coin="XRP", action="CLOSE", position_id="p")], {"reason": "cap"})
+    ex.supersede_pending(con, "newer plan: nothing to do")
+    assert "already FAILED" in ex.claim(con, old, "late tap") and fake.submits == 0
+    assert con.execute("SELECT state FROM plans WHERE id=?", (cap,)).fetchone()[0] == "PLANNED"
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_trader.py")).read()
+    assert "ex.supersede_pending(con" in src                       # plan() calls it when nothing is to do
     fake.stop()
 
 

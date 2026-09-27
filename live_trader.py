@@ -44,13 +44,27 @@ def read_state():
 
 # ---------- pure planning logic (unit-tested)
 
+def bad_data(uni, last_closed, days=400):
+    """Coins whose daily history is stale (no bar for the decision day) or has gaps in the last `days` days."""
+    bad = set()
+    for c, cs in uni.items():
+        recent = [x[0] for x in cs if x[0] > last_closed - days * DAY]
+        if not recent or recent[-1] != last_closed or any(b - a != DAY for a, b in zip(recent, recent[1:])):
+            bad.add(c)
+    return bad
+
+
 def build_orders(targets, owned, manual_symbols, prices, atrs, specs, size_equity_inr, armed, entries_blocked,
-                 rate):
+                 rate, bad=()):
     """targets: {coin: 1x weight}; owned: {coin: position_id} of bot-owned open positions.
-    Returns actions. CLOSE only for bot-owned positions; never plans anything on a symbol with a manual position."""
+    Returns actions. CLOSE only for bot-owned positions; never plans anything on a symbol with a manual position.
+    bad: coins with stale/gappy price data -> no decision at all today (a held one keeps its exchange stop)."""
     size_eq = s1.sizing_equity(size_equity_inr)
     out = []
     for c in s1.BASKET:
+        if c in bad:
+            out.append(dict(action="SKIP", coin=c, reason="price data stale or missing days: no decision today"))
+            continue
         w, px, s = targets.get(c, 0.0), prices[c], specs[c]
         if c in manual_symbols:
             out.append(dict(action="SKIP", coin=c, reason="you hold a manual position on this coin; bot stays out"))
@@ -69,6 +83,9 @@ def build_orders(targets, owned, manual_symbols, prices, atrs, specs, size_equit
             qty = math.floor(notional_inr / rate / px / s["step"] + 1e-9) * s["step"]
             if qty < s["min_qty"] or qty * px < s["min_notional"]:
                 out.append(dict(action="SKIP", coin=c, reason="below Mudrex minimum order"))
+                continue
+            if s1.stop_risk_inr(notional_inr, px, px - s1.SL_ATR * atrs[c]) > s1.MAX_TRADE_STOP_RISK * size_eq:
+                out.append(dict(action="SKIP", coin=c, reason="stop would risk more than the per-trade loss budget"))
                 continue
             out.append(dict(action="OPEN", coin=c, planned_price=px, notional_inr=round(notional_inr, 2),
                             atr=atrs[c], est_stop=round(px - s1.SL_ATR * atrs[c], 6), reason="trend up"))
@@ -116,12 +133,15 @@ def plan(client=None, con=None):
                f"bot P&L unconfirmed ({pnl_unknown})" if pnl_unknown else
                f"daily {caps['hit']} cap hit" if caps["hit"] else
                "no recent INR hedge rate from Mudrex" if not rate else None)
-    orders = build_orders(targets, owned, manual, {c: closes[c][last_closed] for c in s1.BASKET},
-                          {c: atrs[c][last_closed] for c in s1.BASKET}, specs, bot_eq, st["armed"], blocked,
-                          rate or config.INR_PER_USDT)
+    bad = bad_data(uni, last_closed)
+    orders = build_orders(targets, owned, manual, {c: closes[c].get(last_closed) for c in s1.BASKET},
+                          {c: atrs[c].get(last_closed) for c in s1.BASKET}, specs, bot_eq, st["armed"], blocked,
+                          rate or config.INR_PER_USDT, bad)
     todo = [o for o in orders if o["action"] in ("OPEN", "CLOSE")]
     decision = time.strftime("%Y-%m-%d", time.gmtime(last_closed))
     plan_id = ex.record_plan(con, decision, todo, dict(orders=orders)) if todo else None
+    if not todo:
+        ex.supersede_pending(con, "superseded by a newer plan with nothing to do")
     p = dict(plan_id=plan_id, created_at=now, decision_day=decision, strategy=s1.NAME,
              mood_ok=mood is True, bot_equity_inr=round(bot_eq, 2), caps=caps,
              hedge_rate=rate, live_enabled=ex.live_enabled(), blocked=blocked, orders=orders)

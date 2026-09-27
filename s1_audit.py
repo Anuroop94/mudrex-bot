@@ -83,7 +83,7 @@ def run(D, **over):
 
     cash, pos, armed = float(P["alloc"]), {}, {c: True for c in basket}
     mood_on, mood_streak, lev_hi = True, 0, True
-    marks, trades, skipped_small, signals = [], [], 0, 0
+    marks, trades, skipped_small, signals, risk_log = [], [], 0, 0, []
     hourly_days = 0
 
     def price_at(c, t):
@@ -215,6 +215,8 @@ def run(D, **over):
             cash -= fee_in
             pos[c] = dict(qty=qty, entry=entry, sl=px - P["sl_atr"] * atr, risk_px=P["sl_atr"] * atr, t=t_fill,
                           fee_in=fee_in, funding=0.0)
+            risk_log.append((qty * P["sl_atr"] * atr * RATE / plan_eq,
+                             sum(p["qty"] * p["risk_px"] * RATE for p in pos.values()) / plan_eq))
 
         # ---- rest of the day's price path: hourly stops + funding (daily bar fallback)
         if use_h:
@@ -232,7 +234,7 @@ def run(D, **over):
                 armed[c] = False
 
     daily = [(marks[i + 1][0], marks[i + 1][1] / marks[i][1] - 1) for i in range(len(marks) - 1)]
-    return dict(P=P, daily=daily, trades=trades, skipped_small=skipped_small, signals=signals,
+    return dict(P=P, daily=daily, trades=trades, skipped_small=skipped_small, signals=signals, risk_log=risk_log,
                 hourly_share=hourly_days / max(1, len(marks)), end_equity=marks[-1][1] if marks else P["alloc"])
 
 

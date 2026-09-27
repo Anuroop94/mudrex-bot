@@ -109,6 +109,21 @@ def s1_paper():
                 trades=trades["rows"] if trades else [], mtime=os.path.getmtime(path))
 
 
+def live_limits():
+    """The limits that actually govern live S1, read from the modules that enforce them."""
+    import execution
+    import s1
+    import watcher
+    return dict(strategy=s1.NAME, allocation_inr=s1.CAPITAL_CAP_INR, leverage=s1.LEV,
+                max_exposure_inr=s1.LEV * s1.CAPITAL_CAP_INR, safety_stop=f"{s1.SL_ATR} x ATR below the fill",
+                max_trade_stop_risk=s1.MAX_TRADE_STOP_RISK, max_total_stop_risk=s1.MAX_TOTAL_STOP_RISK,
+                daily_cap_pct=s1.DAILY_CAP_PCT,
+                daily_cap_note="blocks NEW buys only; closing needs your approval (Close all); not a maximum loss",
+                guard=f"{watcher.TRIP_STREAK} losses in a row or {watcher.TRIP_DD:.0%} drawdown",
+                buy_plan_valid_min=execution.ENTRY_MAX_AGE // 60, max_price_drift=execution.MAX_DRIFT,
+                taker_fee=config.TAKER_FEE, gst=config.GST, inr_per_usdt=config.INR_PER_USDT)
+
+
 def state():
     logs = {os.path.basename(p): dict(lines=read_text(p), mtime=os.path.getmtime(p))
             for p in glob.glob(os.path.join(HERE, "*.log"))}
@@ -122,9 +137,11 @@ def state():
         promote_rule=f"t >= {paper_portfolio.PROMOTE_T} over >= {paper_portfolio.PROMOTE_DAYS} overlapping days",
         paper=paper("paper"),
         replay=paper("replay"),
-        limits=dict(risk_per_trade=config.RISK_PCT, leverage=config.LEVERAGE, daily_loss_cap=config.DAILY_LOSS_CAP,
-                    dd_halve=config.DD_HALVE, dd_halt=config.DD_HALT, taker_fee=config.TAKER_FEE, gst=config.GST,
-                    inr_per_usdt=config.INR_PER_USDT),
+        limits=live_limits(),
+        research_only_settings=dict(note="config.py values used by old research scripts only, NOT by live S1",
+                                    risk_per_trade=config.RISK_PCT, leverage=config.LEVERAGE,
+                                    daily_loss_cap=config.DAILY_LOSS_CAP, dd_halve=config.DD_HALVE,
+                                    dd_halt=config.DD_HALT),
         account=account(),
         universe=read_csv("universe.csv"),
         scans={os.path.basename(p): scan_summary(os.path.basename(p))
@@ -213,8 +230,11 @@ async function tick(){
   document.getElementById("updated").textContent="updated "+new Date().toLocaleTimeString();
   document.getElementById("mode").textContent=s.mode;
   document.getElementById("account").innerHTML=accountHtml(s.account);
-  const L=s.limits; document.getElementById("limits").innerHTML=[["Risk per trade",pct(L.risk_per_trade)],["Max leverage",L.leverage+"x"],
-    ["Daily loss stop",pct(L.daily_loss_cap)],["Halve risk at drawdown",pct(L.dd_halve)],["Halt at drawdown",pct(L.dd_halt)],
+  const L=s.limits; document.getElementById("limits").innerHTML=[["Strategy",L.strategy],["Money the bot may use","₹"+L.allocation_inr],
+    ["Leverage (isolated)",L.leverage+"x"],["Max total position size","₹"+L.max_exposure_inr],["Safety stop",L.safety_stop],
+    ["Max loss if one stop hits",pct(L.max_trade_stop_risk,0)+" of bot money"],["Max loss if ALL stops hit",pct(L.max_total_stop_risk,0)+" of bot money"],
+    ["Daily profit / loss line",pct(L.daily_cap_pct,0)+": "+L.daily_cap_note],["Guard: stop new buys at",L.guard],
+    ["Buy plan valid for",L.buy_plan_valid_min+" min"],["Max price move since plan",pct(L.max_price_drift,0)],
     ["Fee (+GST)",pct(L.taker_fee,3)+" + "+pct(L.gst,0)],["INR / USDT",L.inr_per_usdt]].map(([k,v])=>`<span class="muted">${k}</span><b>${v}</b>`).join("");
   if(s.watch){ const W=s.watch, B=W.bot||{}, age=Date.now()/1000-W.at, alive=age<2*W.check_every_sec+60, rup=x=>"₹"+(+x||0).toLocaleString(undefined,{maximumFractionDigits:0});
     const bar=(v,cap,col)=>`<div class="bar" style="width:220px"><i style="width:${Math.min(100,Math.max(0,100*v/(cap||1)))}%;background:var(--${col})"></i></div>`;

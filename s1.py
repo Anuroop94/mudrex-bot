@@ -23,6 +23,17 @@ CAPITAL_CAP_INR = 5000
 DAILY_CAP_PCT = 0.05     # user rule: daily profit cap AND loss cap = 5% of the day's starting equity (raise to 0.10 later)
 
 
+# Hard loss budgets (safety nets, not sizing rules): money lost if stops fill exactly at their level, as a share of
+# bot equity. Set just above the worst seen in s1_audit.py (per trade 5.5%, all open positions 14.8%), so they
+# never changed a historical trade; they stop anything unusual. Gaps through a stop can still lose more.
+MAX_TRADE_STOP_RISK = 0.06
+MAX_TOTAL_STOP_RISK = 0.15
+
+
+def stop_risk_inr(notional_inr, entry, stop):
+    return notional_inr * max(0.0, entry - stop) / entry
+
+
 def sizing_equity(equity_inr):
     """Equity used BOTH to round weights to Mudrex minimums and to size orders (capped at the allocation).
     Rounding on the full equity but sizing on the capped one shrank min-size orders below the exchange minimum

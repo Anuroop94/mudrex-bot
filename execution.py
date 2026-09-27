@@ -129,6 +129,13 @@ def record_plan(con, decision_day, orders, payload):
     return pid
 
 
+def supersede_pending(con, note):
+    """A newer plan found nothing to do: older approvable plans (and their buttons) become invalid too.
+    A pending cap-hit Close-all plan is kept."""
+    con.execute("UPDATE plans SET state='FAILED', note=? WHERE state='PLANNED' AND "
+                "COALESCE(json_extract(payload, '$.reason'), '') <> 'cap'", (note,))
+
+
 def claim(con, plan_id, approver):
     """Atomically move PLANNED -> APPROVED. Returns None on success or the reason it was refused.
     BEGIN IMMEDIATE takes the write lock, so two approvers (processes or threads) cannot both win."""
@@ -329,20 +336,20 @@ def gate():
 # ---------- order lifecycle
 
 def lookup_until_known(client, cid, sleep, tries=LOOKUP_TRIES):
-    """The order, or None only if Mudrex definitively answered 'not found' (404).
-    Raises Ambiguous if every lookup failed: an unanswered lookup must never be read as 'not placed'."""
-    answered = False
+    """The order, or None only if EVERY lookup got a definitive 'not found' (404).
+    Raises Ambiguous if any lookup failed (timeout/5xx/423): a partly unanswered lookup must never be read as
+    'not placed' (the exchange may be slow to show it, or the failing call may have been the one that knew)."""
+    failed = 0
     for i in range(tries):
         try:
             o = client.order_by_client_id(cid)
             if o is not None:
                 return o
-            answered = True
         except (Ambiguous, Locked):
-            pass
+            failed += 1
         sleep(min(2 ** i, 8))
-    if not answered:
-        raise Ambiguous(0, f"lookup of {cid} inconclusive after {tries} tries")
+    if failed:
+        raise Ambiguous(0, f"lookup of {cid} inconclusive ({failed}/{tries} lookups failed)")
     return None
 
 
@@ -573,6 +580,9 @@ def run_open(con, client, row, sleep, alert):
         return fail(con, row["id"], "not enough free margin")
     pstep = float(a["price_step"])
     initial_stop = fmt_step(floor_to(price - s1.SL_ATR * row["atr"], pstep), pstep)
+    why = over_loss_budget(positions, owned, rate, eq, qty * price * rate, price, float(initial_stop))
+    if why:
+        return fail(con, row["id"], why)
     qty_s = fmt_step(qty, step)
     set_order(con, row["id"], qty=qty_s)
     gate()
@@ -597,6 +607,25 @@ def run_open(con, client, row, sleep, alert):
     if o is None:
         return order_row(con, row["id"])["state"] == "FAILED"
     return protect_and_check(con, client, row, o, sleep, alert)
+
+
+def over_loss_budget(positions, owned, rate, equity, notional_inr, price, stop):
+    """Hard per-trade and total stop-loss budgets (s1.MAX_TRADE_STOP_RISK / MAX_TOTAL_STOP_RISK of bot equity).
+    A held bot position without a readable stop counts at its full margin (notional / LEV)."""
+    new = s1.stop_risk_inr(notional_inr, price, stop)
+    if new > s1.MAX_TRADE_STOP_RISK * equity:
+        return f"loss budget: stop risk Rs {new:,.0f} > {s1.MAX_TRADE_STOP_RISK:.0%} of Rs {equity:,.0f}"
+    held = 0.0
+    for p in positions:
+        if p["id"] not in owned:
+            continue
+        n, entry = float(p["quantity"]) * float(p["entry_price"]) * rate, float(p["entry_price"])
+        sl = float((p.get("stoploss") or {}).get("price") or 0)
+        held += s1.stop_risk_inr(n, entry, sl) if 0 < sl < entry else n / s1.LEV
+    if held + new > s1.MAX_TOTAL_STOP_RISK * equity:
+        return (f"loss budget: all stops would lose Rs {held + new:,.0f} > {s1.MAX_TOTAL_STOP_RISK:.0%} "
+                f"of Rs {equity:,.0f}")
+    return None
 
 
 def stale_at_submit(con, client, row, sym):

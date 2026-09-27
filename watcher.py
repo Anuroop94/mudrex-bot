@@ -32,7 +32,7 @@ CHECK_SEC = 300
 DAY = 86400
 PLAN_AFTER = "05:35"
 STALE_SEC = 900
-# performance guard, from the S1 backtest (6 years, 127 trades): worst losing streak 10, worst drawdown 30.4%
+# performance guard thresholds set from the original S1 backtest (worst losing streak 10, worst drawdown ~30%)
 WARN_STREAK, TRIP_STREAK, WARN_DD, TRIP_DD = 10, 13, 0.25, 0.35
 JOURNAL_FIELDS = ["coin", "opened", "closed", "days", "entry", "exit", "pnl_inr", "outcome", "btc_mood", "signal"]
 
@@ -142,14 +142,14 @@ def journal_and_guard(st, con, client, bot_open_upnl):
         for r in rows:
             notify(f"S1 trade closed: {r['coin']} {r['outcome']} Rs {r['pnl_inr']:+,.0f} after {r['days']} days.")
     st["journaled"] = sorted(done)
-    all_rows = []
-    if os.path.exists(JOURNAL_PATH):
-        with open(JOURNAL_PATH, newline="") as f:
-            all_rows = list(csv.DictReader(f))
+    # guard statistics come from the database (one row per position), never from the CSV, so a crash between
+    # writing journal.csv and saving watcher state cannot double-count a trade
+    pnls = [r[0] for r in con.execute("SELECT realized_pnl FROM owned WHERE closed_at IS NOT NULL AND "
+                                      "realized_pnl IS NOT NULL ORDER BY closed_at, position_id")]
     streak = 0
-    for r in all_rows:
-        streak = streak + 1 if float(r["pnl_inr"]) <= 0 else 0
-    bot_eq = s1.CAPITAL_CAP_INR + sum(float(r["pnl_inr"]) for r in all_rows) + bot_open_upnl
+    for pnl in pnls:
+        streak = streak + 1 if pnl <= 0 else 0
+    bot_eq = s1.CAPITAL_CAP_INR + sum(pnls) + bot_open_upnl
     st["bot_peak"] = max(st.get("bot_peak", s1.CAPITAL_CAP_INR), bot_eq)
     dd = 1 - bot_eq / st["bot_peak"]
     guard = load(ex.GUARD_PATH, dict(tripped=False))
@@ -157,7 +157,7 @@ def journal_and_guard(st, con, client, bot_open_upnl):
     if not guard.get("tripped") and (streak >= TRIP_STREAK or dd >= TRIP_DD):
         guard.update(tripped=True, at=time.time(),
                      reason=f"{streak} losses in a row" if streak >= TRIP_STREAK else f"drawdown {dd:.0%}")
-        notify(f"PERFORMANCE GUARD TRIPPED ({guard['reason']}): worse than 6 years of backtest. "
+        notify(f"PERFORMANCE GUARD TRIPPED ({guard['reason']}): worse than anything in the backtest. "
                f"No new entries until you review and reset guard.json.")
     elif not guard.get("tripped") and (streak >= WARN_STREAK or dd >= WARN_DD) and st.get("guard_warned") != ist_str("%Y-%m-%d"):
         st["guard_warned"] = ist_str("%Y-%m-%d")

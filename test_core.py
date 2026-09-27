@@ -245,12 +245,23 @@ def test_live_build_orders_safety():
     spec = dict(step=0.1, min_qty=0.1, min_notional=5.0, price_step=0.0001, max_leverage=75, price=1.5)
     specs = {c: dict(spec) for c in s1.BASKET}
     prices = {c: 1.5 for c in s1.BASKET}
-    atrs = {c: 0.1 for c in s1.BASKET}
+    atrs = {c: 0.02 for c in s1.BASKET}
     targets = {"XRP": 0.2, "ADA": 0.2}
     o = {x["coin"]: x for x in lt.build_orders(targets, {}, set(), prices, atrs, specs, 20000, {}, None, 102)}
     # sized on the Rs 5,000 allocation even though bot equity says Rs 20,000: 0.2 * 2x * 5000 = Rs 2000
     assert o["XRP"]["action"] == "OPEN" and o["XRP"]["notional_inr"] == 2000
-    assert abs(o["XRP"]["est_stop"] - 1.2) < 1e-9                   # 3x ATR (final stop re-anchored to the fill)
+    assert abs(o["XRP"]["est_stop"] - 1.44) < 1e-9                  # 3x ATR (final stop re-anchored to the fill)
+    # a stop 20% away on Rs 2,000 risks Rs 400 > 6% of Rs 5,000: skipped at planning
+    o = {x["coin"]: x for x in lt.build_orders(targets, {}, set(), prices, {c: 0.1 for c in s1.BASKET}, specs,
+                                               5000, {}, None, 102)}
+    assert o["XRP"]["action"] == "SKIP" and "loss budget" in o["XRP"]["reason"]
+    # stale/gappy data: no decision on that coin, not even a CLOSE of a held position
+    D = 86400
+    good = [[i * D, 1, 1, 1, 1, 0] for i in range(500)]
+    assert lt.bad_data({"XRP": good, "ADA": good[:-1], "DOGE": good[:300] + good[301:]}, 499 * D) == {"ADA", "DOGE"}
+    o = {x["coin"]: x for x in lt.build_orders(targets, {"XRP": "p1"}, set(), prices, atrs, specs, 5000, {}, None,
+                                               102, bad={"XRP"})}
+    assert o["XRP"]["action"] == "SKIP" and "stale" in o["XRP"]["reason"]
     # entries blocked (cap/guard/STOP): no entries, exits of BOT-OWNED positions still planned
     o = {x["coin"]: x for x in lt.build_orders(targets, {"LINK": "pos-1"}, set(), prices, atrs, specs, 5000, {},
                                                "daily loss cap hit", 102)}
@@ -289,7 +300,7 @@ def test_live_orders_identical_at_any_equity_above_the_cap():
     books = []
     for eq in (5000, 7500, 10000, 20000):
         t = s1.targets(ctx, closes, 0, s1.sizing_equity(eq), specs)
-        books.append(lt.build_orders(t, {}, set(), {c: 1.5 for c in s1.BASKET}, {c: 0.1 for c in s1.BASKET},
+        books.append(lt.build_orders(t, {}, set(), {c: 1.5 for c in s1.BASKET}, {c: 0.02 for c in s1.BASKET},
                                      specs, eq, {}, None, 102))
     assert all(b == books[0] for b in books)
     assert all(o["action"] == "OPEN" and o["notional_inr"] >= 1000 for o in books[0] if o["coin"] != "XRP")
@@ -485,7 +496,7 @@ def test_telegram_approval_security():
     saved = {k: os.environ.get(k) for k in ("TELEGRAM_CHAT_ID", "TELEGRAM_USER_ID")}
     os.environ.update(TELEGRAM_CHAT_ID="111", TELEGRAM_USER_ID="222")
     ran, sent = [], []
-    orig = (tg.answer, tg.edit, tg.send)
+    orig, orig_db = (tg.answer, tg.edit, tg.send), ex.DB_PATH
     tg.answer = lambda *a: sent.append(a)
     tg.edit = lambda *a: sent.append(a)
     tg.send = lambda *a, **k: sent.append(a)
@@ -522,7 +533,12 @@ def test_telegram_approval_security():
         say("/plan")
         say("/plan", user=999)
         assert replans == [1, 1]                                   # /plan works for the owner only
+        ex.DB_PATH = os.path.join(tmp, "exec.db")
+        cap = ex.record_plan(ex.db(), "d", [dict(coin="XRP", action="CLOSE", position_id="p")], {"reason": "cap"})
+        assert tap(111, 222, data=f"approve:{cap}", runner=expired) == "cap expired"
+        assert replans == [1, 1]                                   # an expired Close-all never becomes a buy plan
     finally:
+        ex.DB_PATH = orig_db
         tg.answer, tg.edit, tg.send = orig
         for k, v in saved.items():
             if v is None:
