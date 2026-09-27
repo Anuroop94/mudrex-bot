@@ -1,11 +1,13 @@
 # Mudrex Monitor UI
 
-Live, read-only dashboard for the Mudrex S1 bot. Double-click `start-live.cmd` (or run `python dashboard.py` in the
-mudrex-bot folder, then `npx vite dev` in this ui folder) and open http://localhost:8080.
+Live, read-only dashboard for the Mudrex S1 bot, served by the bot itself: double-click `start-dashboard.cmd` in
+the mudrex-bot folder and open http://127.0.0.1:8765. One process (`python dashboard.py`) serves this UI's static
+build (`ui/dist/client`) and its data at `/api/ui` (watcher status, execution journal, read-only Mudrex calls).
+This page places no orders; approvals stay in Telegram.
 
-Data comes from the bot's `/api/ui` endpoint (mudrex-bot/dashboard.py on 127.0.0.1:8765, proxied by Vite): watcher
-status, the execution journal (plans, orders, events, equity marks) and read-only Mudrex calls. This page places no
-orders; approvals stay in Telegram. `src/data/mudrex-demo.json` is now only the type template for that shape.
+After changing anything in `src/`, rebuild: `npx vite build` in this folder. For live editing, run
+`python dashboard.py` and `npx vite dev` (port 8080, `/api` is proxied to the bot).
+`src/data/mudrex-demo.json` is only the type template for the `/api/ui` shape.
 
 ## Customize the preview data
 

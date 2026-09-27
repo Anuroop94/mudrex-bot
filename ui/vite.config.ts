@@ -11,7 +11,10 @@ export default defineConfig({
     // Redirect TanStack Start's bundled server entry to src/server.ts (our SSR error wrapper).
     // nitro/vite builds from this
     server: { entry: "server" },
+    // Static build (dist/client/_shell.html + assets) served by mudrex-bot/dashboard.py: one process, one URL.
+    spa: { enabled: true },
   },
+  nitro: false,
   // Live data: the bot's read-only dashboard server (python dashboard.py, 127.0.0.1:8765).
   vite: { server: { proxy: { "/api": "http://127.0.0.1:8765" } } },
 });

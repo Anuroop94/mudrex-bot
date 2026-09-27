@@ -555,6 +555,33 @@ def test_closed_only_and_gaps():
     assert data.gaps([[0], [900], [2700]]) == 1
 
 
+def test_dashboard_serves_ui_and_never_bot_files():
+    import http.client
+    import tempfile
+    import threading
+    from http.server import ThreadingHTTPServer
+    import dashboard
+    tmp = tempfile.mkdtemp()
+    os.makedirs(os.path.join(tmp, "assets"))
+    with open(os.path.join(tmp, "_shell.html"), "w") as f:
+        f.write("<html>shell</html>")
+    orig, dashboard.UI_DIST = dashboard.UI_DIST, tmp
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), dashboard.Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        def get(path):
+            c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=10)
+            c.request("GET", path)
+            r = c.getresponse()
+            return r.status, r.read()
+        assert get("/") == (200, b"<html>shell</html>")
+        for bad in ("/../execution.db", "/..%2f.env", "/assets/../../dashboard.py", "/%2e%2e/.env"):
+            assert get(bad)[0] == 404, bad
+    finally:
+        srv.shutdown()
+        dashboard.UI_DIST = orig
+
+
 if __name__ == "__main__":
     tests = [v for k, v in dict(globals()).items() if k.startswith("test_")]
     for t in tests:
