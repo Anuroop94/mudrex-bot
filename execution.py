@@ -705,6 +705,43 @@ def exited(con, row, why, alert):
     event(con, "protect", f"{row['coin']}: protective exit done; position closed.", alert)
     return True
 
+def claim_exit(con, row, state=None):
+    """Atomically take the position-level exit fence and journal the close attempt BEFORE sending. Returns None
+    if this order may send now, else why not. One transaction: two processes can never both pass."""
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        busy = exit_in_flight(con, row["position_id"], row["id"])
+        if busy:
+            con.execute("ROLLBACK")
+            return busy
+        cur = order_row(con, row["id"])
+        extra = ", state=?" if state else ""
+        con.execute(f"UPDATE orders SET exit_sent_at=?, exit_attempts=?, updated_at=?{extra} WHERE id=?",
+                    (int(time.time()), (cur["exit_attempts"] or 0) + 1, int(time.time()),
+                     *([state] if state else []), row["id"]))
+        con.execute("COMMIT")
+        return None
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+
+
+UNKNOWN_ALERT_AFTER = 1800   # a position neither visible nor in Mudrex history this long -> tell the human
+
+
+def still_unknown(con, row, alert):
+    """A close whose position is neither visible nor confirmed closed: keep waiting (never assume closed), but
+    never silently: the human is alerted once after UNKNOWN_ALERT_AFTER."""
+    err = row["error"] or ""
+    if "not visible" not in err:                       # OPEN rows keep the marker that routes them back here
+        set_order(con, row["id"], state="RECONCILE_REQUIRED", error=("protective exit: " if row["action"] == "OPEN"
+                                                                     else "") + "position not visible; closure "
+                                                                                "not confirmed")
+    elif "[alerted]" not in err and time.time() - (row["updated_at"] or 0) > UNKNOWN_ALERT_AFTER:
+        con.execute("UPDATE orders SET error=? WHERE id=?", (err + " [alerted]", row["id"]))
+        event(con, "reconcile", f"{row['coin']}: position has not been visible or confirmed closed for 30 min. "
+                                f"Check it in the Mudrex app; new buys stay blocked until this is resolved.", alert)
+
 def protective_close(con, client, row, why, sleep, alert):
     """Exit a bot-owned position whose approved entry could not be protected or broke a limit. Not blocked by
     STOP (it only reduces risk). Order-bound (exit_authorized) and identity re-validated right before every
@@ -740,7 +777,8 @@ def protective_close(con, client, row, why, sleep, alert):
                 event(con, "protect", f"{row['coin']}: {why}. EXITING this position now (automatic protective "
                                       f"exit).", alert)
             renew(con, row["plan_id"])                                 # our fence is live right before sending
-            set_order(con, row["id"], exit_sent_at=now, exit_attempts=attempts + 1)     # journal BEFORE sending
+            busy = claim_exit(con, row)                                # atomic: journal BEFORE sending
+        if pos is not None and not busy and (not sent or now - sent >= EXIT_RETRY_AFTER):
             try:
                 client.close_position(pid)
             except Rejected as e:
@@ -751,17 +789,23 @@ def protective_close(con, client, row, why, sleep, alert):
                 return False
             except (Ambiguous, Locked):
                 pass                                                   # unknown: verify by position state
+    last = state
     for i in range(POLL_TRIES):
         renew(con, row["plan_id"])                                   # a live wait keeps the lease
         try:
-            gone = position_state(client, pid)[0] == "closed"
+            last = position_state(client, pid)[0]
         except (Ambiguous, Locked):
-            gone = False
-        if gone:
+            last = "unknown"
+        if last == "closed":
             return exited(con, row, why, alert)
         sleep(min(1 + i, 5))
+    if last == "unknown":                                              # vanished but not yet in history: wait
+        still_unknown(con, order_row(con, row["id"]), alert)
+        return False
+    was = order_row(con, row["id"])["error"] or ""
     set_order(con, row["id"], state="RECONCILE_REQUIRED", error=f"protective exit not confirmed: {why}"[:300])
-    event(con, "protect", f"{row['coin']}: protective exit NOT confirmed. Check Mudrex now.", alert)
+    if "protective exit not confirmed" not in was:                     # alert once, not every 5-minute pass
+        event(con, "protect", f"{row['coin']}: protective exit NOT confirmed yet. Check Mudrex now.", alert)
     return False
 
 
@@ -793,7 +837,7 @@ def run_close(con, client, row, sleep, alert):
         con.execute("UPDATE owned SET closed_at=? WHERE position_id=?", (int(time.time()), row["position_id"]))
         return
     if state == "unknown":                             # not visible, not in history yet: never assume closed
-        set_order(con, row["id"], state="RECONCILE_REQUIRED", error="position not visible; closure not confirmed")
+        still_unknown(con, row, alert)
         return
     why = close_problem(con, pos, row)
     if why:
@@ -802,7 +846,11 @@ def run_close(con, client, row, sleep, alert):
         return
     renew(con, row["plan_id"])
     gate()
-    set_order(con, row["id"], state="SUBMITTED", exit_sent_at=int(time.time()), exit_attempts=1)   # for resume_close
+    busy = claim_exit(con, row, "SUBMITTED")                          # atomic fence + journal before sending
+    if busy:
+        set_order(con, row["id"], state="FAILED", error=f"refused: {busy}"[:300])
+        event(con, "close", f"{row['coin']}: close NOT sent: {busy}.", alert)
+        return
     try:
         client.close_position(row["position_id"])
         set_order(con, row["id"], state="ACCEPTED")
@@ -1048,7 +1096,8 @@ def resume_close(con, client, row, alert):
                     (now, row["position_id"]))
         return
     if state == "unknown":
-        return                                                         # wait for a definite answer
+        still_unknown(con, row, alert)                                 # wait for a definite answer, never silently
+        return
     why = close_problem(con, pos, row)
     if why:
         set_order(con, row["id"], state="FAILED", error=f"refused: {why}"[:300])
@@ -1069,7 +1118,9 @@ def resume_close(con, client, row, alert):
                                 f"CLOSE IT IN THE MUDREX APP NOW.", alert)
         return
     renew(con, row["plan_id"])
-    set_order(con, row["id"], state="SUBMITTED", exit_sent_at=now, exit_attempts=attempts + 1)   # journal first
+    busy = claim_exit(con, row, "SUBMITTED")                          # atomic fence + journal before sending
+    if busy:
+        return                                                         # another exit owns it right now
     event(con, "reconcile", f"{row['coin']}: finishing the approved close (attempt {attempts + 1}).", alert)
     try:
         client.close_position(row["position_id"])

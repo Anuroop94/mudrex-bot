@@ -807,6 +807,35 @@ def test_one_missing_snapshot_never_ends_a_close():
     fake.stop()
 
 
+def test_close_never_waits_silently_on_an_invisible_position():
+    tmp, fake, client, con, xrp = _one_verified_xrp()
+    fake.positions.pop()                                            # gone, but never shows up in history
+    pid = _close_plan(con, xrp)
+    alerts = []
+    ex.execute(con, client, pid, "t", NOSLEEP, alerts.append)
+    ex.reconcile(con, client, NOSLEEP, alerts.append)
+    assert not any("30 min" in a for a in alerts)                   # not yet
+    con.execute("UPDATE orders SET updated_at=? WHERE plan_id=?", (int(time.time()) - 1801, pid))
+    ex.reconcile(con, client, NOSLEEP, alerts.append)
+    ex.reconcile(con, client, NOSLEEP, alerts.append)
+    assert sum("30 min" in a for a in alerts) == 1                  # told once, not every pass
+    assert states(con, pid)["XRP"][0] == "RECONCILE_REQUIRED" and close_posts(fake) == 0
+    fake.stop()
+
+
+def test_exit_fence_claim_is_atomic():
+    tmp, fake, client, con, xrp = _one_verified_xrp()
+    a, b = _close_plan(con, xrp), None
+    row_a = con.execute("SELECT * FROM orders WHERE plan_id=?", (a,)).fetchone()
+    con.execute("UPDATE plans SET state='APPROVED' WHERE id=?", (a,))
+    b = ex.record_plan(con, "d2", [dict(coin="XRP", action="CLOSE", position_id=xrp)], {"reason": "cap"})
+    row_b = con.execute("SELECT * FROM orders WHERE plan_id=?", (b,)).fetchone()
+    con2 = ex.db(os.path.join(tmp, "exec.db"))                      # a second process
+    assert ex.claim_exit(con, row_a) is None                        # first one takes the fence
+    assert "still closing" in ex.claim_exit(con2, row_b)            # second one sees it, never both
+    fake.stop()
+
+
 def test_position_missing_from_one_snapshot_is_reopened():
     tmp, fake, client, con, xrp = _one_verified_xrp()
     con.execute("UPDATE owned SET closed_at=? WHERE position_id=?", (int(time.time()), xrp))   # a bad snapshot
