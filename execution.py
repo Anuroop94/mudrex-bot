@@ -674,6 +674,7 @@ def after_fill_budget(con, client, row, o, alert):
     return True
 
 
+RECONCILE_GRACE = 15 * 60     # an order younger than this is never called 'not placed' from history absence
 EXIT_RETRY_AFTER = 600       # an unconfirmed close is re-sent only after 10 min with the position still open
 EXIT_MAX_ATTEMPTS = 3
 
@@ -1181,7 +1182,11 @@ def reconcile_plan(con, client, pid, sleep, alert):
                 continue
             o = lookup_until_known(client, row["client_order_id"], sleep, con=con, plan_id=pid)   # raises if inconclusive
             renew(con, pid)
+            if o is None and row["exchange_order_id"]:
+                o = client.order_by_id(row["exchange_order_id"])      # Mudrex acknowledged it: never "not placed"
             if o is None:
+                if time.time() - (row["updated_at"] or 0) < RECONCILE_GRACE:
+                    continue                                           # order history may lag a just-sent order
                 set_order(con, row["id"], state="FAILED", error="not found on exchange after restart")
                 continue
             if o.get("status") in TERMINAL_BAD:

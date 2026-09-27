@@ -13,7 +13,7 @@ os.environ["LIVE_TRADING_ENABLED"] = "true"          # tests exercise the live p
 import execution as ex                                  # noqa: E402
 import fake_mudrex                                      # noqa: E402
 import s1                                               # noqa: E402
-from mudrex_client import Client                        # noqa: E402
+from mudrex_client import Ambiguous, Client             # noqa: E402
 
 PRICES = {"XRP": 1.5, "ADA": 0.26, "DOGE": 0.1, "LINK": 14.0, "AVAX": 11.0, "TRX": 0.34}
 NOSLEEP = lambda s: None                                # noqa: E731
@@ -163,6 +163,9 @@ def test_restart_reconciliation_by_client_order_id():
     pid = plan(con, ["XRP"])
     assert ex.execute(con, client, pid, "t", NOSLEEP)[0] == "RECONCILE_REQUIRED"
     con.execute("UPDATE plans SET approved_at=? WHERE id=?", (int(time.time()) - 3600, pid))
+    ex.reconcile(con, client, NOSLEEP)                             # young: history may lag, not judged yet
+    assert states(con, pid)["XRP"][0] == "RECONCILE_REQUIRED"
+    con.execute("UPDATE orders SET updated_at=? WHERE plan_id=?", (int(time.time()) - 3600, pid))
     ex.reconcile(con, client, NOSLEEP)                             # restart: lookup says it never landed
     assert states(con, pid)["XRP"][0] == "FAILED" and not fake.positions
     fake.stop()
@@ -182,6 +185,7 @@ def test_inconclusive_lookup_never_releases_an_unknown_order():
     ex.reconcile(con, client, NOSLEEP)
     assert states(con, pid)["XRP"][0] == "RECONCILE_REQUIRED"      # still unknown, never "safely absent"
     fake.faults["detail"] = []
+    con.execute("UPDATE orders SET updated_at=? WHERE plan_id=?", (int(time.time()) - 3600, pid))   # past grace
     ex.reconcile(con, client, NOSLEEP)                             # every lookup answers 404: absent
     assert states(con, pid)["XRP"][0] == "FAILED"
     fake.stop()
@@ -1048,6 +1052,42 @@ def test_live_disabled_by_default_refuses():
         assert ex.execute(con, client, pid, "t", NOSLEEP)[0] == "REFUSED" and fake.submits == 0
     finally:
         os.environ["LIVE_TRADING_ENABLED"] = "true"
+    fake.stop()
+
+
+def test_client_id_lookup_uses_history_like_live_mudrex():
+    """Live 2026-09-27: detail?client_order_id= is 404 even for a FILLED order. The first real plan ended
+    RECONCILE_REQUIRED, then reconcile marked the filled XRP order FAILED ('not found'). Lookups must use history."""
+    tmp, fake, client, con = setup()
+    pid = plan(con, ["XRP"])
+    assert ex.execute(con, client, pid, "t", NOSLEEP)[0] == "COMPLETE" and len(fake.positions) == 1
+    o = client.order_by_client_id(f"s1-{pid}-0-XRP-O")
+    assert o["status"] == "FILLED" and o["future_position_uuid"] == fake.positions[0]["id"]
+    assert client.order_by_client_id("never-sent") is None
+    client.HISTORY_LIMIT = 1                                     # truncated history: absence proves nothing
+    try:
+        client.order_by_client_id("never-sent")
+        assert False, "truncated history must be Ambiguous"
+    except Ambiguous:
+        pass
+    fake.stop()
+
+
+def test_reconcile_never_fails_a_young_or_acknowledged_order():
+    """History may lag a just-sent order: absence only means 'not placed' after RECONCILE_GRACE, and an order
+    with a Mudrex order id is resolved by that id, never called 'not placed'."""
+    tmp, fake, client, con = setup()
+    pid = plan(con, ["XRP", "ADA"])
+    con.execute("UPDATE plans SET state='RECONCILE_REQUIRED', approved_at=1, approved_by='t' WHERE id=?", (pid,))
+    con.execute("UPDATE orders SET state='RECONCILE_REQUIRED', updated_at=? WHERE plan_id=?", (int(time.time()), pid))
+    con.execute("UPDATE orders SET exchange_order_id='gone' WHERE plan_id=? AND coin='ADA'", (pid,))
+    state = lambda c: con.execute("SELECT state FROM orders WHERE plan_id=? AND coin=?", (pid, c)).fetchone()[0]  # noqa: E731
+    ex.reconcile(con, client, NOSLEEP)
+    assert state("XRP") == "RECONCILE_REQUIRED" and state("ADA") == "RECONCILE_REQUIRED"
+    con.execute("UPDATE orders SET updated_at=? WHERE plan_id=?", (int(time.time()) - ex.RECONCILE_GRACE - 1, pid))
+    ex.reconcile(con, client, NOSLEEP)
+    assert state("XRP") == "FAILED"                       # old and never seen: really not placed
+    assert state("ADA") == "RECONCILE_REQUIRED"           # acknowledged id that 404s: stays open, alerts
     fake.stop()
 
 

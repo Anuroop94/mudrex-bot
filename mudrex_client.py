@@ -96,13 +96,28 @@ class Client:
         return self.get(f"/v1/futures/{symbol}", {"is_symbol": ""})
 
     def order_by_client_id(self, cid):
-        """Order detail, or None if Mudrex has no order with this client_order_id."""
+        """Order detail, or None if Mudrex has no order with this client_order_id.
+        Live Mudrex (2026-09-27) answers 404 on /orders/detail?client_order_id= even for a FILLED order: detail
+        only resolves by order_id. So a 404 falls back to the INR order history, whose rows carry client_order_id
+        and the same fields (status, filled_price, filled_quantity, future_position_uuid). Absence from a
+        truncated history is NOT proof: raise Ambiguous so callers reconcile instead of treating it as unplaced."""
         try:
             return self.get("/v1/futures/orders/detail", {"client_order_id": cid})
         except Rejected as e:
-            if e.status == 404:
-                return None
-            raise
+            if e.status != 404:
+                raise
+        rows, truncated = self.history("orders")
+        for r in rows:
+            if r.get("client_order_id") == cid:
+                return r
+        if truncated:
+            raise Ambiguous(0, f"{cid} not in the last {self.HISTORY_LIMIT} orders (history truncated)")
+        return None
+
+    def order_by_id(self, order_id):
+        """Order detail by Mudrex's own order id (the only key /orders/detail resolves). A 404 raises Rejected:
+        an order Mudrex acknowledged is never treated as 'not placed'."""
+        return self.get("/v1/futures/orders/detail", {"order_id": order_id})
 
     HISTORY_LIMIT = 500
 

@@ -33,6 +33,7 @@ class FakeMudrex:
         self.no_liq = False
         self.fill_after = 1                  # detail lookups before a CREATED order becomes FILLED
         self.never_fill = False
+        self.cid_detail = False              # live Mudrex: /orders/detail?client_order_id= is always 404
         self.leverage_store = {}
         self.leverage_stuck = None           # if set, POST leverage is ignored and this value is reported
         self.margin_type = "ISOLATED"        # reported margin type (tests: None, "isolated", "CROSS")
@@ -154,7 +155,8 @@ class FakeMudrex:
                     return self._apply("positions", lambda: ok(fake.positions))
                 if p.endswith("/futures/orders/detail"):
                     def detail():
-                        o = fake.orders.get(q.get("client_order_id"))
+                        o = fake.orders.get(q.get("client_order_id")) if fake.cid_detail else \
+                            next((o for o in fake.orders.values() if o["id"] == q.get("order_id")), None)
                         if not o:
                             return 404, {"success": False, "errors": [{"text": "order not found"}]}
                         fake._maybe_fill(o)
@@ -162,8 +164,12 @@ class FakeMudrex:
                     return self._apply("detail", detail)
                 limit = int(q.get("limit", 20))
                 if p.endswith("/futures/orders/history"):
-                    rows = sorted(fake.orders.values(), key=lambda o: o["created_at"], reverse=True)[:limit]
-                    return self._send(*ok([fake.public(o) for o in rows]))
+                    def hist():
+                        rows = sorted(fake.orders.values(), key=lambda o: o["created_at"], reverse=True)[:limit]
+                        for o in rows:
+                            fake._maybe_fill(o)
+                        return ok([fake.public(o) for o in rows])
+                    return self._apply("history", hist)
                 if p.endswith("/futures/positions/history"):
                     return self._send(*ok(list(reversed(fake.closed))[:limit]))
                 if p.endswith("/leverage"):

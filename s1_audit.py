@@ -35,7 +35,8 @@ N_TRIALS = 60   # rough count of strategy variants tried during the research (fo
 
 BASE = dict(basket=s1.BASKET, lev=s1.LEV, sl_atr=s1.SL_ATR, delay_h=0, slip=pf.SLIPPAGE,
             fund=config.FUNDING_PER_DAY, stop_slip=0.0, rounding="capped", risk=None, agg_risk=None,
-            mood="one", volcap=False, caps=True, no_chase=None, alloc=s1.CAPITAL_CAP_INR, cap_pct=s1.DAILY_CAP_PCT)
+            mood="one", volcap=False, caps=True, no_chase=None, alloc=s1.CAPITAL_CAP_INR, cap_pct=s1.DAILY_CAP_PCT,
+            tp=None, tp_rearm=True)   # tp: take-profit as a fraction above the fill; tp_rearm: re-buy next day
 
 
 # ---------- data
@@ -121,6 +122,10 @@ def run(D, **over):
                 if b[3] <= p["sl"]:
                     close(c, min(b[1], p["sl"]) * (1 - P["slip"] - P["stop_slip"]), h, "stop-loss")
                     armed[c] = False
+                    break
+                if p["tp"] and b[2] >= p["tp"]:                            # stop checked first: conservative
+                    close(c, max(b[1], p["tp"]) * (1 - P["slip"]), h, "target")
+                    armed[c] = P["tp_rearm"]
                     break
 
     for k in range(len(days) - 1):
@@ -214,6 +219,7 @@ def run(D, **over):
             fee_in = qty * entry * RATE * FEE
             cash -= fee_in
             pos[c] = dict(qty=qty, entry=entry, sl=px - P["sl_atr"] * atr, risk_px=P["sl_atr"] * atr, t=t_fill,
+                          tp=entry * (1 + P["tp"]) if P["tp"] else None,
                           fee_in=fee_in, funding=0.0)
             risk_log.append((qty * P["sl_atr"] * atr * RATE / size_eq,     # as the live check sees it (Rs 5,000 base)
                              sum(p["qty"] * p["risk_px"] * RATE for p in pos.values()) / size_eq))
@@ -232,6 +238,9 @@ def run(D, **over):
             if b[3] <= p["sl"]:
                 close(c, min(b[1], p["sl"]) * (1 - P["slip"] - P["stop_slip"]), d1, "stop-loss")
                 armed[c] = False
+            elif p["tp"] and b[2] >= p["tp"]:
+                close(c, max(b[1], p["tp"]) * (1 - P["slip"]), d1, "target")
+                armed[c] = P["tp_rearm"]
 
     daily = [(marks[i + 1][0], marks[i + 1][1] / marks[i][1] - 1) for i in range(len(marks) - 1)]
     return dict(P=P, daily=daily, trades=trades, skipped_small=skipped_small, signals=signals, risk_log=risk_log,
@@ -388,7 +397,17 @@ def volcap(D):
         print(line(label, run(D, **kw)), flush=True)
 
 
-SECTIONS = dict(parity=parity, stress=stress, sizing=sizing, loo=loo, mood=mood, volcap=volcap)
+def target(D):
+    print("\nFixed take-profit (owner ask 2026-09-27): exit at +X% above the fill, checked hourly; stop first if both.")
+    for label, kw in [("no target (current)", {}), ("target +2%, re-buy next day if trend up", dict(tp=0.02)),
+                      ("target +2%, wait for trend reset", dict(tp=0.02, tp_rearm=False)),
+                      ("target +5%, re-buy next day", dict(tp=0.05)), ("target +10%, re-buy next day", dict(tp=0.10))]:
+        r = run(D, **kw)
+        hits = sum(t["why"] == "target" for t in r["trades"] if t["exit_t"] < pf.SPLIT)
+        print(line(label, r) + f"  targets hit {hits}", flush=True)
+
+
+SECTIONS = dict(target=target, parity=parity, stress=stress, sizing=sizing, loo=loo, mood=mood, volcap=volcap)
 
 if __name__ == "__main__":
     want = sys.argv[1:] or list(SECTIONS)
