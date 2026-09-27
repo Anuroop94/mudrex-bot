@@ -131,6 +131,7 @@ def state():
         now=time.time(),
         mode="LIVE S1 (Rs 5,000 cap): real orders only when you run execute + YES. Watcher is read-only.",
         s1=s1_paper(),
+        s3=json.load(open(os.path.join(HERE, "s3_paper_state.json"))) if os.path.exists(os.path.join(HERE, "s3_paper_state.json")) else None,
         watch=json.load(open(os.path.join(HERE, "watch_status.json"))) if os.path.exists(os.path.join(HERE, "watch_status.json")) else None,
         portfolio=portfolio_paper(),
         leaderboard=paper_portfolio.leaderboard(),
