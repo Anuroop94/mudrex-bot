@@ -20,3 +20,5 @@ STOP
 .claude/
 *.db-wal
 *.db-shm
+
+*_results.txt

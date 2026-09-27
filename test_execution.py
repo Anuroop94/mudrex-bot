@@ -664,6 +664,36 @@ def test_protective_exit_is_not_resent_until_proven_needed():
     fake.stop()
 
 
+def test_crashed_approved_close_is_finished_by_reconcile():
+    tmp, fake, client, con = setup()
+    assert ex.execute(con, client, plan(con, ["XRP"]), "t", NOSLEEP)[0] == "COMPLETE"
+    xrp = next(iter(ex.owned_ids(con)))
+    pid = ex.record_plan(con, "d", [dict(coin="XRP", action="CLOSE", position_id=xrp)], {})
+    _simulate_crash(con, pid, "SUBMITTED")                 # crashed before the close was sent
+    alerts = []
+    ex.reconcile(con, client, NOSLEEP, alerts.append)
+    assert close_posts(fake) == 1 and any("finishing the approved close" in a for a in alerts)
+    ex.reconcile(con, client, NOSLEEP, alerts.append)      # position gone now
+    assert states(con, pid)["XRP"][0] == "VERIFIED" and not fake.positions
+    assert con.execute("SELECT state FROM plans WHERE id=?", (pid,)).fetchone()[0] == "COMPLETE"
+    # a close that never lands: retried after 10 min, max 3 times, then handed to the human
+    tmp, fake, client, con = setup()
+    assert ex.execute(con, client, plan(con, ["XRP"]), "t", NOSLEEP)[0] == "COMPLETE"
+    xrp = next(iter(ex.owned_ids(con)))
+    pid = ex.record_plan(con, "d", [dict(coin="XRP", action="CLOSE", position_id=xrp)], {})
+    _simulate_crash(con, pid, "SUBMITTED")
+    fake.faults["close"] = ["timeout"] * 10
+    ex.reconcile(con, client, NOSLEEP, alerts.append)
+    ex.reconcile(con, client, NOSLEEP, alerts.append)
+    assert close_posts(fake) == 1                          # within 10 min: not re-sent
+    for n in (2, 3, 3):
+        con.execute("UPDATE orders SET exit_sent_at=? WHERE plan_id=?", (int(time.time()) - 601, pid))
+        ex.reconcile(con, client, NOSLEEP, alerts.append)
+        assert close_posts(fake) == n, (n, close_posts(fake))
+    assert "not confirmed after 3 tries" in states(con, pid)["XRP"][1]
+    fake.stop()
+
+
 def test_existing_positions_use_their_own_inr_rate():
     pos = [dict(id="a", quantity="100", entry_price="1", entry_hedge_rate="130", stoploss=dict(price="0.8"))]
     # 100 x 1 x 130 = Rs 13,000 at a 20% stop = Rs 2,600 > 15% of 5,000, even though today's rate says 102

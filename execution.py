@@ -522,7 +522,7 @@ def identity_problems(pos, row):
     except (TypeError, ValueError):
         problems.append(f"leverage {pos.get('leverage')}")
     try:
-        qty_ok = row["filled_qty"] and abs(float(pos["quantity"]) - row["filled_qty"]) <= 1e-9 * max(1, row["filled_qty"])
+        qty_ok = row["filled_qty"] and abs(float(pos["quantity"]) - row["filled_qty"]) <= 1e-6 * max(1, row["filled_qty"])
     except (KeyError, TypeError, ValueError):
         qty_ok = False
     if not qty_ok:
@@ -679,6 +679,7 @@ def protective_close(con, client, row, why, sleep, alert):
             if not attempts:
                 event(con, "protect", f"{row['coin']}: {why}. EXITING this position now (automatic protective "
                                       f"exit).", alert)
+            renew(con, row["plan_id"])                                 # our fence is live right before sending
             set_order(con, row["id"], exit_sent_at=now, exit_attempts=attempts + 1)     # journal BEFORE sending
             try:
                 client.close_position(pid)
@@ -717,7 +718,7 @@ def run_close(con, client, row, sleep, alert):
         con.execute("UPDATE owned SET closed_at=? WHERE position_id=?", (int(time.time()), row["position_id"]))
         return
     gate()
-    set_order(con, row["id"], state="SUBMITTED")
+    set_order(con, row["id"], state="SUBMITTED", exit_sent_at=int(time.time()), exit_attempts=1)   # for resume_close
     try:
         client.close_position(row["position_id"])
         set_order(con, row["id"], state="ACCEPTED")
@@ -947,6 +948,40 @@ def execute(con, client, plan_id, approver, sleep=time.sleep, alert=None):
     return final, summary
 
 
+def resume_close(con, client, row, alert):
+    """A human-approved CLOSE left unfinished by a crash. Gone -> VERIFIED. Still open -> the approval covers
+    finishing it: re-send only if never sent or the last send was >= EXIT_RETRY_AFTER ago (journaled first),
+    at most EXIT_MAX_ATTEMPTS times, then hand over to the human. Only ever closes a bot-owned position."""
+    now = int(time.time())
+    if not any(p["id"] == row["position_id"] for p in client.positions()):
+        set_order(con, row["id"], state="VERIFIED")
+        con.execute("UPDATE owned SET closed_at=? WHERE position_id=? AND closed_at IS NULL",
+                    (now, row["position_id"]))
+        return
+    if row["position_id"] not in owned_ids(con):
+        set_order(con, row["id"], state="FAILED", error="refused: position not owned by the bot")
+        return
+    attempts, sent = row["exit_attempts"] or 0, row["exit_sent_at"] or 0
+    if sent and now - sent < EXIT_RETRY_AFTER:
+        return                                                         # wait: the earlier close may still land
+    if attempts >= EXIT_MAX_ATTEMPTS:
+        set_order(con, row["id"], state="RECONCILE_REQUIRED",
+                  error=f"approved close not confirmed after {attempts} tries")
+        event(con, "reconcile", f"{row['coin']}: approved close failed {attempts} times. "
+                                f"CLOSE IT IN THE MUDREX APP NOW.", alert)
+        return
+    renew(con, row["plan_id"])
+    set_order(con, row["id"], state="SUBMITTED", exit_sent_at=now, exit_attempts=attempts + 1)   # journal first
+    event(con, "reconcile", f"{row['coin']}: finishing the approved close (attempt {attempts + 1}).", alert)
+    try:
+        client.close_position(row["position_id"])
+    except Rejected as e:
+        set_order(con, row["id"], state="RECONCILE_REQUIRED", error=f"close rejected {e.status}: {e.errors}"[:300])
+        event(con, "reconcile", f"{row['coin']}: approved close REJECTED. Check Mudrex now.", alert)
+    except (Ambiguous, Locked):
+        pass                                                           # next reconcile checks the position
+
+
 def reconcile(con, client, sleep=time.sleep, alert=None, min_age=0):
     """After a crash/restart: resolve every order that is not terminal, by client_order_id. Never resubmits
     entries. Skips any plan whose execution lease is still live (a run in progress renews it before every
@@ -966,10 +1001,7 @@ def reconcile(con, client, sleep=time.sleep, alert=None, min_age=0):
                 protective_close(con, client, row, row["error"], sleep, alert)   # finish an unconfirmed exit
                 continue
             if row["action"] == "CLOSE":
-                if not any(p["id"] == row["position_id"] for p in client.positions()):
-                    set_order(con, row["id"], state="VERIFIED")
-                    con.execute("UPDATE owned SET closed_at=? WHERE position_id=?",
-                                (int(time.time()), row["position_id"]))
+                resume_close(con, client, row, alert)
                 continue
             o = lookup_until_known(client, row["client_order_id"], sleep)   # raises if inconclusive -> deferred
             if o is None:
