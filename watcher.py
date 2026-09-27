@@ -242,6 +242,12 @@ def check(st, client=None, con=None, make_plan=None):
             if notify(f"{coin}: bot position {problem} on Mudrex. Check it in the app now."):
                 st["warned_sl"].append(key)           # handled only once delivered; otherwise retried next check
 
+    sent_cap = st.get("cap_sent")
+    if caps["hit"] and sent_cap and sent_cap.get("day") == caps["day"] == st.get("cap_day"):
+        row = con.execute("SELECT state, note FROM plans WHERE id=?", (sent_cap["plan_id"],)).fetchone()
+        if row and row["state"] == "FAILED" and (row["note"] or "") != "rejected by user":
+            st.pop("cap_day", None)                   # expired/failed without a Keep: offer Close all again
+
     if caps["hit"] and st.get("cap_day") != caps["day"]:
         bot_open = [v for v in view if v["bot"]]
         msg = (f"Daily {caps['hit']} cap hit: bot Rs {caps['pnl']:+,.0f} today (cap {caps['cap']:,.0f}). "
@@ -259,10 +265,20 @@ def check(st, client=None, con=None, make_plan=None):
             sent = notify(msg)
         if sent:                                      # mark handled only after confirmed delivery (else retry)
             st["cap_day"] = caps["day"]
-            st.pop("cap_plan", None)
+            st["cap_sent"] = st.pop("cap_plan", None)
     elif caps["pnl"] <= -0.8 * caps["cap"] and st.get("warned_80") != caps["day"]:
         st["warned_80"] = caps["day"]
         notify(f"Warning: bot down Rs {-caps['pnl']:,.0f} today (loss cap Rs {caps['cap']:,.0f}).")
+
+    stuck = con.execute("SELECT DISTINCT plan_id FROM orders WHERE state IN "
+                        "('SUBMITTED','ACCEPTED','FILLED','RECONCILE_REQUIRED') AND updated_at < ?",
+                        (int(time.time()) - 1200,)).fetchall()
+    for r in stuck:                                   # read-only nudge; the approver reconciles automatically
+        key = f"stuck:{r['plan_id']}"
+        if key not in st.setdefault("warned_stuck", []) and notify(
+                f"Plan {r['plan_id']} has an unfinished order (>20 min). A position may lack a checked stop-loss. "
+                f"Check Mudrex; on the PC run: python live_trader.py reconcile"):
+            st["warned_stuck"].append(key)
 
     guard = journal_and_guard(st, con, client, sum(v["upnl_inr"] for v in view if v["bot"]))
     if make_plan is None:

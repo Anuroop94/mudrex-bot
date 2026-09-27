@@ -23,6 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 OFFSET_PATH = os.path.join(HERE, "approver_offset.json")
 HEARTBEAT_PATH = os.path.join(HERE, "approver_heartbeat.json")
 LOG_PATH = os.path.join(HERE, "approver.log")
+RECONCILE_EVERY = 300
 
 
 def log(msg):
@@ -89,6 +90,10 @@ def handle(u, run=None, replan=None):
         tg.edit(m["chat"]["id"], m["message_id"], m.get("text", "") + f"\n\n{final}:\n" + "\n".join(summary))
         log(f"plan {plan_id} approve by {who}: {final}")
         if final == "REFUSED" and summary and str(summary[0]).startswith("EXPIRED"):
+            row = ex.db().execute("SELECT payload FROM plans WHERE id=?", (int(plan_id),)).fetchone()
+            if row and json.loads(row["payload"] or "{}").get("reason") == "cap":
+                tg.send("That Close-all plan expired. The watcher sends a fresh Close-all within 5 minutes.")
+                return "cap expired"                   # the watcher re-offers the cap close (never a strategy plan)
             replan()                                   # new prices, new plan id, new buttons: tap again to trade
             log(f"plan {plan_id} expired; fresh plan sent")
             return "replanned"
@@ -117,8 +122,14 @@ def main():
         with open(OFFSET_PATH) as f:
             offset = json.load(f)["offset"]
     log("approver started" + ("" if tg.enabled() else " (Telegram not fully configured: idle)"))
-    warned_watcher, started = 0, time.time()
+    warned_watcher, started, reconciled = 0, time.time(), 0
     while True:
+        if time.time() - reconciled > RECONCILE_EVERY:
+            reconciled = time.time()
+            try:   # finishes orders of ALREADY-APPROVED plans after a crash (attach stops, verify); never submits
+                ex.reconcile(ex.db(), __import__("mudrex_client").Client(), alert=tg_alert)
+            except Exception:
+                log("reconcile error:\n" + traceback.format_exc())
         with open(HEARTBEAT_PATH, "w") as f:
             json.dump({"at": time.time()}, f)
         ws = os.path.join(HERE, "watch_status.json")

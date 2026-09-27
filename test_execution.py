@@ -455,6 +455,64 @@ def test_buy_plans_expire_after_15_minutes_close_plans_after_3_hours():
     fake.stop()
 
 
+def test_freshness_rechecked_right_before_the_order_is_sent():
+    for hook in ("price", "age"):
+        tmp, fake, client, con = setup()
+        pid = plan(con, ["XRP"])
+        if hook == "price":
+            fake.hooks["on_leverage"] = lambda: fake.prices.__setitem__("XRP", PRICES["XRP"] * 1.05)
+        else:
+            fake.hooks["on_leverage"] = lambda: ex.db(os.path.join(tmp, "exec.db")).execute(   # server thread
+                "UPDATE plans SET created_at=? WHERE id=?", (int(time.time()) - 21 * 60, pid))
+        ex.execute(con, client, pid, "t", NOSLEEP)
+        st = states(con, pid)["XRP"]
+        assert st[0] == "FAILED" and ("drifted" in st[1] if hook == "price" else "too old" in st[1]), st
+        assert fake.submits == 0
+        fake.stop()
+
+
+def test_recovery_only_owns_positions_the_journal_verified():
+    tmp, fake, client, con = setup()
+    fake.create_order("XRPUSDT", dict(client_order_id="s1-99-0-XRP-O", quantity="6"))
+    fake._maybe_fill(fake.orders["s1-99-0-XRP-O"])              # filled on the exchange, unknown to the journal
+    ex.recover_ownership(con, client)
+    assert fake.positions and not ex.owned_ids(con)              # treated as manual: never touched
+    fake.stop()
+
+
+def test_watcher_reoffers_expired_cap_close_and_flags_stuck_orders():
+    import watcher
+    tmp, fake, client, con = setup()
+    assert ex.execute(con, client, plan(con, ["XRP"]), "t", NOSLEEP)[0] == "COMPLETE"
+    con.execute("INSERT INTO owned(position_id, coin, client_order_id, opened_at, closed_at, realized_pnl) "
+                "VALUES('lost','ADA','s1-y',?,?,-400)", (int(time.time()) - 60, int(time.time()) - 30))
+    sent, st = [], {}
+    orig = (watcher.notify, watcher.STATUS_PATH, watcher.LOG_PATH, watcher.JOURNAL_PATH)
+    watcher.STATUS_PATH, watcher.LOG_PATH, watcher.JOURNAL_PATH = (os.path.join(tmp, n) for n in
+                                                                   ("ws.json", "w.log", "j.csv"))
+    watcher.notify = lambda msg, buttons=None: sent.append((msg, buttons)) or True
+    mk = lambda: dict(plan_id=None, orders=[], created_at=time.time())      # noqa: E731
+    closes = lambda: [b for _, b in sent if b and "Close all" in str(b)]      # noqa: E731
+    try:
+        watcher.check(st, client, con, make_plan=mk)
+        first = st["cap_sent"]["plan_id"]
+        watcher.check(st, client, con, make_plan=mk)
+        assert len(closes()) == 1                                  # delivered once, not repeated
+        con.execute("UPDATE plans SET state='FAILED', note='expired' WHERE id=?", (first,))
+        watcher.check(st, client, con, make_plan=mk)
+        assert len(closes()) == 2 and st["cap_sent"]["plan_id"] != first      # expired -> fresh Close all
+        con.execute("UPDATE plans SET state='FAILED', note='rejected by user' WHERE id=?", (st["cap_sent"]["plan_id"],))
+        watcher.check(st, client, con, make_plan=mk)
+        assert len(closes()) == 2                                  # "Keep" is respected
+        con.execute("UPDATE orders SET state='RECONCILE_REQUIRED', updated_at=? WHERE plan_id=1",
+                    (int(time.time()) - 3600,))
+        watcher.check(st, client, con, make_plan=mk)
+        assert any("unfinished order" in m for m, _ in sent)
+    finally:
+        watcher.notify, watcher.STATUS_PATH, watcher.LOG_PATH, watcher.JOURNAL_PATH = orig
+    fake.stop()
+
+
 def test_cap_close_plan_is_not_superseded_by_an_entry_plan():
     tmp, fake, client, con = setup()
     cap = ex.record_plan(con, "d", [dict(coin="XRP", action="CLOSE", position_id="p")], {"reason": "cap"})

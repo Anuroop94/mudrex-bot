@@ -43,6 +43,7 @@ STOP_PATH = os.path.join(HERE, "STOP")
 GUARD_PATH = os.path.join(HERE, "guard.json")
 PLAN_MAX_AGE = 3 * 3600
 ENTRY_MAX_AGE = 15 * 60      # a plan that BUYS must be approved within 15 min; after that a fresh plan is made
+SUBMIT_GRACE = 5 * 60        # ...and each buy must be SENT within 15 + 5 min of the plan (basket execution time)
 MAX_DRIFT = 0.02            # refuse an entry if the live price moved >2% from the planned price
 HEDGE_BUFFER = 1.03         # size as if INR were 3% weaker than the last applied rate
 HEDGE_MAX_AGE = 7 * 86400
@@ -105,20 +106,26 @@ def order_row(con, oid):
 def record_plan(con, decision_day, orders, payload):
     """Store a new PLANNED plan. orders: dicts with coin, action, position_id?, planned_price, notional_inr, atr."""
     now = int(time.time())
-    cur = con.execute("INSERT INTO plans(created_at, decision_day, state, payload) VALUES(?,?,?,?)",
-                      (now, decision_day, "PLANNED", json.dumps(payload)))
-    pid = cur.lastrowid
-    # only ONE approvable plan exists at a time: older unapproved plans (and their buttons) become invalid,
-    # except a pending cap-hit "Close all" plan, which only another cap plan may replace
-    con.execute("UPDATE plans SET state='FAILED', note=? WHERE state='PLANNED' AND id<>? AND "
-                "(? OR COALESCE(json_extract(payload, '$.reason'), '') <> 'cap')",
-                (f"superseded by plan {pid}", pid, payload.get("reason") == "cap"))
-    for i, o in enumerate(orders):
-        cid = f"s1-{pid}-{i}-{o['coin']}-{o['action'][0]}"[:64]
-        con.execute("""INSERT INTO orders(plan_id, seq, coin, action, client_order_id, state, position_id,
-                       planned_price, planned_notional_inr, atr, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                    (pid, i, o["coin"], o["action"], cid, "PLANNED", o.get("position_id"), o.get("planned_price"),
-                     o.get("notional_inr"), o.get("atr"), now))
+    con.execute("BEGIN IMMEDIATE")          # one atomic step: a concurrent claim sees the old plan or the new one
+    try:
+        cur = con.execute("INSERT INTO plans(created_at, decision_day, state, payload) VALUES(?,?,?,?)",
+                          (now, decision_day, "PLANNED", json.dumps(payload)))
+        pid = cur.lastrowid
+        # only ONE approvable plan exists at a time: older unapproved plans (and their buttons) become invalid,
+        # except a pending cap-hit "Close all" plan, which only another cap plan may replace
+        con.execute("UPDATE plans SET state='FAILED', note=? WHERE state='PLANNED' AND id<>? AND "
+                    "(? OR COALESCE(json_extract(payload, '$.reason'), '') <> 'cap')",
+                    (f"superseded by plan {pid}", pid, payload.get("reason") == "cap"))
+        for i, o in enumerate(orders):
+            cid = f"s1-{pid}-{i}-{o['coin']}-{o['action'][0]}"[:64]
+            con.execute("""INSERT INTO orders(plan_id, seq, coin, action, client_order_id, state, position_id,
+                           planned_price, planned_notional_inr, atr, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                        (pid, i, o["coin"], o["action"], cid, "PLANNED", o.get("position_id"),
+                         o.get("planned_price"), o.get("notional_inr"), o.get("atr"), now))
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
     return pid
 
 
@@ -212,11 +219,15 @@ def quarantined(con, position_id):
 
 
 def recover_ownership(con, client):
-    """Add our filled orders ('s1-...-O') seen in history to the local ownership table (which is authoritative)."""
+    """Re-add ownership of positions the bot opened AND fully validated: a history order counts only if the local
+    journal has the same client_order_id VERIFIED on the same position (identity, stop and notional checked).
+    Anything else is treated as manual (never touched) until reconcile() validates it."""
     orders, truncated = client.history("orders")
     for o in orders:
         cid = o.get("client_order_id") or ""
-        if cid.startswith("s1-") and cid.endswith("-O") and o.get("status") == "FILLED" \
+        verified = con.execute("SELECT 1 FROM orders WHERE client_order_id=? AND state='VERIFIED' AND position_id=?",
+                               (cid, o.get("future_position_uuid"))).fetchone()
+        if cid.startswith("s1-") and cid.endswith("-O") and o.get("status") == "FILLED" and verified \
                 and o.get("future_position_uuid") and not quarantined(con, o["future_position_uuid"]):
             con.execute("INSERT OR IGNORE INTO owned(position_id, coin, client_order_id, opened_at) VALUES(?,?,?,?)",
                         (o["future_position_uuid"], o["symbol"].removesuffix("USDT"), cid, int(time.time())))
@@ -574,6 +585,9 @@ def run_open(con, client, row, sleep, alert):
     lev = client.leverage(sym)
     if lev is None or lev[0] != float(s1.LEV) or lev[1] != "ISOLATED":
         return fail(con, row["id"], f"leverage not verified as {s1.LEV}x isolated (got {lev})")
+    why = stale_at_submit(con, client, row, sym)
+    if why:
+        return fail(con, row["id"], why)
     accepted = submit_with_reconcile(con, client, order_row(con, row["id"]),
                                      lambda: client.place_market_long(sym, qty_s, row["client_order_id"], initial_stop),
                                      sleep, alert)
@@ -583,6 +597,18 @@ def run_open(con, client, row, sleep, alert):
     if o is None:
         return order_row(con, row["id"])["state"] == "FAILED"
     return protect_and_check(con, client, row, o, sleep, alert)
+
+
+def stale_at_submit(con, client, row, sym):
+    """Freshness re-checked immediately before the entry POST: the plan's age (claim-time check + a short grace
+    for the basket's own execution time) and the live price vs the planned price."""
+    created = con.execute("SELECT created_at FROM plans WHERE id=?", (row["plan_id"],)).fetchone()[0]
+    if time.time() - created > ENTRY_MAX_AGE + SUBMIT_GRACE:
+        return "refused: plan too old by the time this order was due"
+    price, planned = float(client.asset(sym)["price"]), row["planned_price"]
+    if planned and abs(price / planned - 1) > MAX_DRIFT:
+        return f"price drifted {price / planned - 1:+.1%} just before sending"
+    return None
 
 
 def fill_within_approval(con, row, o, alert):
