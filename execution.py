@@ -13,13 +13,12 @@ Rules:
     A basket symbol with any position we do not own (manual long or short) is refused and alerted.
   - STOP and LIVE_TRADING_ENABLED are re-checked immediately before EVERY order-changing request (leverage,
     entry, close). Protective stop-loss attach/edit is never blocked by STOP.
-  - Before each entry: positions/ownership, free margin, bot caps, guard, asset spec, live price (drift),
-    leverage read back = exactly LEV isolated, and a recent Mudrex hedge rate (sized with a safety buffer).
-  - Stops are fill-aware: target = actual fill - SL_ATR*ATR; VERIFIED only if the exchange stop is within
-    tolerance of the target and fill > stop > liquidation (liquidation must be known). Missing stop -> POST,
-    wrong stop -> PATCH with its stoploss_order_id. Any failure -> alert + halt entries.
-  - Daily caps are bot-only: 5% of the bot's day-start equity (Rs 5,000 allocation + bot realized P&L from the
-    local ledger + bot unrealized). Deposits, withdrawals, manual positions excluded. If bot P&L cannot be
+  - Before each entry: positions/ownership, free margin, fixed rupee-risk ledger, guard, asset spec, live price
+    (drift), side-aware variable leverage read back in isolated mode, and a recent Mudrex hedge rate.
+  - Both stop and target are fill-aware and side-aware. VERIFIED requires exchange SL and TP within tolerance and
+    both before liquidation. Missing/wrong protection is repaired once; failure alerts, halts and protective-exits.
+  - Daily caps are bot-only: fixed -Rs500 / +Rs500 thresholds over the IST day, measured from day-start equity
+    using the local ledger plus bot unrealized P&L. Deposits, withdrawals, and manual positions are excluded. If bot P&L cannot be
     confirmed (closed position missing from truncated history), entries are blocked (fail closed).
     Caps BLOCK NEW ENTRIES only; closing needs a human-approved plan (the watcher offers "Close all").
   - PROTECTIVE EXIT (owner's standing rule, 2026-09-27): a bot-owned position from an approved entry that cannot
@@ -31,6 +30,7 @@ Rules:
     checked after the fill.
 """
 import json
+import hashlib
 import math
 import os
 import sqlite3
@@ -39,7 +39,9 @@ import uuid
 from datetime import datetime
 
 import config
+import adaptive_risk
 import s1
+import trade_policy
 from mudrex_client import Ambiguous, ApiError, Locked, Rejected
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -85,11 +87,22 @@ def db(path=None):
     CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, at INTEGER, kind TEXT, msg TEXT);
     CREATE TABLE IF NOT EXISTS marks(at INTEGER PRIMARY KEY, equity REAL);
     CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value REAL);
+    CREATE TABLE IF NOT EXISTS trade_sets(id INTEGER PRIMARY KEY, plan_id INTEGER, order_id INTEGER,
+        cycle TEXT NOT NULL, set_number INTEGER, proposal_id TEXT UNIQUE NOT NULL, coin TEXT NOT NULL,
+        side TEXT NOT NULL, state TEXT NOT NULL, planned_risk_inr REAL NOT NULL,
+        attempted_at INTEGER, completed_at INTEGER);
+    CREATE TABLE IF NOT EXISTS set_approvals(proposal_id TEXT PRIMARY KEY, cycle TEXT NOT NULL,
+        expires_at INTEGER NOT NULL, channel TEXT NOT NULL, approved_by TEXT NOT NULL,
+        approved_at INTEGER NOT NULL, consumed_at INTEGER);
     """)
     for table, col in (("owned", "realized_pnl REAL"), ("plans", "lease_until INTEGER"), ("plans", "lease_token TEXT"),
                        ("ledger", "trusted INTEGER DEFAULT 1"), ("orders", "exit_sent_at INTEGER"),
                        ("orders", "exit_attempts INTEGER DEFAULT 0"),
-                       ("marks", "trusted INTEGER DEFAULT 1")):
+                       ("marks", "trusted INTEGER DEFAULT 1"), ("orders", "side TEXT DEFAULT 'LONG'"),
+                       ("orders", "planned_stop REAL"), ("orders", "planned_target REAL"),
+                       ("orders", "planned_leverage REAL"), ("orders", "planned_risk_inr REAL"),
+                       ("orders", "planned_qty REAL"), ("orders", "set_id INTEGER"),
+                       ("orders", "target_price TEXT")):
         if col.split()[0] not in {r["name"] for r in con.execute(f"PRAGMA table_info({table})")}:
             con.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
     if con.execute("SELECT 1 FROM kv WHERE key='marks_v2'").fetchone() is None:
@@ -108,7 +121,9 @@ def event(con, kind, msg, alert=None):
     con.execute("INSERT INTO events(at, kind, msg) VALUES(?,?,?)", (int(time.time()), kind, msg))
     if alert:
         try:
-            alert(msg)
+            delivered = alert(msg)
+            if delivered is False:
+                raise ConnectionError("alert callback reported delivery failure")
         except Exception as e:                                   # noqa: BLE001 - delivery must not break trading state
             con.execute("INSERT INTO events(at, kind, msg) VALUES(?,?,?)",
                         (int(time.time()), "alert_failed", f"{type(e).__name__}: {e}"[:300]))
@@ -117,6 +132,13 @@ def event(con, kind, msg, alert=None):
 def set_order(con, oid, **kw):
     kw["updated_at"] = int(time.time())
     con.execute(f"UPDATE orders SET {', '.join(k + '=?' for k in kw)} WHERE id=?", (*kw.values(), oid))
+
+
+def set_trade_set_state(con, row, state, completed_at=None):
+    """Advance the durable set in step with a terminal/known submission outcome."""
+    if row["set_id"]:
+        con.execute("UPDATE trade_sets SET state=?, completed_at=? WHERE id=?",
+                    (state, completed_at, row["set_id"]))
 
 
 def order_row(con, oid):
@@ -136,17 +158,146 @@ def record_plan(con, decision_day, orders, payload):
         con.execute("UPDATE plans SET state='FAILED', note=? WHERE state='PLANNED' AND id<>? AND "
                     "(? OR COALESCE(json_extract(payload, '$.reason'), '') <> 'cap')",
                     (f"superseded by plan {pid}", pid, payload.get("reason") == "cap"))
+        cycle = trade_policy.cycle_id(now)
         for i, o in enumerate(orders):
             cid = f"s1-{pid}-{i}-{o['coin']}-{o['action'][0]}"[:64]
-            con.execute("""INSERT INTO orders(plan_id, seq, coin, action, client_order_id, state, position_id,
-                           planned_price, planned_notional_inr, atr, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                        (pid, i, o["coin"], o["action"], cid, "PLANNED", o.get("position_id"),
-                         o.get("planned_price"), o.get("notional_inr"), o.get("atr"), now))
+            side, stop, target, lev, risk, set_id = "LONG", None, None, None, None, None
+            if o["action"] == "OPEN":
+                side = str(o.get("side") or "LONG").upper()
+                entry, atr = float(o["planned_price"]), float(o["atr"])
+                stop = float(o.get("stop_loss") or (entry - s1.SL_ATR * atr if side == "LONG"
+                                                     else entry + s1.SL_ATR * atr))
+                distance = abs(entry - stop)
+                target = float(o.get("take_profit") or (entry + 1.5 * distance if side == "LONG"
+                                                         else entry - 1.5 * distance))
+                trade_policy.validate_bracket(side, entry, stop, target)
+                lev = float(o.get("leverage") or s1.LEV)
+                risk = float(o.get("planned_risk_inr") or
+                             (float(o["notional_inr"]) * distance / entry))
+                if not all(math.isfinite(x) and x > 0 for x in (lev, risk)):
+                    raise ValueError("planned leverage and risk must be finite and positive")
+                proposal = dict(cycle=cycle, plan_id=pid, seq=i, coin=o["coin"], side=side,
+                                entry=entry, stop=stop, target=target, leverage=lev, risk=round(risk, 8))
+                proposal_id = hashlib.sha256(json.dumps(proposal, sort_keys=True,
+                                                        separators=(",", ":")).encode()).hexdigest()
+                cur_set = con.execute("""INSERT INTO trade_sets(plan_id, cycle, proposal_id, coin, side, state,
+                                      planned_risk_inr) VALUES(?,?,?,?,?,'PLANNED',?)""",
+                                      (pid, cycle, proposal_id, o["coin"], side, risk))
+                set_id = cur_set.lastrowid
+            cur_order = con.execute("""INSERT INTO orders(plan_id, seq, coin, action, client_order_id, state,
+                           position_id, planned_price, planned_notional_inr, atr, updated_at, side, planned_stop,
+                           planned_target, planned_leverage, planned_risk_inr, planned_qty, set_id)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           (pid, i, o["coin"], o["action"], cid, "PLANNED", o.get("position_id"),
+                            o.get("planned_price"), o.get("notional_inr"), o.get("atr"), now, side, stop,
+                            target, lev, risk, o.get("qty"), set_id))
+            if set_id:
+                con.execute("UPDATE trade_sets SET order_id=? WHERE id=?", (cur_order.lastrowid, set_id))
         con.execute("COMMIT")
     except Exception:
         con.execute("ROLLBACK")
         raise
     return pid
+
+
+def journal_set_approval(con, plan_id, approver, ttl=15 * 60):
+    """Bind one Telegram approval to one immutable planned set. It is consumed at first submit."""
+    row = con.execute("""SELECT s.proposal_id, s.cycle FROM trade_sets s JOIN plans p ON p.id=s.plan_id
+                         WHERE s.plan_id=? AND s.state='PLANNED' AND p.state='PLANNED'""", (plan_id,)).fetchall()
+    if len(row) != 1:
+        return "approval must name a plan containing exactly one unattempted set"
+    now = int(time.time())
+    con.execute("""INSERT INTO set_approvals(proposal_id, cycle, expires_at, channel, approved_by, approved_at)
+                   VALUES(?,?,?,'telegram',?,?) ON CONFLICT(proposal_id) DO UPDATE SET expires_at=excluded.expires_at,
+                   approved_by=excluded.approved_by, approved_at=excluded.approved_at, consumed_at=NULL""",
+                (row[0]["proposal_id"], row[0]["cycle"], now + ttl, approver, now))
+    return None
+
+
+def cycle_set_counts(con, cycle, exclude_set_id=None):
+    """Return verified completions and unresolved writes for one durable cycle.
+
+    A set is complete only after protect_and_check verifies entry, stop, and target.
+    An attempted row in any other nonterminal state is ambiguous/in-flight and blocks
+    a later set until reconciliation; definitively FAILED rows do not count as sets.
+    """
+    completed = con.execute("SELECT COUNT(*) FROM trade_sets WHERE cycle=? AND state='COMPLETE'",
+                            (cycle,)).fetchone()[0]
+    params = [cycle]
+    exclusion = ""
+    if exclude_set_id is not None:
+        exclusion = " AND id<>?"
+        params.append(exclude_set_id)
+    unresolved = con.execute("SELECT COUNT(*) FROM trade_sets WHERE cycle=? AND attempted_at IS NOT NULL "
+                              "AND state NOT IN ('COMPLETE','FAILED','RETRYABLE')" + exclusion,
+                              params).fetchone()[0]
+    return completed, unresolved
+
+
+def plan_requires_set_approval(con, plan_id):
+    """True only when this exact single-set plan would become set 4+ in its current cycle."""
+    rows = con.execute("SELECT cycle FROM trade_sets WHERE plan_id=? AND state='PLANNED'", (plan_id,)).fetchall()
+    if len(rows) != 1:
+        return False
+    completed, _unresolved = cycle_set_counts(con, rows[0]["cycle"])
+    return completed >= trade_policy.AUTONOMOUS_SETS_PER_CYCLE
+
+
+def authorize_set_submission(con, row):
+    """Atomically assign/consume the next cycle set immediately before the first exchange write."""
+    if not row["set_id"]:
+        return None
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        item = con.execute("SELECT * FROM trade_sets WHERE id=?", (row["set_id"],)).fetchone()
+        if item is None:
+            why = "set journal missing"
+        elif item["state"] == "COMPLETE":
+            why = "set is already complete; refusing duplicate submission"
+        elif item["state"] == "ATTEMPTED":
+            why = "prior submission is unresolved; reconcile before any new set or retry"
+        elif item["state"] == "RETRYABLE":
+            # A definite exchange-busy response proves no order was accepted. Permit
+            # only this same in-progress plan to retry; its per-set approval was bound
+            # and consumed at the first write attempt.
+            plan_state = con.execute("SELECT state FROM plans WHERE id=?", (item["plan_id"],)).fetchone()
+            if item["cycle"] != trade_policy.cycle_id():
+                why = "planned set belongs to an expired 24-hour IST cycle"
+            else:
+                why = None if plan_state and plan_state["state"] == "EXECUTING" else "known-not-submitted attempt is no longer retryable in this plan"
+            if why is None:
+                con.execute("UPDATE trade_sets SET state='ATTEMPTED', attempted_at=? WHERE id=?",
+                            (int(time.time()), item["id"]))
+        elif item["cycle"] != trade_policy.cycle_id():
+            why = "planned set belongs to an expired 24-hour IST cycle"
+        else:
+            completed, unresolved = cycle_set_counts(con, item["cycle"], exclude_set_id=item["id"])
+            why = None
+            if unresolved:
+                why = "another set submission is unresolved; reconcile it before opening a new set"
+            if why is None and completed >= trade_policy.AUTONOMOUS_SETS_PER_CYCLE:
+                approval = con.execute("SELECT * FROM set_approvals WHERE proposal_id=?",
+                                       (item["proposal_id"],)).fetchone()
+                now = int(time.time())
+                if approval is None or approval["channel"] != "telegram" or approval["cycle"] != item["cycle"] \
+                        or approval["expires_at"] <= now or approval["consumed_at"] is not None:
+                    why = (f"owner Telegram approval required for set {completed + 1}; approval must be current "
+                           "and bound to this exact proposal")
+                else:
+                    con.execute("UPDATE set_approvals SET consumed_at=? WHERE proposal_id=?",
+                                (now, item["proposal_id"]))
+            if why is None:
+                now = int(time.time())
+                con.execute("UPDATE trade_sets SET set_number=?, state='ATTEMPTED', attempted_at=? WHERE id=?",
+                            (completed + 1, now, item["id"]))
+        if why:
+            con.execute("ROLLBACK")
+            return why
+        con.execute("COMMIT")
+        return None
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
 
 
 def supersede_pending(con, note):
@@ -247,6 +398,10 @@ def floor_to(x, step):
     return math.floor(x / step + 1e-9) * step
 
 
+def ceil_to(x, step):
+    return math.ceil(x / step - 1e-9) * step
+
+
 def fmt_step(x, step):
     import decimal
     q = decimal.Decimal(str(step))
@@ -332,7 +487,9 @@ def sync_owned(con, client, positions):
         for r in missing:
             p = hist.get(r["position_id"])
             if p is not None and p.get("pnl") is not None:
-                con.execute("UPDATE owned SET realized_pnl=? WHERE position_id=?", (float(p["pnl"]), r["position_id"]))
+                value = float(p["pnl"])
+                if math.isfinite(value):
+                    con.execute("UPDATE owned SET realized_pnl=? WHERE position_id=?", (value, r["position_id"]))
     return unconfirmed + con.execute("SELECT COUNT(*) FROM owned WHERE closed_at IS NOT NULL AND realized_pnl IS NULL"
                                      ).fetchone()[0]
 
@@ -343,7 +500,12 @@ def unrealized_inr(con, positions, rate):
     for p in positions:
         if p["id"] in ours:
             px = float(p.get("mark_price") or p.get("last_price") or p["entry_price"])
-            u += float(p["quantity"]) * (px - float(p["entry_price"])) * float(p.get("entry_hedge_rate") or rate)
+            direction = 1 if str(p.get("order_type")).upper() == "LONG" else -1
+            value = (float(p["quantity"]) * (px - float(p["entry_price"])) * direction
+                     * float(p.get("entry_hedge_rate") or rate))
+            if not math.isfinite(value):
+                raise PnlUnknown(f"non-finite open P&L for {p.get('symbol')}")
+            u += value
     return u
 
 
@@ -358,7 +520,10 @@ def bot_equity(con, client, positions, rate):
         raise PnlUnknown("a closed bot position's P&L is not yet visible in Mudrex history")
     realized = con.execute("SELECT COALESCE(SUM(realized_pnl), 0) FROM owned WHERE closed_at IS NOT NULL"
                            ).fetchone()[0]
-    return s1.CAPITAL_CAP_INR + realized + unrealized_inr(con, positions, rate)
+    equity = s1.CAPITAL_CAP_INR + float(realized) + unrealized_inr(con, positions, rate)
+    if not math.isfinite(equity):
+        raise PnlUnknown("bot equity is non-finite")
+    return equity
 
 
 def ist_day(t=None):
@@ -369,7 +534,7 @@ MARK_WINDOW = 15 * 60       # a pre-midnight equity mark this recent is a trustw
 
 
 def caps_state(con, equity, unreal=0.0, now=None, trusted=True):
-    """Bot day P&L vs 5% caps (IST day). Every call records an equity mark. The day-start baseline is:
+    """Bot day P&L vs the fixed rupee caps (IST day). Every call records an equity mark. The day-start baseline is:
       - the last equity mark in the 15 min before IST midnight (the watcher marks every 5 min), else
       - with NO open bot position: allocation + P&L realized before midnight (exact), else
       - UNKNOWN (baseline_ok False): open positions moved while nobody watched, so today's loss cannot be
@@ -396,7 +561,7 @@ def caps_state(con, equity, unreal=0.0, now=None, trusted=True):
         con.execute("INSERT INTO ledger(day, start_equity, trusted) VALUES(?,?,?)", (day, start, trusted))
     else:
         start, trusted = row["start_equity"], row["trusted"] if row["trusted"] is not None else 1
-    cap = s1.DAILY_CAP_PCT * start
+    cap = trade_policy.DAILY_LOSS_LIMIT_INR
     pnl = equity - start
     return dict(day=day, start=start, pnl=pnl, cap=cap, baseline_ok=bool(trusted),
                 hit="loss" if pnl <= -cap else "profit" if pnl >= cap else None)
@@ -473,6 +638,10 @@ def submit_with_reconcile(con, client, row, send, sleep, alert, fresh=None):
             set_order(con, row["id"], state="FAILED", error=why)
             return None
         gate()                                                         # STOP / live flag, right before sending
+        why = authorize_set_submission(con, row)
+        if why:
+            set_order(con, row["id"], state="FAILED", error=why)
+            return None
         set_order(con, row["id"], state="SUBMITTED")
         try:
             resp = send()
@@ -484,9 +653,11 @@ def submit_with_reconcile(con, client, row, send, sleep, alert, fresh=None):
                 set_order(con, row["id"], state="ACCEPTED", exchange_order_id=(o or {}).get("id"))
                 return o or {}
             set_order(con, row["id"], state="FAILED", error=f"rejected {e.status}: {e.errors}")
+            set_trade_set_state(con, row, "FAILED")
             return None
         except Locked:
             set_order(con, row["id"], state="PLANNED")                 # 423/429: exchange did not take it
+            set_trade_set_state(con, row, "RETRYABLE")
             renew(con, row["plan_id"])
             sleep(min(2 ** attempt, 8))
             continue
@@ -499,6 +670,7 @@ def submit_with_reconcile(con, client, row, send, sleep, alert, fresh=None):
             event(con, "reconcile", f"{row['coin']}: order {cid} outcome unknown; not resubmitted", alert)
             return None
     set_order(con, row["id"], state="FAILED", error="exchange busy (423/429) after retries")
+    set_trade_set_state(con, row, "FAILED")
     return None
 
 
@@ -516,6 +688,7 @@ def poll_fill(con, client, row, sleep):
             return o
         if status in TERMINAL_BAD:
             set_order(con, row["id"], state="FAILED", error=f"order {status}")
+            set_trade_set_state(con, row, "FAILED")
             return None
         sleep(min(1 + i, 5))
     set_order(con, row["id"], state="RECONCILE_REQUIRED", error="no terminal status yet")
@@ -527,9 +700,9 @@ def stop_tolerance(fill, step):
 
 
 def unprotected(con, oid, row, why, alert):
-    """A filled position whose protection is not confirmed: never FAILED (that would release the entry block)."""
+    """A filled position whose bracket is not confirmed: never FAILED (that would release the entry block)."""
     set_order(con, oid, state="RECONCILE_REQUIRED", error=why)
-    event(con, "stop", f"{row['coin']}: {why}. POSITION MAY BE UNPROTECTED - check Mudrex now. "
+    event(con, "bracket", f"{row['coin']}: {why}. POSITION MAY BE UNPROTECTED - check Mudrex now. "
                        f"New entries are blocked until this is resolved.", alert)
     return False
 
@@ -539,12 +712,13 @@ def identity_problems(pos, row):
     problems = []
     if pos.get("symbol") != row["coin"] + "USDT":
         problems.append(f"symbol {pos.get('symbol')}")
-    if pos.get("order_type") != "LONG":
+    expected_side = str(row["side"] or "LONG").upper()
+    if str(pos.get("order_type") or "").upper() != expected_side:
         problems.append(f"side {pos.get('order_type')}")
     if pos.get("trade_currency") not in (None, "INR"):
         problems.append(f"currency {pos.get('trade_currency')}")
     try:
-        if float(pos.get("leverage")) != float(s1.LEV):
+        if float(pos.get("leverage")) != float(row["planned_leverage"] or s1.LEV):
             problems.append(f"leverage {pos.get('leverage')}")
     except (TypeError, ValueError):
         problems.append(f"leverage {pos.get('leverage')}")
@@ -557,7 +731,7 @@ def identity_problems(pos, row):
     return problems
 
 def verify_entry(con, client, oid, sleep, alert):
-    """Confirm the position identity, quantity and an exchange stop at the fill-derived target.
+    """Confirm position identity, quantity, and both exchange bracket legs at fill-derived prices.
     Returns True when protected; the caller sets VERIFIED only after the approved-notional check also passes,
     so a crash in between leaves the order FILLED (re-checked by reconcile), never VERIFIED unchecked."""
     row = order_row(con, oid)
@@ -576,42 +750,89 @@ def verify_entry(con, client, oid, sleep, alert):
         return False
     con.execute("INSERT OR IGNORE INTO owned(position_id, coin, client_order_id, opened_at) VALUES(?,?,?,?)",
                 (pos["id"], row["coin"], row["client_order_id"], int(time.time())))
+    side = str(row["side"] or "LONG").upper()
     try:
         liq = float(pos.get("liquidation_price"))
     except (TypeError, ValueError):
         liq = float("nan")
-    if not (math.isfinite(liq) and 0 < liq < fill):
-        return unprotected(con, oid, row, f"liquidation price unknown/invalid ({liq}); stop NOT verified", alert)
+    valid_liq = math.isfinite(liq) and ((side == "LONG" and 0 < liq < fill) or
+                                        (side == "SHORT" and liq > fill))
+    if not valid_liq:
+        return unprotected(con, oid, row, f"liquidation price unknown/invalid ({liq}); bracket NOT verified", alert)
     step = float(client.asset(row["coin"] + "USDT")["price_step"])
-    target = floor_to(fill - s1.SL_ATR * row["atr"], step)
+    stop_distance = abs(float(row["planned_price"]) - float(row["planned_stop"]))
+    target_distance = abs(float(row["planned_target"]) - float(row["planned_price"]))
+    wanted_stop = (floor_to(fill - stop_distance, step) if side == "LONG" else
+                   ceil_to(fill + stop_distance, step))
+    wanted_target = (ceil_to(fill + target_distance, step) if side == "LONG" else
+                     floor_to(fill - target_distance, step))
+    try:
+        trade_policy.validate_bracket(side, fill, wanted_stop, wanted_target)
+    except ValueError as e:
+        return unprotected(con, oid, row, f"no valid fill-derived bracket ({e})", alert)
+    if (side == "LONG" and wanted_stop <= liq) or (side == "SHORT" and wanted_stop >= liq):
+        return unprotected(con, oid, row,
+                           f"stop {wanted_stop} is beyond liquidation {liq} at fill {fill}", alert)
     tol = stop_tolerance(fill, step)
-    if not (liq < target < fill):
-        return unprotected(con, oid, row, f"no valid stop possible (target {target}, fill {fill}, liq {liq})", alert)
-    ok = lambda sl: liq < sl < fill and abs(sl - target) <= tol     # noqa: E731
-    sl_info = pos.get("stoploss") or {}
-    current = float(sl_info.get("price") or 0)
-    if not ok(current):
-        renew(con, row["plan_id"])                                     # fence live right before the stop write
+
+    def values(position):
+        sl = position.get("stoploss") or {}
+        tp = position.get("takeprofit") or {}
         try:
-            if current > 0:
-                if not sl_info.get("order_id"):
-                    raise Rejected(0, "existing stop has no order_id to amend")
-                client.edit_stoploss(pos["id"], sl_info["order_id"], fmt_step(target, step))
-            else:
-                client.set_stoploss(pos["id"], fmt_step(target, step), f"{row['client_order_id']}-SL")
-        except ApiError as e:
-            event(con, "stop", f"{row['coin']}: stop attach/edit error {e}", None)
+            return sl, tp, float(sl.get("price") or 0), float(tp.get("price") or 0)
+        except (TypeError, ValueError):
+            return sl, tp, float("nan"), float("nan")
+
+    def stop_ok(value):
+        geometry = liq < value < fill if side == "LONG" else fill < value < liq
+        return math.isfinite(value) and geometry and abs(value - wanted_stop) <= tol
+
+    def target_ok(value):
+        geometry = value > fill if side == "LONG" else 0 < value < fill
+        return math.isfinite(value) and geometry and abs(value - wanted_target) <= tol
+
+    sl_info, tp_info, current_stop, current_target = values(pos)
+    if not (stop_ok(current_stop) and target_ok(current_target)):
+        renew(con, row["plan_id"])
+        try:
+            edit_stop = current_stop > 0 and not stop_ok(current_stop)
+            edit_target = current_target > 0 and not target_ok(current_target)
+            if edit_stop or edit_target:
+                client.edit_bracket(
+                    pos["id"],
+                    stop_order_id=sl_info.get("order_id") if edit_stop else None,
+                    stop=fmt_step(wanted_stop, step) if edit_stop else None,
+                    target_order_id=tp_info.get("order_id") if edit_target else None,
+                    target=fmt_step(wanted_target, step) if edit_target else None,
+                )
+            missing_stop = not math.isfinite(current_stop) or current_stop <= 0
+            missing_target = not math.isfinite(current_target) or current_target <= 0
+            if missing_stop or missing_target:
+                client.set_bracket(
+                    pos["id"],
+                    stop=fmt_step(wanted_stop, step) if missing_stop else None,
+                    target=fmt_step(wanted_target, step) if missing_target else None,
+                    sl_cid=f"{row['client_order_id']}-SL" if missing_stop else None,
+                    tp_cid=f"{row['client_order_id']}-TP" if missing_target else None,
+                )
+        except (ApiError, ValueError) as e:
+            event(con, "bracket", f"{row['coin']}: bracket attach/edit error {e}", None)
         for _ in range(3):
             renew(con, row["plan_id"])
             sleep(1)
             pos = next((p for p in client.positions() if p["id"] == row["position_id"]), None)
-            current = float(((pos or {}).get("stoploss") or {}).get("price") or 0)
-            if ok(current):
+            if pos is None:
                 break
-    if ok(current):
-        set_order(con, oid, stop_price=fmt_step(current, step))
+            sl_info, tp_info, current_stop, current_target = values(pos)
+            if stop_ok(current_stop) and target_ok(current_target):
+                break
+    if stop_ok(current_stop) and target_ok(current_target):
+        set_order(con, oid, stop_price=fmt_step(current_stop, step),
+                  target_price=fmt_step(current_target, step))
         return True
-    return unprotected(con, oid, row, f"stop-loss not verified (exchange {current}, target {target})", alert)
+    return unprotected(con, oid, row,
+                       f"bracket not verified (stop {current_stop}/{wanted_stop}, "
+                       f"target {current_target}/{wanted_target})", alert)
 
 
 def protect_and_check(con, client, row, o, sleep, alert):
@@ -624,6 +845,9 @@ def protect_and_check(con, client, row, o, sleep, alert):
     budget = protected and within and after_fill_budget(con, client, order_row(con, row["id"]), o, alert)
     if protected and within and budget:
         set_order(con, row["id"], state="VERIFIED")
+        if row["set_id"]:
+            con.execute("UPDATE trade_sets SET state='COMPLETE', completed_at=? WHERE id=?",
+                        (int(time.time()), row["set_id"]))
         return True
     cur = order_row(con, row["id"])
     if cur["position_id"] and not quarantined(con, cur["position_id"]) and cur["position_id"] in owned_ids(con):
@@ -641,9 +865,68 @@ def pos_rate(p, rate=None):
     return r if r > 0 and math.isfinite(r) else None
 
 
+def cycle_realized_pnls(con, now=None):
+    """Confirmed outcomes observed in the current IST cycle; unknown/non-finite fails closed."""
+    now = now or time.time()
+    midnight = int((now + config.IST_OFFSET) // 86400 * 86400 - config.IST_OFFSET)
+    rows = con.execute("SELECT realized_pnl FROM owned WHERE closed_at>=?", (midnight,)).fetchall()
+    values = []
+    for row in rows:
+        if row["realized_pnl"] is None:
+            raise PnlUnknown("current-cycle realized P&L is not confirmed")
+        value = float(row["realized_pnl"])
+        if not math.isfinite(value):
+            raise PnlUnknown("current-cycle realized P&L is non-finite")
+        values.append(value)
+    return values
+
+
+def active_stop_risks(con, positions, owned=None):
+    """Conservative verified rupee stop risks for bot-owned open positions."""
+    owned = owned if owned is not None else owned_ids(con)
+    risks = []
+    for p in positions:
+        if p["id"] not in owned:
+            continue
+        try:
+            side = str(p["order_type"]).upper()
+            entry, qty = float(p["entry_price"]), float(p["quantity"])
+            stop = float((p.get("stoploss") or {}).get("price") or 0)
+            rate = pos_rate(p)
+        except (KeyError, TypeError, ValueError):
+            raise PnlUnknown(f"stop risk unknown for held {p.get('symbol')}")
+        valid = (side == "LONG" and 0 < stop < entry) or (side == "SHORT" and stop > entry)
+        if not valid or rate is None or not all(math.isfinite(x) and x > 0 for x in (entry, qty, stop)):
+            raise PnlUnknown(f"verified stop/rate missing for held {p.get('symbol')}")
+        actual = qty * abs(entry - stop) * rate
+        planned = con.execute("""SELECT planned_risk_inr FROM orders WHERE client_order_id=(
+                              SELECT client_order_id FROM owned WHERE position_id=?) ORDER BY id DESC LIMIT 1""",
+                              (p["id"],)).fetchone()
+        reserve = float(planned[0]) if planned and planned[0] is not None else actual
+        if not math.isfinite(reserve) or reserve < 0:
+            raise PnlUnknown(f"risk reserve invalid for held {p.get('symbol')}")
+        risks.append(max(actual, reserve))
+    return risks
+
+
 def unknown_rate(positions, owned):
     """Name of a held bot position whose applied INR rate is unknown (its size in rupees cannot be trusted)."""
     return next((p["symbol"] for p in positions if p["id"] in owned and pos_rate(p) is None), None)
+
+
+def position_margin_inr(position, fallback_rate=None):
+    """Conservative isolated margin; unknown or invalid leverage/rate fails closed."""
+    rate = pos_rate(position) or fallback_rate
+    try:
+        qty = float(position["quantity"])
+        entry = float(position["entry_price"])
+        leverage = float(position.get("leverage"))
+        rate = float(rate)
+    except (KeyError, TypeError, ValueError, OverflowError) as e:
+        raise PnlUnknown(f"margin inputs unknown for held {position.get('symbol')}") from e
+    if not all(math.isfinite(x) and x > 0 for x in (qty, entry, leverage, rate)):
+        raise PnlUnknown(f"margin inputs invalid for held {position.get('symbol')}")
+    return qty * entry * rate / leverage
 
 
 def after_fill_budget(con, client, row, o, alert):
@@ -658,16 +941,28 @@ def after_fill_budget(con, client, row, o, alert):
         why = f"bot balance unknown after the fill ({e})"
     else:
         fill, qty = row["fill_price"], float(row["filled_qty"])
-        why = over_loss_budget([p for p in positions if p["id"] != row["position_id"]], owned, rate, eq,
-                               qty * fill * rate, fill, float(row["stop_price"]))
+        try:
+            realized = cycle_realized_pnls(con)
+        except PnlUnknown as e:
+            why = f"current-cycle P&L unknown ({e})"
+        else:
+            planned_pure = (float(row["planned_notional_inr"]) *
+                            abs(float(row["planned_price"]) - float(row["planned_stop"])) /
+                            float(row["planned_price"]))
+            buffer = max(0.0, float(row["planned_risk_inr"] or planned_pure) - planned_pure)
+            why = over_loss_budget([p for p in positions if p["id"] != row["position_id"]], owned, rate, eq,
+                                   qty * fill * rate, fill, float(row["stop_price"]), row["side"], realized,
+                                   buffer, con=con, candidate_risk_limit=row["planned_risk_inr"])
         others = [p for p in positions if p["id"] != row["position_id"]]
         bad = unknown_rate(others, owned)
         why = why or (f"INR rate unknown for held {bad}" if bad else None)
-        exposure = sum(float(p["quantity"]) * float(p["entry_price"]) * (rate if p["id"] == row["position_id"]
-                                                                          else pos_rate(p) or 0)
-                       for p in positions if p["id"] in owned)
-        if not why and exposure > s1.LEV * s1.CAPITAL_CAP_INR:
-            why = f"allocation cap: bot holds Rs {exposure:,.0f} after this fill"
+        try:
+            margin = sum(position_margin_inr(p, rate if p["id"] == row["position_id"] else None)
+                         for p in positions if p["id"] in owned)
+        except PnlUnknown as e:
+            margin, why = 0.0, why or str(e)
+        if not why and margin > s1.CAPITAL_CAP_INR:
+            why = f"allocation cap: bot margin Rs {margin:,.0f} after this fill"
     if why:
         set_order(con, row["id"], state="RECONCILE_REQUIRED", error=f"after fill: {why}")
         return False
@@ -714,6 +1009,7 @@ def exited(con, row, why, alert):
     con.execute("UPDATE owned SET closed_at=? WHERE position_id=? AND closed_at IS NULL",
                 (int(time.time()), row["position_id"]))
     set_order(con, row["id"], state="FAILED", error=f"exited automatically: {why}"[:300])
+    set_trade_set_state(con, row, "FAILED")
     event(con, "protect", f"{row['coin']}: protective exit done; position closed.", alert)
     return True
 
@@ -896,6 +1192,9 @@ def fail(con, oid, why):
 
 def run_open(con, client, row, sleep, alert):
     """Returns True if further entries may proceed, False to HALT the plan's entries."""
+    migration = trade_policy.migration_block_reason()
+    if migration:
+        return fail(con, row["id"], migration)
     sym = row["coin"] + "USDT"
     positions = client.positions()
     owned = owned_ids(con)
@@ -923,22 +1222,46 @@ def run_open(con, client, row, sleep, alert):
     if planned and abs(price / planned - 1) > MAX_DRIFT:
         return fail(con, row["id"], f"price drifted {price / planned - 1:+.1%} since plan")
     step, min_qty, min_notional = float(a["quantity_step"]), float(a["min_contract"]), float(a["min_notional_value"])
-    notional_inr = min(row["planned_notional_inr"], s1.LEV * s1.CAPITAL_CAP_INR)
+    side = str(row["side"] or "LONG").upper()
+    lev = float(row["planned_leverage"] or s1.LEV)
+    exchange_max = float(a.get("max_leverage") or lev)
+    if side not in {"LONG", "SHORT"} or not math.isfinite(lev) or not (1 <= lev <= 5 and lev <= exchange_max):
+        return fail(con, row["id"], f"invalid planned side/leverage ({side}, {lev}x; exchange max {exchange_max}x)")
+    # Leverage only converts the already risk-sized planned notional into margin. Quantity remains bounded by the
+    # immutable planned_qty below, and the live risk is separately required not to exceed planned_risk_inr.
+    notional_inr = min(row["planned_notional_inr"], lev * s1.CAPITAL_CAP_INR)
     bad = unknown_rate(positions, owned)
     if bad:
         return fail(con, row["id"], f"INR rate unknown for held {bad}: cannot size safely")
-    held = sum(float(p["quantity"]) * float(p["entry_price"]) * pos_rate(p) for p in positions if p["id"] in owned)
-    if held + notional_inr > s1.LEV * s1.CAPITAL_CAP_INR:
-        return fail(con, row["id"], f"allocation cap: bot holds Rs {held:,.0f}, +Rs {notional_inr:,.0f} would exceed "
-                                    f"Rs {s1.LEV * s1.CAPITAL_CAP_INR:,.0f}")
-    qty = floor_to(notional_inr / (rate * HEDGE_BUFFER) / price, step)
+    try:
+        held_margin = sum(position_margin_inr(p) for p in positions if p["id"] in owned)
+    except PnlUnknown as e:
+        return fail(con, row["id"], str(e))
+    if held_margin + notional_inr / lev > s1.CAPITAL_CAP_INR:
+        return fail(con, row["id"], f"allocation cap: margin Rs {held_margin:,.0f} + Rs {notional_inr / lev:,.0f} "
+                                    f"would exceed Rs {s1.CAPITAL_CAP_INR:,.0f}")
+    live_max_qty = notional_inr / (rate * HEDGE_BUFFER) / price
+    planned_qty = float(row["planned_qty"] or live_max_qty)
+    qty = floor_to(min(planned_qty, live_max_qty), step)
     if qty < min_qty or qty * price < min_notional:
         return fail(con, row["id"], "below Mudrex minimum at live price")
-    if qty * price * rate * HEDGE_BUFFER / s1.LEV > float(client.funds()["balance"]):
+    if qty * price * rate * HEDGE_BUFFER / lev > float(client.funds()["balance"]):
         return fail(con, row["id"], "not enough free margin")
     pstep = float(a["price_step"])
-    initial_stop = fmt_step(floor_to(price - s1.SL_ATR * row["atr"], pstep), pstep)
-    why = over_loss_budget(positions, owned, rate, eq, qty * price * rate, price, float(initial_stop))
+    stop_distance = abs(float(row["planned_price"]) - float(row["planned_stop"]))
+    target_distance = abs(float(row["planned_target"]) - float(row["planned_price"]))
+    stop_value = floor_to(price - stop_distance, pstep) if side == "LONG" else ceil_to(price + stop_distance, pstep)
+    target_value = floor_to(price + target_distance, pstep) if side == "LONG" else floor_to(price - target_distance, pstep)
+    initial_stop, initial_target = fmt_step(stop_value, pstep), fmt_step(target_value, pstep)
+    try:
+        trade_policy.validate_bracket(side, price, initial_stop, initial_target)
+        realized = cycle_realized_pnls(con)
+    except (ValueError, PnlUnknown) as e:
+        return fail(con, row["id"], f"risk inputs unavailable: {e}")
+    pure_planned = float(row["planned_notional_inr"]) * stop_distance / float(row["planned_price"])
+    cost_buffer = max(0.0, float(row["planned_risk_inr"] or pure_planned) - pure_planned)
+    why = over_loss_budget(positions, owned, rate, eq, qty * price * rate, price, float(initial_stop), side,
+                           realized, cost_buffer, con=con, candidate_risk_limit=row["planned_risk_inr"])
     if why:
         return fail(con, row["id"], why)
     qty_s = fmt_step(qty, step)
@@ -946,16 +1269,17 @@ def run_open(con, client, row, sleep, alert):
     renew(con, row["plan_id"])
     gate()
     try:
-        client.set_leverage(sym, s1.LEV)
+        client.set_leverage(sym, lev)
     except Rejected as e:
         return fail(con, row["id"], f"leverage rejected: {e.errors}")
     except (Locked, Ambiguous):
         pass                                                           # verified below either way
-    lev = client.leverage(sym)
-    if lev is None or lev[0] != float(s1.LEV) or lev[1] != "ISOLATED":
-        return fail(con, row["id"], f"leverage not verified as {s1.LEV}x isolated (got {lev})")
+    saved = client.leverage(sym)
+    if saved is None or saved[0] != lev or saved[1] != "ISOLATED":
+        return fail(con, row["id"], f"leverage not verified as {lev}x isolated (got {saved})")
     accepted = submit_with_reconcile(con, client, order_row(con, row["id"]),
-                                     lambda: client.place_market_long(sym, qty_s, row["client_order_id"], initial_stop),
+                                     lambda: client.place_market(sym, qty_s, row["client_order_id"], side,
+                                                                 initial_stop, initial_target),
                                      sleep, alert, fresh=lambda: stale_at_submit(con, client, row, sym))
     if accepted is None:
         return order_row(con, row["id"])["state"] == "FAILED"        # unknown outcome -> halt
@@ -965,25 +1289,63 @@ def run_open(con, client, row, sleep, alert):
     return protect_and_check(con, client, row, o, sleep, alert)
 
 
-def over_loss_budget(positions, owned, rate, equity, notional_inr, price, stop):
-    """Hard per-trade and total stop-loss budgets (s1.MAX_TRADE_STOP_RISK / MAX_TOTAL_STOP_RISK of bot equity).
-    A held bot position without a readable stop counts at its full margin (notional / LEV)."""
-    new = s1.stop_risk_inr(notional_inr, price, stop)
-    if new > s1.MAX_TRADE_STOP_RISK * equity:
-        return f"loss budget: stop risk Rs {new:,.0f} > {s1.MAX_TRADE_STOP_RISK:.0%} of Rs {equity:,.0f}"
-    held = 0.0
-    for p in positions:
-        if p["id"] not in owned:
-            continue
-        r = pos_rate(p)
-        if r is None:
-            return f"loss budget: INR rate unknown for held {p['symbol']}"
-        n, entry = float(p["quantity"]) * float(p["entry_price"]) * r, float(p["entry_price"])
-        sl = float((p.get("stoploss") or {}).get("price") or 0)
-        held += s1.stop_risk_inr(n, entry, sl) if 0 < sl < entry else n / s1.LEV
-    if held + new > s1.MAX_TOTAL_STOP_RISK * equity:
-        return (f"loss budget: all stops would lose Rs {held + new:,.0f} > {s1.MAX_TOTAL_STOP_RISK:.0%} "
-                f"of Rs {equity:,.0f}")
+def over_loss_budget(positions, owned, rate, equity, notional_inr, price, stop, side="LONG",
+                     realized_pnls=(), candidate_cost_buffer=0.0, con=None, candidate_risk_limit=None):
+    """Compatibility gate for the fixed Rs500 collective cycle risk budget.
+
+    `equity` is intentionally ignored: the owner's rupee cap does not grow with account equity.
+    """
+    del equity
+    try:
+        values = [float(notional_inr), float(price), float(stop), float(candidate_cost_buffer)]
+        if not all(math.isfinite(x) for x in values) or price <= 0 or notional_inr < 0 or candidate_cost_buffer < 0:
+            return "loss budget: candidate risk inputs are invalid"
+        side = str(side).upper()
+        if notional_inr == 0:
+            new = candidate_cost_buffer
+        else:
+            valid = (side == "LONG" and 0 < stop < price) or (side == "SHORT" and stop > price)
+            if not valid:
+                return f"loss budget: invalid {side} stop"
+            new = notional_inr * abs(price - stop) / price + candidate_cost_buffer
+    except (TypeError, ValueError):
+        return "loss budget: candidate risk inputs are invalid"
+    if new > adaptive_risk.MAX_CANDIDATE_RISK_INR + 1e-9:
+        return f"loss budget: candidate stop risk Rs {new:,.0f} > Rs {adaptive_risk.MAX_CANDIDATE_RISK_INR:,.0f}"
+    if candidate_risk_limit is not None:
+        try:
+            limit = float(candidate_risk_limit)
+        except (TypeError, ValueError):
+            return "loss budget: planned candidate risk is invalid"
+        if not math.isfinite(limit) or limit < 0 or new > limit + 0.01:
+            return f"loss budget: live candidate risk Rs {new:,.2f} exceeds planned Rs {limit:,.2f}"
+    try:
+        if con is not None:
+            held = sum(active_stop_risks(con, positions, owned))
+        else:  # legacy pure callers: production always supplies the journal so original reserves are retained
+            held = 0.0
+            for p in positions:
+                if p["id"] not in owned:
+                    continue
+                r = pos_rate(p)
+                if r is None:
+                    return f"loss budget: INR rate unknown for held {p['symbol']}"
+                n, entry = float(p["quantity"]) * float(p["entry_price"]) * r, float(p["entry_price"])
+                sl = float((p.get("stoploss") or {}).get("price") or 0)
+                pside = str(p.get("order_type") or "LONG").upper()
+                if not ((pside == "LONG" and 0 < sl < entry) or (pside == "SHORT" and sl > entry)):
+                    return f"loss budget: verified stop missing for held {p['symbol']}"
+                held += n * abs(entry - sl) / entry
+    except PnlUnknown as e:
+        return f"loss budget: {e}"
+    try:
+        losses = adaptive_risk.gross_realized_losses(realized_pnls)
+    except ValueError:
+        return "loss budget: current-cycle P&L is unknown"
+    total = losses + held + new
+    if total > trade_policy.DAILY_LOSS_LIMIT_INR + 1e-9:
+        return (f"loss budget: realized losses plus all stops would lose Rs {total:,.0f} > "
+                f"Rs {trade_policy.DAILY_LOSS_LIMIT_INR:,.0f}")
     return None
 
 
@@ -1007,8 +1369,12 @@ def fill_within_approval(con, row, o, alert):
         actual = float(o["filled_quantity"]) * float(o["filled_price"]) * applied
     except (KeyError, TypeError, ValueError):
         applied = actual = 0.0
-    allowed = min(row["planned_notional_inr"], s1.LEV * s1.CAPITAL_CAP_INR)
-    if applied > 0 and actual <= allowed:
+    try:
+        leverage = float(row["planned_leverage"] or s1.LEV)
+        allowed = min(float(row["planned_notional_inr"]), leverage * s1.CAPITAL_CAP_INR)
+    except (TypeError, ValueError, OverflowError):
+        allowed = 0.0
+    if all(math.isfinite(x) for x in (applied, actual, allowed)) and applied > 0 and allowed > 0 and actual <= allowed:
         return True
     cur = order_row(con, row["id"])
     set_order(con, row["id"], state="RECONCILE_REQUIRED",
@@ -1188,9 +1554,11 @@ def reconcile_plan(con, client, pid, sleep, alert):
                 if time.time() - (row["updated_at"] or 0) < RECONCILE_GRACE:
                     continue                                           # order history may lag a just-sent order
                 set_order(con, row["id"], state="FAILED", error="not found on exchange after restart")
+                set_trade_set_state(con, row, "FAILED")
                 continue
             if o.get("status") in TERMINAL_BAD:
                 set_order(con, row["id"], state="FAILED", error=f"order {o['status']}")
+                set_trade_set_state(con, row, "FAILED")
                 continue
             if o.get("status") not in TERMINAL_OK:
                 continue                                               # still working: next reconcile

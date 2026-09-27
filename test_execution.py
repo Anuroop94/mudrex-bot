@@ -8,12 +8,16 @@ import tempfile
 import threading
 import time
 
+os.environ["MUDREX_TEST_MODE"] = "1"
 os.environ["LIVE_TRADING_ENABLED"] = "true"          # tests exercise the live path against the FAKE server only
 
 import execution as ex                                  # noqa: E402
 import fake_mudrex                                      # noqa: E402
 import s1                                               # noqa: E402
-from mudrex_client import Ambiguous, Client             # noqa: E402
+import trade_policy                                     # noqa: E402
+from mudrex_client import Ambiguous, Client, Rejected   # noqa: E402
+
+trade_policy.AUTONOMOUS_HEDGE_READY = True              # explicit in-process fake-exchange test unlock
 
 PRICES = {"XRP": 1.5, "ADA": 0.26, "DOGE": 0.1, "LINK": 14.0, "AVAX": 11.0, "TRX": 0.34}
 NOSLEEP = lambda s: None                                # noqa: E731
@@ -52,6 +56,79 @@ def test_happy_path_fill_aware_stop():
         fill, stop, liq = float(pos["entry_price"]), float(pos["stoploss"]["price"]), float(pos["liquidation_price"])
         assert liq < stop < fill
     assert len(ex.owned_ids(con)) == 2
+    fake.stop()
+
+
+def test_short_entry_has_verified_two_sided_bracket_and_variable_leverage():
+    tmp, fake, client, con = setup()
+    px = PRICES["XRP"]
+    pid = ex.record_plan(con, "d", [dict(coin="XRP", action="OPEN", side="SHORT", planned_price=px,
+                                         notional_inr=1000, atr=0.02, stop_loss=px + 0.04,
+                                         take_profit=px - 0.06, leverage=3, planned_risk_inr=40)], {})
+    final, _ = ex.execute(con, client, pid, "autonomous test", NOSLEEP)
+    assert final == "COMPLETE", states(con, pid)
+    pos = fake.positions[0]
+    assert pos["order_type"] == "SHORT" and float(pos["leverage"]) == 3
+    assert float(pos["takeprofit"]["price"]) < float(pos["entry_price"]) < float(pos["stoploss"]["price"])
+    row = con.execute("SELECT stop_price, target_price FROM orders WHERE plan_id=?", (pid,)).fetchone()
+    assert row["stop_price"] and row["target_price"]
+    fake.stop()
+
+
+def test_fourth_set_needs_exact_single_use_telegram_approval():
+    tmp, fake, client, con = setup()
+    cycle = trade_policy.cycle_id()
+    for n in range(1, 4):
+        pid = plan(con, [s1.BASKET[n - 1]])
+        con.execute("UPDATE trade_sets SET set_number=?, state='COMPLETE', attempted_at=?, completed_at=? WHERE plan_id=?",
+                    (n, int(time.time()), int(time.time()), pid))
+        con.execute("UPDATE plans SET state='FAILED' WHERE id=?", (pid,))
+    pid = plan(con, ["LINK"])
+    row = con.execute("SELECT * FROM orders WHERE plan_id=?", (pid,)).fetchone()
+    assert ex.plan_requires_set_approval(con, pid)
+    assert "Telegram approval required" in ex.authorize_set_submission(con, row)
+    assert ex.journal_set_approval(con, pid, "telegram owner") is None
+    assert ex.authorize_set_submission(con, row) is None
+    item = con.execute("SELECT set_number FROM trade_sets WHERE plan_id=?", (pid,)).fetchone()
+    approval = con.execute("SELECT consumed_at FROM set_approvals WHERE proposal_id=(SELECT proposal_id FROM "
+                           "trade_sets WHERE plan_id=?)", (pid,)).fetchone()
+    assert item["set_number"] == 4 and approval["consumed_at"] is not None and cycle == trade_policy.cycle_id()
+    fake.stop()
+
+
+def test_failed_attempts_do_not_count_but_unresolved_attempts_block():
+    tmp, fake, client, con = setup()
+    for n in range(3):
+        pid = plan(con, [s1.BASKET[n]])
+        con.execute("UPDATE trade_sets SET state=? WHERE plan_id=?",
+                    ("COMPLETE" if n < 2 else "FAILED", pid))
+        con.execute("UPDATE plans SET state='FAILED' WHERE id=?", (pid,))
+    pid = plan(con, ["LINK"])
+    row = con.execute("SELECT * FROM orders WHERE plan_id=?", (pid,)).fetchone()
+    assert not ex.plan_requires_set_approval(con, pid)
+    assert ex.authorize_set_submission(con, row) is None
+    assert con.execute("SELECT set_number FROM trade_sets WHERE plan_id=?", (pid,)).fetchone()[0] == 3
+
+    # Simulate a write whose exchange outcome is not yet known. It does not count as
+    # a completed set, but it blocks every subsequent set pending reconciliation.
+    con.execute("UPDATE trade_sets SET state='ATTEMPTED', attempted_at=? WHERE plan_id=?",
+                (int(time.time()), pid))
+    con.execute("UPDATE plans SET state='FAILED' WHERE id=?", (pid,))
+    next_pid = plan(con, ["AVAX"])
+    next_row = con.execute("SELECT * FROM orders WHERE plan_id=?", (next_pid,)).fetchone()
+    assert "unresolved" in ex.authorize_set_submission(con, next_row)
+    fake.stop()
+
+
+def test_definite_rejection_marks_attempted_set_failed():
+    tmp, fake, client, con = setup()
+    pid = plan(con, ["XRP"])
+    row = con.execute("SELECT * FROM orders WHERE plan_id=?", (pid,)).fetchone()
+    def reject():
+        raise Rejected(400, [{"text": "definite test rejection"}])
+    assert ex.submit_with_reconcile(con, client, row, reject, NOSLEEP, None) is None
+    set_row = con.execute("SELECT state, attempted_at FROM trade_sets WHERE plan_id=?", (pid,)).fetchone()
+    assert set_row["state"] == "FAILED" and set_row["attempted_at"] is not None
     fake.stop()
 
 
@@ -381,10 +458,10 @@ def test_unconfirmed_bot_pnl_blocks_entries():
 def test_daily_cap_counts_losses_realized_before_restart():
     tmp, fake, client, con = setup()
     con.execute("INSERT INTO owned(position_id, coin, client_order_id, opened_at, closed_at, realized_pnl) "
-                "VALUES('p1','XRP','s1-x',?,?,-300)", (int(time.time()) - 60, int(time.time()) - 30))
+                "VALUES('p1','XRP','s1-x',?,?,-500)", (int(time.time()) - 60, int(time.time()) - 30))
     pid = plan(con, ["ADA"])                                  # fresh process/day: no ledger row yet
     ex.execute(con, client, pid, "t", NOSLEEP)
-    assert "loss cap" in states(con, pid)["ADA"][1] and fake.submits == 0   # -300 today > 5% of 5000
+    assert "loss cap" in states(con, pid)["ADA"][1] and fake.submits == 0   # absolute Rs500 owner limit
     fake.stop()
 
 
@@ -505,7 +582,7 @@ def test_watcher_reoffers_expired_cap_close_and_flags_stuck_orders():
     tmp, fake, client, con = setup()
     assert ex.execute(con, client, plan(con, ["XRP"]), "t", NOSLEEP)[0] == "COMPLETE"
     con.execute("INSERT INTO owned(position_id, coin, client_order_id, opened_at, closed_at, realized_pnl) "
-                "VALUES('lost','ADA','s1-y',?,?,-400)", (int(time.time()) - 60, int(time.time()) - 30))
+                "VALUES('lost','ADA','s1-y',?,?,-600)", (int(time.time()) - 60, int(time.time()) - 30))
     sent, st = [], {}
     orig = (watcher.notify, watcher.STATUS_PATH, watcher.LOG_PATH, watcher.JOURNAL_PATH)
     watcher.STATUS_PATH, watcher.LOG_PATH, watcher.JOURNAL_PATH = (os.path.join(tmp, n) for n in
@@ -539,26 +616,26 @@ def test_loss_budgets_per_trade_and_total():
                                           atr=0.1)], {})                     # stop 0.3 below: 20% x Rs 2000 = Rs 400
     ex.execute(con, client, wide, "t", NOSLEEP)
     assert "loss budget" in states(con, wide)["XRP"][1] and fake.submits == 0   # > 7% of Rs 5,000
-    for c in ["XRP", "ADA", "DOGE", "LINK", "AVAX", "TRX"]:                 # each ~Rs 1,070 at 18% stop = ~Rs 192
+    for c in ["XRP", "ADA", "DOGE"]:                             # each ~Rs 1,070 at 18% stop = ~Rs 198
         pid = ex.record_plan(con, "d", [dict(coin=c, action="OPEN", planned_price=PRICES[c], notional_inr=1100,
                                              atr=PRICES[c] * 0.06)], {})
         ex.execute(con, client, pid, "t", NOSLEEP)
     last = states(con, pid)[c]
-    assert last[0] == "FAILED" and "all stops" in last[1], last             # 6th would pass 21% of Rs 5,000
-    assert len(fake.positions) == 5
+    assert last[0] == "FAILED" and "all stops" in last[1], last             # third exceeds fixed Rs500 collective risk
+    assert len(fake.positions) == 2
     fake.stop()
 
 
 def test_post_fill_budget_breach_exits_automatically():
     tmp, fake, client, con = setup()
-    real = s1.MAX_TRADE_STOP_RISK
-    fake.hooks["after_fill"] = lambda o: setattr(s1, "MAX_TRADE_STOP_RISK", 0.001)   # limit breached by the fill
+    real = trade_policy.DAILY_LOSS_LIMIT_INR
+    fake.hooks["after_fill"] = lambda o: setattr(trade_policy, "DAILY_LOSS_LIMIT_INR", 1.0)
     alerts = []
     try:
         pid = plan(con, ["XRP", "ADA"])
         ex.execute(con, client, pid, "t", NOSLEEP, alerts.append)
     finally:
-        s1.MAX_TRADE_STOP_RISK = real
+        trade_policy.DAILY_LOSS_LIMIT_INR = real
     st = states(con, pid)
     assert exited(st["XRP"], fake) and "loss budget" in st["XRP"][1] and "halted" in st["ADA"][1], st
     assert any("EXITING" in a for a in alerts) and any("exit done" in a for a in alerts)
@@ -886,6 +963,20 @@ def test_existing_positions_use_their_own_inr_rate():
     assert "rate unknown" in ex.over_loss_budget(no_rate, {"a"}, 102, 5000, 0, 1, 1)   # fails closed
 
 
+def test_collective_gate_keeps_original_stop_reserve_and_candidate_limit():
+    tmp, fake, client, con, xrp = _one_verified_xrp()
+    pos = client.positions()
+    entry = float(pos[0]["entry_price"])
+    pos[0]["stoploss"]["price"] = str(entry - 0.001)  # trailed close: actual stop risk is now tiny
+    con.execute("UPDATE orders SET planned_risk_inr=200 WHERE position_id=?", (xrp,))
+    why = ex.over_loss_budget(pos, {xrp}, 102, 5000, 2000, 1, 0.9, "LONG", [-100], 10,
+                              con=con, candidate_risk_limit=210)
+    assert "all stops" in why                           # 100 realized + 200 reserve + 210 candidate > 500
+    assert "exceeds planned" in ex.over_loss_budget([], set(), 102, 5000, 2000, 1, 0.89, "LONG", [], 0,
+                                                     con=con, candidate_risk_limit=200)
+    fake.stop()
+
+
 def test_execution_lease_is_fenced():
     tmp, fake, client, con = setup()
     pid = plan(con, ["XRP"])
@@ -1009,6 +1100,15 @@ def test_alert_failure_never_breaks_execution():
     fake.stop()
 
 
+def test_false_alert_result_is_journaled_without_breaking_execution():
+    tmp, fake, client, con = setup()
+    pid = plan(con, ["XRP"])
+    final, _ = ex.execute(con, client, pid, "t", NOSLEEP, lambda msg: False)
+    assert final == "COMPLETE"
+    assert con.execute("SELECT COUNT(*) FROM events WHERE kind='alert_failed'").fetchone()[0] >= 1
+    fake.stop()
+
+
 def test_watcher_flags_moved_stop_and_retries_cap_close_delivery():
     import watcher
     tmp, fake, client, con = setup()
@@ -1016,7 +1116,7 @@ def test_watcher_flags_moved_stop_and_retries_cap_close_delivery():
     assert ex.execute(con, client, pid, "t", NOSLEEP)[0] == "COMPLETE"
     fake.positions[0]["stoploss"]["price"] = "1.0"            # someone moved the stop far from the verified level
     con.execute("INSERT INTO owned(position_id, coin, client_order_id, opened_at, closed_at, realized_pnl) "
-                "VALUES('lost','ADA','s1-y',?,?,-400)", (int(time.time()) - 60, int(time.time()) - 30))
+                "VALUES('lost','ADA','s1-y',?,?,-600)", (int(time.time()) - 60, int(time.time()) - 30))
     sent, st = [], {}
     orig = (watcher.notify, watcher.STATUS_PATH, watcher.LOG_PATH, watcher.JOURNAL_PATH, ex.GUARD_PATH)
     watcher.STATUS_PATH, watcher.LOG_PATH, watcher.JOURNAL_PATH = (os.path.join(tmp, n) for n in
@@ -1024,21 +1124,21 @@ def test_watcher_flags_moved_stop_and_retries_cap_close_delivery():
     watcher.notify = lambda msg, buttons=None: sent.append((msg, buttons)) or len(sent) > 2   # first sends fail
     try:
         watcher.check(st, client, con, make_plan=lambda: dict(plan_id=None, orders=[], created_at=time.time()))
-        assert any("stop moved" in m for m, _ in sent)
+        assert any("bracket moved" in m for m, _ in sent)
         assert "cap_day" not in st and st.get("cap_plan")          # cap-close alert not delivered -> retry kept
         cap_pid = st["cap_plan"]["plan_id"]
         watcher.check(st, client, con, make_plan=lambda: dict(plan_id=None, orders=[], created_at=time.time()))
         assert st.get("cap_day") and any(b and f"approve:{cap_pid}" in str(b) for _, b in sent)
         assert con.execute("SELECT COUNT(*) FROM plans WHERE payload LIKE '%cap%'").fetchone()[0] == 1   # no dupes
-        assert sum("stop moved" in m for m, _ in sent) == 2          # undelivered stop alert was retried
+        assert sum("bracket moved" in m for m, _ in sent) == 2       # undelivered bracket alert was retried
         watcher.check(st, client, con, make_plan=lambda: dict(plan_id=None, orders=[], created_at=time.time()))
-        assert sum("stop moved" in m for m, _ in sent) == 2          # delivered once -> not repeated
+        assert sum("bracket moved" in m for m, _ in sent) == 2       # delivered once -> not repeated
         good = fake.positions[0]["stoploss"]["price"] = con.execute(
             "SELECT stop_price FROM orders WHERE plan_id=?", (pid,)).fetchone()[0]
         watcher.check(st, client, con, make_plan=lambda: dict(plan_id=None, orders=[], created_at=time.time()))
         fake.positions[0]["stoploss"]["price"] = "1.0"            # the same problem comes back later
         watcher.check(st, client, con, make_plan=lambda: dict(plan_id=None, orders=[], created_at=time.time()))
-        assert good and sum("stop moved" in m for m, _ in sent) == 3   # re-armed after the healthy check
+        assert good and sum("bracket moved" in m for m, _ in sent) == 3  # re-armed after healthy check
     finally:
         watcher.notify, watcher.STATUS_PATH, watcher.LOG_PATH, watcher.JOURNAL_PATH, ex.GUARD_PATH = orig
     fake.stop()

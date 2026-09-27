@@ -20,13 +20,18 @@ UI_DIST = os.path.join(HERE, "ui", "dist", "client")
 def live_limits():
     """The limits that actually govern live S1, read from the modules that enforce them."""
     import execution
+    import adaptive_risk
+    import trade_policy
     import s1
     import watcher
-    return dict(strategy=s1.NAME, allocation_inr=s1.CAPITAL_CAP_INR, leverage=s1.LEV,
-                max_exposure_inr=s1.LEV * s1.CAPITAL_CAP_INR, safety_stop=f"{s1.SL_ATR} x ATR below the fill",
-                max_trade_stop_risk=s1.MAX_TRADE_STOP_RISK, max_total_stop_risk=s1.MAX_TOTAL_STOP_RISK,
-                daily_cap_pct=s1.DAILY_CAP_PCT,
-                daily_cap_note="blocks NEW buys only; closing needs your approval (Close all); not a maximum loss",
+    return dict(strategy=s1.NAME, allocation_inr=s1.CAPITAL_CAP_INR,
+                leverage=f"1-{adaptive_risk.HARD_MAX_LEVERAGE}",
+                max_exposure_inr=adaptive_risk.HARD_MAX_LEVERAGE * s1.CAPITAL_CAP_INR,
+                safety_stop="volatility-tier ATR stop with exchange-verified take-profit",
+                max_trade_stop_risk=adaptive_risk.MAX_CANDIDATE_RISK_INR,
+                max_total_stop_risk=adaptive_risk.DAILY_RISK_LIMIT_INR,
+                daily_cap_note="blocks NEW long/short entries; protective exits remain allowed",
+                autonomous_ready=trade_policy.AUTONOMOUS_HEDGE_READY,
                 guard=f"{watcher.TRIP_STREAK} losses in a row or {watcher.TRIP_DD:.0%} drawdown",
                 buy_plan_valid_min=execution.ENTRY_MAX_AGE // 60, max_price_drift=execution.MAX_DRIFT,
                 taker_fee=config.TAKER_FEE, gst=config.GST, inr_per_usdt=config.INR_PER_USDT)
@@ -145,8 +150,8 @@ def ui():
         notional = p["qty"] * p["price"] * rate
         move = (p["price"] / p["entry"] - 1) * (1 if p["side"] == "LONG" else -1) if p["entry"] else 0
         positions.append(dict(symbol=coin, name=f"{coin} / USDT", side=p["side"],
-                              leverage=f"{s1.LEV}× isolated" if p.get("bot") else "manual",
-                              stopLabel=f"{s1.SL_ATR}× ATR" if p.get("bot") else "your stop",
+                              leverage=f"{p.get('leverage') or '?'}× isolated" if p.get("bot") else "manual",
+                              stopLabel="adaptive ATR bracket" if p.get("bot") else "your stop",
                               price=f"{p['price']:g}", entry=f"{p['entry']:g}", notional=_rs(notional),
                               pnl=_rs(p["upnl_inr"], True), pnlPct=f"{move:+.1%}",
                               stop=f"{p['sl']:g}" if p.get("sl") else "none",
@@ -161,6 +166,7 @@ def ui():
         porders = con.execute("SELECT coin, action, state, planned_notional_inr, error FROM orders WHERE plan_id=? "
                               "ORDER BY seq", (prow["id"],)).fetchall() if prow else []
         events = con.execute("SELECT at, kind, msg FROM events ORDER BY id DESC LIMIT 8").fetchall()
+        latest_needs_approval = ex.plan_requires_set_approval(con, prow["id"]) if prow else False
     finally:
         con.close()
     marks = [(int(a), float(e)) for a, e in marks] + ([(int(w["at"]), eq)] if w.get("at") and eq else [])
@@ -193,8 +199,8 @@ def ui():
                                    + (" · not sent" if "halted" in (o["error"] or "") else ""),
                                    count=_rs(o["planned_notional_inr"] or 0)))
         fresh = now - prow["created_at"] < ex.ENTRY_MAX_AGE
-        needs = prow["state"] == "PLANNED" and fresh
-        msg = ("Tap Approve in Telegram within 15 min to place these orders." if needs else
+        needs = prow["state"] == "PLANNED" and fresh and latest_needs_approval
+        msg = ("This extra set needs its one-time Telegram approval within 15 min." if needs else
                f"Plan {prow['id']} is {prow['state'].replace('_', ' ').lower()}. Send /plan in Telegram for a fresh one.")
     if not plan_items:
         plan_items = [dict(tone="idle", label="No orders", detail="nothing to do today")]
@@ -243,13 +249,13 @@ def ui():
                   message=msg, title=f"Plan {prow['id']}" if prow else "No plan yet",
                   decisionLabel=f"Decision on {prow['decision_day']} close" if prow else "",
                   time=_ist(prow["created_at"], "%d %b %H:%M IST") if prow else "", items=plan_items),
-        strategy=dict(name="S1 Trend Ensemble", description="Buy-only · daily · 6-coin basket",
+        strategy=dict(name="Adaptive Two-Sided Trend", description="LONG/SHORT · IST 24-hour cycle · 6-coin basket",
                       leverage=f"{L['leverage']}×", stop=f"{s1.SL_ATR}× ATR", btcFilter="200-day average",
                       allocationCap=f"₹{L['allocation_inr']:,}", signal="9 Donchian trend judges (5-360 days)",
                       marketFilter="BTC at/above its 200-day average", basket=" · ".join(s1.BASKET),
-                      entryMode="Every buy needs your Telegram approval", stopModel=L["safety_stop"],
-                      target="None: exits on trend end, mood, stop-loss or daily limit",
-                      tradeRisk=f"{L['max_trade_stop_risk']:.0%} per trade · {L['max_total_stop_risk']:.0%} total"),
+                      entryMode="Sets 1-3 autonomous after certification; exact approval above three",
+                      stopModel=L["safety_stop"], target="At least 1.5:1 reward/risk; exchange verified",
+                      tradeRisk=f"₹{L['max_trade_stop_risk']:,.0f} candidate · ₹{L['max_total_stop_risk']:,.0f} collective"),
         positions=positions,
         activity=[dict(icon=EVENT_ICON.get(e["kind"], ("Activity", "gray"))[0], title=e["kind"].title(),
                        detail=e["msg"][:220], tone=EVENT_ICON.get(e["kind"], ("Activity", "gray"))[1],

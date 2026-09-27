@@ -6,11 +6,15 @@ import sys
 import tempfile
 import time
 
+os.environ["MUDREX_TEST_MODE"] = "1"
 os.environ["LIVE_TRADING_ENABLED"] = "true"
 
 import execution as ex
 import fake_mudrex
+import trade_policy
 from mudrex_client import Client
+
+trade_policy.AUTONOMOUS_HEDGE_READY = True  # explicit in-process fake-exchange test unlock
 
 PRICES = {"XRP": 1.5, "ADA": 0.26, "DOGE": 0.1, "LINK": 14.0, "AVAX": 11.0, "TRX": 0.34}
 NOSLEEP = lambda s: None

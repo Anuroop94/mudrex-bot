@@ -1,26 +1,30 @@
 """Strategy S1, chosen by the user on 2026-09-26: single source of truth for paper, live and backtest.
 
 Every day after the 05:30 IST close, for each basket coin, 9 Donchian trend "judges" (5..360 days) vote UP/not;
-position = votes x volatility scaling (50% vol target), rounded to what Mudrex accepts. Buy-only. Exits: the
-judges' trailing midpoint (trend exit, next open) or a safety stop-loss on Mudrex at 3x ATR below entry.
-No fixed target. Exposure 2x (Mudrex leverage 2). Capital capped at Rs 5,000. Daily profit/loss caps 5% each.
+position = votes x volatility scaling (50% vol target), rounded to what Mudrex accepts. This is the legacy
+two-sided strategy; production entries are migration-gated until the owner's new contract is certified. Exits: the
+judges' trailing midpoint (trend exit, next open) plus a volatility-adaptive exchange bracket on every entry.
+Leverage varies by coin and volatility but never increases the risk-sized quantity. Capital is capped at Rs 5,000.
 Market mood: no positions while BTC is below its 200-day average; unknown mood blocks new entries.
-Evidence (s1_audit.py, 2026-09-27; ONE continuous run of these exact live rules with hourly stops, net of all
-costs; data starts May 2021): development May 2021 - Sep 2025 +232% (27.6%/yr, max DD 25%, worst day -Rs 563,
-111 trades, 34% net win rate), Newey-West t 1.79, deflated Sharpe 44%: suggestive, NOT proven. The year after
-(+4.3%) was looked at many times and is descriptive only. Earlier figures (+327%, +277%, +14%, +9.8%) came
-from simulations that did not match these rules and are withdrawn. Backtests are not guarantees.
+Evidence status: the historical `s1_audit.py` run is NOT evidence for the current owner contract or this strategy
+configuration. It models legacy long-only S1 with fixed 3x ATR stop, no take-profit, fixed leverage, legacy
+percentage caps, and older execution assumptions; it does not implement adaptive risk sizing, two-sided regime
+selection, or the owner’s fixed-Rs500 cycle P&L stop. Its reported returns/statistics and earlier variants are
+withdrawn as support for live activation. `adaptive_backtest.py` is the separate research-only path for evaluating
+the newer rules; its daily-bar results are not evidence of exchange execution and are not guarantees.
 """
 import config
 import portfolio as pf
+from trade_policy import DAILY_LOSS_LIMIT_INR
 
-NAME = "S1 trend ensemble: buy-only, safety stop 3xATR, 2x"
+NAME = "S1 two-sided trend ensemble: adaptive bracket and leverage"
 BASKET = ["XRP", "ADA", "DOGE", "LINK", "AVAX", "TRX"]
-SIGNAL_KW = dict(target_vol=0.5)          # zarattini() defaults: 9 lookbacks, long-only
+SIGNAL_KW = dict(target_vol=0.5, allow_short=True)  # 9 lookbacks; positive=LONG, negative=SHORT
 LEV = 2
 SL_ATR = 3
 CAPITAL_CAP_INR = 5000
-DAILY_CAP_PCT = 0.05     # user rule: daily profit cap AND loss cap = 5% of the day's starting equity (raise to 0.10 later)
+DAILY_CAP_INR = DAILY_LOSS_LIMIT_INR  # compatibility alias; authoritative value lives in trade_policy.py
+DAILY_CAP_PCT = DAILY_CAP_INR / CAPITAL_CAP_INR  # research/dashboard compatibility; live uses the absolute cap
 
 
 # Hard loss budgets (safety nets, not sizing rules): money lost if stops fill exactly at their level, as a share of
@@ -44,8 +48,8 @@ def sizing_equity(equity_inr):
 
 
 def daily_cap_inr(day_start_equity_inr):
-    """Rupee size of both daily caps for a day that started with this equity."""
-    return DAILY_CAP_PCT * day_start_equity_inr
+    """Absolute rupee size of both daily caps. The argument remains for API compatibility."""
+    return DAILY_CAP_INR
 
 
 MOOD_SMA = 200   # market mood: no positions while BTC closes below its 200-day average (tested: better in both periods)
@@ -75,17 +79,23 @@ def entries_only_for_held(x_all, held):
 
 def targets(ctx, closes, d, equity_inr, specs, btc=None, basket=None):
     """1x weights decided at day d's close, rounded for an account of equity_inr (before the LEV multiplier).
-    btc: BTC daily candles; when given and the market mood is bad, S1 wants no positions. When the mood is
-    unknown (btc_mood None) targets are returned unchanged and the CALLER must block new entries."""
-    if btc is not None and btc_mood(btc, d) is False:
-        return {}
+    btc: BTC daily candles select the permitted hedge direction: LONG at/above the 200-day average and SHORT
+    below it. Unknown mood returns signals unchanged and the CALLER must block new entries."""
     tf = pf.basket_targets(basket or BASKET, closes, equity_inr / config.INR_PER_USDT, specs)
-    return tf(ctx, d, {})
+    raw = tf(ctx, d, {})
+    mood = btc_mood(btc, d) if btc is not None else None
+    if mood is True:
+        return {coin: weight for coin, weight in raw.items() if weight > 0}
+    if mood is False:
+        return {coin: weight for coin, weight in raw.items() if weight < 0}
+    return raw
 
 
 def specs_from_listing(rows, coins=None):
     by = {r["symbol"].removesuffix("USDT"): r for r in rows}
     return {c: dict(step=float(by[c]["quantity_step"]), min_qty=float(by[c]["min_contract"]),
                     min_notional=float(by[c]["min_notional_value"]), price_step=float(by[c]["price_step"]),
-                    max_leverage=float(by[c]["max_leverage"]), price=float(by[c]["price"]))
+                    max_leverage=float(by[c]["max_leverage"]), price=float(by[c]["price"]),
+                    funding_fee_perc_hour=(float(by[c]["funding_fee_perc"])
+                                           if by[c].get("funding_fee_perc") is not None else None))
             for c in (coins or BASKET)}

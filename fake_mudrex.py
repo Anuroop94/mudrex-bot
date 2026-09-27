@@ -51,17 +51,19 @@ class FakeMudrex:
 
     def stop(self):
         self.server.shutdown()
+        self.server.server_close()
 
     def add_manual(self, coin, side, qty=10.0):
         self.positions.append(self._position(coin, side, qty, self.prices[coin], manual=True))
 
-    def _position(self, coin, side, qty, px, lev=2, stop=None, manual=False):
+    def _position(self, coin, side, qty, px, lev=2, stop=None, target=None, manual=False):
         liq = px * (1 - 0.9 / lev) if side == "LONG" else px * (1 + 0.9 / lev)
         return dict(id=("manual-" if manual else "") + str(uuid.uuid4()), symbol=coin + "USDT", order_type=side,
                     quantity=str(qty), entry_price=str(px), leverage=str(lev), trade_currency="INR",
                     liquidation_price="" if self.no_liq else str(liq), entry_hedge_rate="102",
                     created_at=_iso(time.time()),
                     stoploss=dict(price=str(stop), order_id=str(uuid.uuid4())) if stop else dict(price="0"),
+                    takeprofit=dict(price=str(target), order_id=str(uuid.uuid4())) if target else dict(price="0"),
                     status="OPEN")
 
     def _fault(self, key):
@@ -89,10 +91,23 @@ class FakeMudrex:
             return
         body, coin = o["_body"], o["symbol"].removesuffix("USDT")
         px = self.fill_price.get(coin, self.prices[coin])
+        side = body.get("order_type", "LONG")  # legacy journal/recovery fixtures predate explicit side
+        if side not in {"LONG", "SHORT"}:
+            o.update(status="REJECTED")
+            return
         stop = float(body["stoploss_price"]) if body.get("is_stoploss") else None
-        if stop is not None and (stop >= px or self.drop_order_stop):
+        target = float(body["takeprofit_price"]) if body.get("is_takeprofit") else None
+        liq = px * (1 - 0.9 / 2) if side == "LONG" else px * (1 + 0.9 / 2)
+        valid_stop = stop is None or (liq < stop < px if side == "LONG" else px < stop < liq)
+        valid_target = target is None or (px < target if side == "LONG" else target < px)
+        if not valid_stop or not valid_target:
+            o.update(status="REJECTED", error="invalid side-aware stop/target geometry")
+            return
+        if stop is not None and self.drop_order_stop:
             stop = None
-        pos = self._position(coin, "LONG", float(body["quantity"]) * self.qty_skew, px, stop=stop)
+        lev = float(self.leverage_store.get(o["symbol"], 2))
+        pos = self._position(coin, side, float(body["quantity"]) * self.qty_skew, px, lev=lev,
+                             stop=stop, target=target)
         self.positions.append(pos)
         o.update(status="FILLED", filled_price=str(px), filled_quantity=body["quantity"],
                  future_position_uuid=pos["id"], hedge_rate=self.applied_rate)
@@ -214,11 +229,26 @@ class FakeMudrex:
                         pos = next((x for x in fake.positions if x["id"] == pid), None)
                         if pos is None:
                             return 404, {"success": False, "errors": [{"text": "Position not found"}]}
-                        if float(pos["stoploss"].get("price") or 0) > 0:
-                            return 400, {"success": False, "errors": [{"text": "stop-loss already exists"}]}
-                        if not fake.riskorder_ok or float(body["stoploss_price"]) <= float(pos["liquidation_price"] or 0):
-                            return 400, {"success": False, "errors": [{"text": "invalid stop"}]}
-                        pos["stoploss"] = dict(price=body["stoploss_price"], order_id=str(uuid.uuid4()))
+                        if not fake.riskorder_ok:
+                            return 400, {"success": False, "errors": [{"text": "risk order refused"}]}
+                        side, entry = pos["order_type"], float(pos["entry_price"])
+                        liq = float(pos["liquidation_price"] or 0)
+                        if body.get("is_stoploss"):
+                            if float(pos["stoploss"].get("price") or 0) > 0:
+                                return 400, {"success": False, "errors": [{"text": "stop-loss already exists"}]}
+                            price = float(body["stoploss_price"])
+                            if not (liq < price < entry if side == "LONG" else entry < price < liq):
+                                return 400, {"success": False, "errors": [{"text": "invalid stop"}]}
+                            pos["stoploss"] = dict(price=body["stoploss_price"], order_id=str(uuid.uuid4()))
+                        if body.get("is_takeprofit"):
+                            if float(pos["takeprofit"].get("price") or 0) > 0:
+                                return 400, {"success": False, "errors": [{"text": "take-profit already exists"}]}
+                            price = float(body["takeprofit_price"])
+                            if not (price > entry if side == "LONG" else price < entry):
+                                return 400, {"success": False, "errors": [{"text": "invalid target"}]}
+                            pos["takeprofit"] = dict(price=body["takeprofit_price"], order_id=str(uuid.uuid4()))
+                        if not (body.get("is_stoploss") or body.get("is_takeprofit")):
+                            return 400, {"success": False, "errors": [{"text": "no risk order supplied"}]}
                         return 200, {"success": True, "data": {"position_id": pid, "status": "CREATED"}}
                     return self._apply("riskorder", risk)
                 if p.endswith("/close"):
@@ -229,7 +259,7 @@ class FakeMudrex:
                         if pos is None:
                             return 404, {"success": False, "errors": [{"text": "Position not found"}]}
                         fake.positions.remove(pos)
-                        fake.closed.append(dict(id=pos["id"], symbol=pos["symbol"], position_type="LONG",
+                        fake.closed.append(dict(id=pos["id"], symbol=pos["symbol"], position_type=pos["order_type"],
                                                 status="CLOSED", entry_price=pos["entry_price"],
                                                 closed_price=pos["entry_price"], quantity=pos["quantity"], pnl="0"))
                         return 200, {"success": True, "data": {"position_id": pid, "status": "CREATED"}}
@@ -249,11 +279,26 @@ class FakeMudrex:
                         pos = next((x for x in fake.positions if x["id"] == pid), None)
                         if pos is None:
                             return 404, {"success": False, "errors": [{"text": "Position not found"}]}
-                        if body.get("stoploss_order_id") != pos["stoploss"].get("order_id"):
-                            return 400, {"success": False, "errors": [{"text": "risk order id missing"}]}
-                        if not fake.riskorder_ok or float(body["stoploss_price"]) <= float(pos["liquidation_price"] or 0):
-                            return 400, {"success": False, "errors": [{"text": "invalid stop"}]}
-                        pos["stoploss"]["price"] = body["stoploss_price"]
+                        if not fake.riskorder_ok:
+                            return 400, {"success": False, "errors": [{"text": "risk order refused"}]}
+                        side, entry = pos["order_type"], float(pos["entry_price"])
+                        liq = float(pos["liquidation_price"] or 0)
+                        if body.get("is_stoploss"):
+                            if body.get("stoploss_order_id") != pos["stoploss"].get("order_id"):
+                                return 400, {"success": False, "errors": [{"text": "stop order id missing"}]}
+                            price = float(body["stoploss_price"])
+                            if not (liq < price < entry if side == "LONG" else entry < price < liq):
+                                return 400, {"success": False, "errors": [{"text": "invalid stop"}]}
+                            pos["stoploss"]["price"] = body["stoploss_price"]
+                        if body.get("is_takeprofit"):
+                            if body.get("takeprofit_order_id") != pos["takeprofit"].get("order_id"):
+                                return 400, {"success": False, "errors": [{"text": "target order id missing"}]}
+                            price = float(body["takeprofit_price"])
+                            if not (price > entry if side == "LONG" else price < entry):
+                                return 400, {"success": False, "errors": [{"text": "invalid target"}]}
+                            pos["takeprofit"]["price"] = body["takeprofit_price"]
+                        if not (body.get("is_stoploss") or body.get("is_takeprofit")):
+                            return 400, {"success": False, "errors": [{"text": "no risk order supplied"}]}
                         return 200, {"success": True, "data": {"message": "Risk order amended successfully"}}
                     return self._apply("riskorder", amend)
                 return self._send(404, {"success": False})

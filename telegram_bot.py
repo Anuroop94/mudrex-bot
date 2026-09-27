@@ -15,6 +15,7 @@ import urllib.error
 import urllib.request
 
 import config  # noqa: F401  (loads .env)
+import trade_policy
 
 
 def enabled():
@@ -46,20 +47,27 @@ def send(text, buttons=None):
 
 
 def plan_message(p):
-    """(text, buttons) for a live_trader.plan() result: one bundled approval with totals (Codex #4)."""
+    """Render every plan update; first-three qualified sets are informational, not approval-gated."""
     todo = [o for o in p["orders"] if o["action"] in ("OPEN", "CLOSE")]
     if not todo:
         return "S1: no orders today." + (f" New entries blocked: {p['blocked']}." if p.get("blocked") else ""), None
     if not (p.get("plan_id") and p.get("live_enabled")):
         return f"S1 plan {p.get('plan_id')}: {len(todo)} order(s), but LIVE_TRADING_ENABLED is false.", None
     opens = [o for o in todo if o["action"] == "OPEN"]
-    lines = [f"{o['action']} {o['coin']}" + (f" ~Rs {o['notional_inr']:,.0f}, stop ~{o['est_stop']}"
+    lines = [f"{o['action']} {o['coin']}" + (f" {o.get('side', 'LONG')} {o.get('leverage', 0):g}x"
+                                             f" ~Rs {o['notional_inr']:,.0f}, SL {o['est_stop']},"
+                                             f" TP {o.get('est_target')}, risk Rs {o.get('planned_risk_inr', 0):,.0f}"
                                              if o["action"] == "OPEN" else "") for o in todo]
-    risk = sum(o["notional_inr"] * (1 - o["est_stop"] / o["planned_price"]) for o in opens)
+    risk = sum(o.get("planned_risk_inr", 0) for o in opens)
     text = (f"S1 plan {p['plan_id']}: {len(todo)} order(s)\n" + "\n".join(lines) +
-            (f"\nTotal buys Rs {sum(o['notional_inr'] for o in opens):,.0f}; loss if every stop hits ~Rs {risk:,.0f}."
-             f"\nValid 15 min. Later? Tap Approve anyway: you get a fresh plan at current prices." if opens else
+            (f"\nPlanned collective reserve for these sets: Rs {risk:,.0f}; cycle hard cap Rs {trade_policy.DAILY_LOSS_LIMIT_INR:,.0f}."
+             f"\nValid 15 min." if opens else
              "\nValid 3 hours."))
+    if p.get("blocked"):
+        return text + f"\nBLOCKED: {p['blocked']}. Nothing will be placed.", None
+    if opens and p.get("attempted_sets", 0) < trade_policy.AUTONOMOUS_SETS_PER_CYCLE:
+        return (text + f"\nThese qualified sets are autonomous (sets 1-{trade_policy.AUTONOMOUS_SETS_PER_CYCLE}); "
+                "no approval tap is required.", None)
     return text, [[("Approve", f"approve:{p['plan_id']}"), ("Reject", f"reject:{p['plan_id']}")]]
 
 

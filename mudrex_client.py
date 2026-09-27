@@ -151,12 +151,22 @@ class Client:
         return self.post(f"/v1/futures/{symbol}/leverage?is_symbol",
                          {"margin_type": "ISOLATED", "leverage": str(lev), "trade_currency": "INR"})
 
-    def place_market_long(self, symbol, qty, cid, stop=None):
-        body = {"trigger_type": "MARKET", "order_type": "LONG", "quantity": qty, "trade_currency": "INR",
+    def place_market(self, symbol, qty, cid, side, stop=None, target=None):
+        """Place a market LONG or SHORT with optional atomic exchange bracket fields."""
+        side = str(side).upper()
+        if side not in {"LONG", "SHORT"}:
+            raise ValueError("side must be LONG or SHORT")
+        body = {"trigger_type": "MARKET", "order_type": side, "quantity": qty, "trade_currency": "INR",
                 "client_order_id": cid}
-        if stop:
+        if stop is not None:
             body.update(is_stoploss=True, stoploss_price=stop)
+        if target is not None:
+            body.update(is_takeprofit=True, takeprofit_price=target)
         return self.post(f"/v2/futures/order?symbol={symbol}", body)
+
+    def place_market_long(self, symbol, qty, cid, stop=None):
+        """Compatibility wrapper for existing LONG callers."""
+        return self.place_market(symbol, qty, cid, "LONG", stop=stop)
 
     # Every write names trade_currency=INR explicitly: Mudrex defaults POST/PATCH bodies to USDT when omitted.
     def close_position(self, position_id):
@@ -168,8 +178,38 @@ class Client:
                          {"is_stoploss": True, "stoploss_price": price, "order_source": "API",
                           "stoploss_client_order_id": sl_cid, "trade_currency": "INR"})
 
+    def set_bracket(self, position_id, stop=None, target=None, sl_cid=None, tp_cid=None):
+        """Attach one or both risk orders to an existing position."""
+        if stop is None and target is None:
+            raise ValueError("at least one of stop or target is required")
+        body = {"order_source": "API", "trade_currency": "INR"}
+        if stop is not None:
+            body.update(is_stoploss=True, stoploss_price=stop)
+            if sl_cid is not None:
+                body["stoploss_client_order_id"] = sl_cid
+        if target is not None:
+            body.update(is_takeprofit=True, takeprofit_price=target)
+            if tp_cid is not None:
+                body["takeprofit_client_order_id"] = tp_cid
+        return self.post(f"/v1/futures/positions/{position_id}/riskorder", body)
+
     def edit_stoploss(self, position_id, sl_order_id, price):
         """Amend an existing stop (PATCH, requires the stop's own order id)."""
         return self._raw("PATCH", f"/v1/futures/positions/{position_id}/riskorder",
                          body={"is_stoploss": True, "stoploss_price": price, "stoploss_order_id": sl_order_id,
                                "trade_currency": "INR"})
+
+    def edit_bracket(self, position_id, stop_order_id=None, stop=None, target_order_id=None, target=None):
+        """Amend either or both risk orders using their exchange order ids."""
+        if stop is None and target is None:
+            raise ValueError("at least one of stop or target is required")
+        body = {"trade_currency": "INR"}
+        if stop is not None:
+            if not stop_order_id:
+                raise ValueError("stop_order_id is required when amending stop")
+            body.update(is_stoploss=True, stoploss_price=stop, stoploss_order_id=stop_order_id)
+        if target is not None:
+            if not target_order_id:
+                raise ValueError("target_order_id is required when amending target")
+            body.update(is_takeprofit=True, takeprofit_price=target, takeprofit_order_id=target_order_id)
+        return self._raw("PATCH", f"/v1/futures/positions/{position_id}/riskorder", body=body)

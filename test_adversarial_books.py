@@ -5,6 +5,7 @@ import os
 import sys
 import time
 
+os.environ["MUDREX_TEST_MODE"] = "1"
 os.environ["LIVE_TRADING_ENABLED"] = "true"
 
 import execution as ex

@@ -248,13 +248,14 @@ def test_live_build_orders_safety():
     atrs = {c: 0.02 for c in s1.BASKET}
     targets = {"XRP": 0.2, "ADA": 0.2}
     o = {x["coin"]: x for x in lt.build_orders(targets, {}, set(), prices, atrs, specs, 20000, {}, None, 102)}
-    # sized on the Rs 5,000 allocation even though bot equity says Rs 20,000: 0.2 * 2x * 5000 = Rs 2000
-    assert o["XRP"]["action"] == "OPEN" and o["XRP"]["notional_inr"] == 2000
-    assert abs(o["XRP"]["est_stop"] - 1.44) < 1e-9                  # 3x ATR (final stop re-anchored to the fill)
-    # a stop 20% away on Rs 2,000 risks Rs 400 > 7% of Rs 5,000: skipped at planning
+    # Quantity comes from the fixed rupee stop budget, independent of equity; leverage only caps margin.
+    assert o["XRP"]["action"] == "OPEN" and o["XRP"]["planned_risk_inr"] <= 250
+    assert o["XRP"]["leverage"] == 5 and abs(o["XRP"]["est_stop"] - 1.47) < 1e-9
+    # High-but-allowed volatility widens the stop, reduces leverage and shrinks quantity instead of using Rs150.
     o = {x["coin"]: x for x in lt.build_orders(targets, {}, set(), prices, {c: 0.1 for c in s1.BASKET}, specs,
                                                5000, {}, None, 102)}
-    assert o["XRP"]["action"] == "SKIP" and "loss budget" in o["XRP"]["reason"]
+    assert o["XRP"]["action"] == "OPEN" and o["XRP"]["leverage"] == 2
+    assert o["XRP"]["planned_risk_inr"] <= 250 and o["XRP"]["notional_inr"] < 2000
     # stale/gappy data: no decision on that coin, not even a CLOSE of a held position
     D = 86400
     good = [[i * D, 1, 1, 1, 1, 0] for i in range(500)]
@@ -265,8 +266,9 @@ def test_live_build_orders_safety():
     # entries blocked (cap/guard/STOP): no entries, exits of BOT-OWNED positions still planned
     o = {x["coin"]: x for x in lt.build_orders(targets, {"LINK": "pos-1"}, set(), prices, atrs, specs, 5000, {},
                                                "daily loss cap hit", 102)}
-    assert o["XRP"]["action"] == "SKIP" and o["LINK"] == dict(action="CLOSE", coin="LINK", position_id="pos-1",
-                                                             reason="trend exit / market mood")
+    assert o["XRP"]["action"] == "SKIP" and o["LINK"] == dict(
+        action="CLOSE", coin="LINK", position_id="pos-1",
+        reason="trend exit / side flip; opposite entry waits for a later set")
     # manual position on a coin: nothing planned on it at all; stopped-out coin not re-bought; owned + up = HOLD
     o = {x["coin"]: x for x in lt.build_orders(targets, {"ADA": "p2"}, {"XRP"}, prices, atrs, specs, 5000,
                                                {"XRP": False}, None, 102)}
@@ -303,7 +305,9 @@ def test_live_orders_identical_at_any_equity_above_the_cap():
         books.append(lt.build_orders(t, {}, set(), {c: 1.5 for c in s1.BASKET}, {c: 0.02 for c in s1.BASKET},
                                      specs, eq, {}, None, 102))
     assert all(b == books[0] for b in books)
-    assert all(o["action"] == "OPEN" and o["notional_inr"] >= 1000 for o in books[0] if o["coin"] != "XRP")
+    opened = [o for o in books[0] if o["action"] == "OPEN"]
+    assert len(opened) == 2 and sum(o["planned_risk_inr"] for o in opened) <= 500
+    assert sum(o["notional_inr"] / o["leverage"] for o in opened) <= s1.CAPITAL_CAP_INR + 0.01
 
 
 def test_paper_mood_gate_two_close_reentry():
@@ -372,14 +376,15 @@ def test_live_execute_requires_yes():
             os.environ["LIVE_TRADING_ENABLED"] = env
 
 
-def test_watcher_is_read_only():
+def test_watcher_has_no_direct_exchange_writes():
     src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "watcher.py")).read()
-    for banned in ("place_market_long", "close_position", "set_stoploss", "set_leverage", ".post(", "ex.execute(",
+    for banned in ("place_market_long", "close_position", "set_stoploss", "set_leverage", ".post(",
                    "urllib.request", "claim("):
         assert banned not in src, banned
+    assert "auto_execute" in src and "ex.execute(" in src  # only the durable executor may place autonomous sets
 
 
-def test_watcher_plan_failure_then_retry():
+def test_watcher_plan_failure_retry_and_repeats_within_cycle():
     import watcher
     st, calls = {}, []
 
@@ -393,14 +398,18 @@ def test_watcher_plan_failure_then_retry():
     watcher.notify = lambda *a, **k: True
     watcher.LOG_PATH = os.path.join(tempfile.mkdtemp(), "watcher.log")     # never write the real log
     try:
-        assert watcher.maybe_plan(st, flaky, now_hm="06:00", today="2026-09-28") is False
+        clock = 1_000_000.0
+        assert watcher.maybe_plan(st, flaky, now_hm="06:00", today="2026-09-28", now=clock) is False
         assert "plan_day" not in st and st["plan_fails"] == 1        # failure NOT recorded as done
-        assert watcher.maybe_plan(st, flaky, now_hm="06:00", today="2026-09-28") is False   # backoff: not yet
+        assert watcher.maybe_plan(st, flaky, now_hm="06:00", today="2026-09-28", now=clock) is False
         st["plan_retry_at"] = 0
-        assert watcher.maybe_plan(st, flaky, now_hm="06:00", today="2026-09-28") is True
+        assert watcher.maybe_plan(st, flaky, now_hm="06:00", today="2026-09-28", now=clock) is True
         assert st["plan_day"] == "2026-09-28" and len(calls) == 2
-        assert watcher.maybe_plan(st, flaky, now_hm="07:00", today="2026-09-28") is False   # once per day
-        assert watcher.maybe_plan({}, flaky, now_hm="05:00", today="2026-09-29") is False   # before the close
+        assert watcher.maybe_plan(st, flaky, now_hm="06:01", today="2026-09-28", now=clock + 60) is False
+        assert watcher.maybe_plan(st, flaky, now_hm="06:15", today="2026-09-28",
+                                  now=clock + watcher.PLAN_INTERVAL_SEC) is True
+        assert len(calls) == 3
+        assert watcher.maybe_plan({}, flaky, now_hm="05:00", today="2026-09-29", now=clock) is False
     finally:
         watcher.notify, watcher.LOG_PATH = orig, orig_log
 
@@ -408,22 +417,24 @@ def test_watcher_plan_failure_then_retry():
 def test_watcher_undelivered_plan_is_resent_not_regenerated():
     import tempfile
     import watcher
-    st, made, sends = {}, [], []
+    st, made, sends, executions = {}, [], [], []
 
     def make():
         made.append(1)
-        return dict(plan_id=len(made), created_at=time.time(), live_enabled=True, blocked=None,
-                    orders=[dict(action="OPEN", coin="XRP", notional_inr=1000, planned_price=1.5, est_stop=1.2)])
+        return dict(plan_id=len(made), created_at=time.time(), live_enabled=True, blocked=None, attempted_sets=0,
+                    orders=[dict(action="OPEN", coin="XRP", side="LONG", leverage=2, notional_inr=1000,
+                                 planned_price=1.5, est_stop=1.2, est_target=1.95, planned_risk_inr=210)])
     orig, orig_log = watcher.notify, watcher.LOG_PATH
     watcher.LOG_PATH = os.path.join(tempfile.mkdtemp(), "watcher.log")
     watcher.notify = lambda msg, buttons=None: sends.append(buttons) or len(sends) > 1   # 1st send fails
     try:
-        assert watcher.maybe_plan(st, make, now_hm="06:00", today="2026-09-28") is False
+        auto = lambda p: executions.append(p["plan_id"]) or ("COMPLETE", ["verified"])  # noqa: E731
+        assert watcher.maybe_plan(st, make, now_hm="06:00", today="2026-09-28", auto_execute=auto) is False
         assert "plan_day" not in st                                  # not marked delivered
         st["plan_retry_at"] = 0
-        assert watcher.maybe_plan(st, make, now_hm="06:00", today="2026-09-28") is True
+        assert watcher.maybe_plan(st, make, now_hm="06:00", today="2026-09-28", auto_execute=auto) is True
         assert len(made) == 1                                        # same plan resent, no duplicate plan
-        assert sends[0] == sends[1] == [[("Approve", "approve:1"), ("Reject", "reject:1")]]
+        assert sends[0] is sends[1] is None and executions == [1]    # execution starts only after delivery succeeds
     finally:
         watcher.notify, watcher.LOG_PATH = orig, orig_log
 
@@ -497,6 +508,7 @@ def test_telegram_approval_security():
     os.environ.update(TELEGRAM_CHAT_ID="111", TELEGRAM_USER_ID="222")
     ran, sent = [], []
     orig, orig_db, orig_log = (tg.answer, tg.edit, tg.send), ex.DB_PATH, approver.LOG_PATH
+    ex.DB_PATH = os.path.join(tmp, "exec.db")                       # never inspect or mutate the real journal
     approver.LOG_PATH = os.path.join(tmp, "approver.log")                   # never write the real log
     tg.answer = lambda *a: sent.append(a)
     tg.edit = lambda *a: sent.append(a)
@@ -534,7 +546,6 @@ def test_telegram_approval_security():
         say("/plan")
         say("/plan", user=999)
         assert replans == [1, 1]                                   # /plan works for the owner only
-        ex.DB_PATH = os.path.join(tmp, "exec.db")
         cap = ex.record_plan(ex.db(), "d", [dict(coin="XRP", action="CLOSE", position_id="p")], {"reason": "cap"})
         assert tap(111, 222, data=f"approve:{cap}", runner=expired) == "cap expired"
         assert replans == [1, 1]                                   # an expired Close-all never becomes a buy plan

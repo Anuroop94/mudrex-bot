@@ -37,7 +37,8 @@ def status_text():
         return "watcher has not reported yet"
     with open(path) as f:
         s = json.load(f)
-    pos = "\n".join(f"  {p['symbol']} {p['side']} P&L Rs {p['upnl_inr']:+,.0f} stop {p['sl'] or 'NONE'}"
+    pos = "\n".join(f"  {p['symbol']} {p['side']} P&L Rs {p['upnl_inr']:+,.0f} "
+                    f"SL {p['sl'] or 'NONE'} TP {p.get('tp') or 'NONE'}"
                     f"{'' if p.get('bot') else ' (manual)'}" for p in s.get("positions", [])) or "  none"
     b = s.get("bot", {})
     return (f"Bot equity Rs {b.get('equity', 0):,.0f} | today {b.get('day_pnl', 0):+,.0f} (caps +/-{b.get('cap', 0):,.0f})"
@@ -65,6 +66,7 @@ def handle(u, run=None, replan=None):
     plan (both injectable for tests). Approving an expired buy plan never trades: it only sends a fresh plan."""
     if not tg.authorized(u):
         return "ignored"
+    default_run = run is None
     run = run or (lambda pid, who: ex.execute(ex.db(), __import__("mudrex_client").Client(), pid, who,
                                               alert=tg_alert))
     replan = replan or fresh_plan
@@ -86,6 +88,13 @@ def handle(u, run=None, replan=None):
         if action != "approve":
             return "ignored"
         tg.answer(cq["id"], "checking and placing...")
+        if default_run:
+            con = ex.db()
+            if ex.plan_requires_set_approval(con, int(plan_id)):
+                why = ex.journal_set_approval(con, int(plan_id), who)
+                if why:
+                    tg.edit(m["chat"]["id"], m["message_id"], m.get("text", "") + f"\n\nREFUSED: {why}")
+                    return "REFUSED"
         final, summary = run(int(plan_id), who)
         tg.edit(m["chat"]["id"], m["message_id"], m.get("text", "") + f"\n\n{final}:\n" + "\n".join(summary))
         log(f"plan {plan_id} approve by {who}: {final}")

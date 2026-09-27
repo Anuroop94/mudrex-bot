@@ -2,13 +2,26 @@
 import os
 
 # Load secrets from .env (gitignored) into the environment. Never hardcode or log the secret.
+# The live-trading switch is different from a normal setting: the local file is
+# authoritative so an inherited Windows/process variable cannot silently keep
+# real trading enabled after the owner turns it off in .env.
 _env = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-if os.path.exists(_env):
+_file_env = {}
+# Tests must be hermetic: a real-money .env beside the source may never override
+# the explicit fake-exchange test environment.
+if os.environ.get("MUDREX_TEST_MODE") != "1" and os.path.exists(_env):
     with open(_env) as f:
         for line in f:
             k, sep, v = line.strip().partition("=")
             if sep and not k.startswith("#"):
-                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                _file_env[k] = v
+                if k == "LIVE_TRADING_ENABLED":
+                    os.environ[k] = v
+                else:
+                    os.environ.setdefault(k, v)
+if "LIVE_TRADING_ENABLED" not in _file_env and os.environ.get("MUDREX_TEST_MODE") != "1":
+    os.environ["LIVE_TRADING_ENABLED"] = "false"
 
 SYMBOL = "BTC/USDT"          # kline format; order API uses "BTCUSDT"
 INTERVAL = "15t"             # Mudrex aggregation code for 15 minutes
@@ -23,7 +36,7 @@ START_EQUITY = 1000.0
 RISK_PCT = 0.01             # risk per trade, fraction of current equity
 LEVERAGE = 3                 # max notional = equity * LEVERAGE
 DAILY_LOSS_CAP = 0.03        # no new entries after losing 3% in an IST day
-DD_HALVE = 0.10              # halve risk when 10% below peak equity
+DD_HALVE = 0.10              # halve research risk at 10% below peak equity
 DD_HALT = 0.20               # stop trading when 20% below peak equity
 QTY_STEP = 0.001             # TODO verify via GET /futures/{asset_id} once API key exists
 MIN_QTY = 0.001

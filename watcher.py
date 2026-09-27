@@ -1,12 +1,13 @@
-"""24/7 watcher. Never places, changes or closes orders: it only READS Mudrex (GET) and writes local files
-(journal plans for you to approve, status, alerts). Every CHECK_SEC it:
-  - computes BOT-only equity and today's P&L vs the 5% caps (execution.bot_equity / caps_state): allocation
+"""24/7 watcher and bounded autonomous dispatcher. Every CHECK_SEC it:
+  - computes BOT-only equity and today's P&L vs fixed +/-Rs500 caps (execution.bot_equity / caps_state): allocation
     Rs 5,000 + realized/unrealized P&L of bot-owned positions. Deposits, withdrawals, manual trades excluded.
     When a cap is hit it alerts you and records a CLOSE-ALL plan that you approve (caps never close by themselves).
   - notices bot positions that closed, journals them (journal.csv) and runs the performance guard (guard.json)
-  - warns about manual positions on basket coins and bot positions without a stop-loss
-  - after the daily close (05:35 IST) generates the S1 plan and sends it with Approve/Reject buttons;
-    plan_day is saved only after the plan was generated AND sent; failures retry with bounded backoff
+  - warns about manual positions and bot positions without a valid exchange stop-loss AND take-profit
+  - after the daily close (05:35 IST) evaluates again at a bounded interval through the current IST cycle,
+    sends every decision, and (only after migration certification) dispatches eligible sets 1-3 autonomously;
+    each extra set gets an exact Telegram approval button; the next evaluation is scheduled only after the
+    current decision was generated AND sent, while delivery failures retry the same immutable plan
   - writes watch_status.json (heartbeat) and alerts if the approver heartbeat goes stale
 """
 import csv
@@ -29,6 +30,7 @@ LOG_PATH = os.path.join(HERE, "watcher.log")
 APPROVER_HEARTBEAT = os.path.join(HERE, "approver_heartbeat.json")
 JOURNAL_PATH = os.path.join(HERE, "journal.csv")
 CHECK_SEC = 300
+PLAN_INTERVAL_SEC = 15 * 60
 DAY = 86400
 PLAN_AFTER = "05:35"
 STALE_SEC = 900
@@ -83,16 +85,24 @@ def save(path, obj):
 
 # ---------- daily plan with retry (plan_day saved only after success)
 
-def maybe_plan(st, make_plan, now_hm=None, today=None):
-    """Generate + send today's plan once. Returns True if done. On failure, retries with bounded backoff."""
+def maybe_plan(st, make_plan, now_hm=None, today=None, auto_execute=None, now=None):
+    """Generate and send one cycle decision when due, then dispatch an eligible autonomous set.
+
+    The daily strategy input still changes only after the 05:30 IST candle closes, but the set ledger and
+    positions can change throughout the day. Re-evaluating every 15 minutes lets the next bounded set become
+    eligible without creating concurrent plans. A failed Telegram delivery retries the same immutable plan.
+    """
     today = today or ist_str("%Y-%m-%d")
-    if (now_hm or ist_str("%H:%M")) < PLAN_AFTER or st.get("plan_day") == today:
+    now = time.time() if now is None else float(now)
+    if (now_hm or ist_str("%H:%M")) < PLAN_AFTER:
         return False
-    if time.time() < st.get("plan_retry_at", 0):
+    if st.get("plan_cycle") == today and now < st.get("plan_next_at", 0):
+        return False
+    if now < st.get("plan_retry_at", 0):
         return False
     try:
         pend = st.get("pending_plan")
-        if pend and pend.get("_day") == today and time.time() - pend.get("created_at", 0) < ex.ENTRY_MAX_AGE:
+        if pend and pend.get("_day") == today and now - pend.get("created_at", 0) < ex.ENTRY_MAX_AGE:
             p = pend                                  # delivery retry: resend the SAME plan, never make a new one
         else:
             p = dict(make_plan(), _day=today)
@@ -102,12 +112,23 @@ def maybe_plan(st, make_plan, now_hm=None, today=None):
         sent = notify(text, buttons=buttons)
         if not sent:
             raise ConnectionError("Telegram delivery failed")                 # retry later; plan_day not saved
-        st["plan_day"], st["plan_fails"], st["plan_retry_at"] = today, 0, 0     # only after generation + delivery
+        # Keep plan_day for old dashboards, but plan_cycle/plan_next_at control the repeated cycle schedule.
+        st["plan_day"], st["plan_cycle"] = today, today
+        st["plan_last_at"], st["plan_next_at"] = now, now + PLAN_INTERVAL_SEC
+        st["plan_fails"], st["plan_retry_at"] = 0, 0
         st.pop("pending_plan", None)
+        opens = [o for o in p.get("orders", []) if o.get("action") == "OPEN"]
+        if (auto_execute and opens and p.get("plan_id") and p.get("live_enabled") and not p.get("blocked")):
+            try:
+                final, summary = auto_execute(p)
+                notify(f"Autonomous plan {p['plan_id']} finished {final}:\n" + "\n".join(summary))
+            except Exception as e:  # delivery succeeded; never create a duplicate plan after an execution error
+                log(f"autonomous execution error: {type(e).__name__}: {e}")
+                notify(f"Autonomous plan {p['plan_id']} hit {type(e).__name__}; entries are halted. Check status.")
         return True
     except Exception as e:
         st["plan_fails"] = st.get("plan_fails", 0) + 1
-        st["plan_retry_at"] = time.time() + min(60 * 2 ** st["plan_fails"], 3600)
+        st["plan_retry_at"] = now + min(60 * 2 ** st["plan_fails"], 3600)
         log(f"plan failed ({st['plan_fails']}): {type(e).__name__}: {e}")
         if st["plan_fails"] == 3:
             notify(f"Could not prepare today's S1 plan after 3 tries ({type(e).__name__}). Retrying; check the PC.")
@@ -207,7 +228,9 @@ def check(st, client=None, con=None, make_plan=None):
         u = side * float(p["quantity"]) * (px - float(p["entry_price"])) * float(p.get("entry_hedge_rate") or rate)
         view.append(dict(id=p["id"], symbol=p["symbol"], side=p["order_type"], qty=float(p["quantity"]),
                          entry=float(p["entry_price"]), price=px, upnl_inr=round(u, 2), bot=p["id"] in owned,
-                         sl=float((p.get("stoploss") or {}).get("price") or 0) or None))
+                         leverage=float(p.get("leverage") or 0) or None,
+                         sl=float((p.get("stoploss") or {}).get("price") or 0) or None,
+                         tp=float((p.get("takeprofit") or {}).get("price") or 0) or None))
     pnl_unknown = None
     try:
         bot_eq = ex.bot_equity(con, client, positions, rate)
@@ -220,8 +243,8 @@ def check(st, client=None, con=None, make_plan=None):
             notify(f"Bot P&L not confirmed yet ({pnl_unknown}): new entries are blocked until Mudrex shows it.")
     caps = ex.caps_state(con, bot_eq, ex.unrealized_inr(con, positions, rate), trusted=pnl_unknown is None)
 
-    verified = {r["position_id"]: r["stop_price"] for r in con.execute(
-        "SELECT position_id, stop_price FROM orders WHERE action='OPEN' AND stop_price IS NOT NULL")}
+    verified = {r["position_id"]: (r["stop_price"], r["target_price"]) for r in con.execute(
+        "SELECT position_id, stop_price, target_price FROM orders WHERE action='OPEN' AND stop_price IS NOT NULL")}
     for v in view:
         coin = v["symbol"].removesuffix("USDT")
         if not v["bot"] and coin in s1.BASKET and v["id"] not in st.setdefault("warned_manual", []):
@@ -229,11 +252,19 @@ def check(st, client=None, con=None, make_plan=None):
             notify(f"Manual {v['side']} on {coin} (an S1 coin): the bot will not trade {coin} while it is open.")
         if not v["bot"]:
             continue
-        want = float(verified[v["id"]]) if verified.get(v["id"]) else None
+        wanted = verified.get(v["id"])
+        want_sl = float(wanted[0]) if wanted and wanted[0] else None
+        want_tp = float(wanted[1]) if wanted and wanted[1] else None
+        side_ok = ((v["sl"] < v["price"] < v["tp"]) if v["side"] == "LONG" else
+                   (v["tp"] < v["price"] < v["sl"])) if v["sl"] and v["tp"] else False
+        moved = ((v["sl"] and want_sl and abs(v["sl"] - want_sl) > ex.stop_tolerance(v["entry"], 0)) or
+                 (v["tp"] and want_tp and abs(v["tp"] - want_tp) > ex.stop_tolerance(v["entry"], 0)))
         problem = ("has NO stop-loss" if not v["sl"] else
-                   f"stop {v['sl']} is at/above the price {v['price']}" if v["sl"] >= v["price"] else
-                   f"stop moved to {v['sl']} (verified {want})"
-                   if want and abs(v["sl"] - want) > ex.stop_tolerance(v["entry"], 0) else None)
+                   "has NO take-profit" if not v["tp"] else
+                   f"has invalid {v['side']} bracket SL {v['sl']} / TP {v['tp']} at price {v['price']}"
+                   if not side_ok else
+                   f"bracket moved to SL {v['sl']} / TP {v['tp']} (verified {want_sl} / {want_tp})"
+                   if moved else None)
         key = f"{v['id']}:{problem}"
         if not problem:                               # healthy again: re-arm, so a new failure alerts again
             st["warned_sl"] = [k for k in st.get("warned_sl", []) if not k.startswith(f"{v['id']}:")]
@@ -287,7 +318,9 @@ def check(st, client=None, con=None, make_plan=None):
     if make_plan is None:
         import live_trader
         make_plan = lambda: live_trader.plan(client, con)   # noqa: E731
-    maybe_plan(st, make_plan)
+    maybe_plan(st, make_plan,
+               auto_execute=lambda p: ex.execute(con, client, p["plan_id"], "autonomous cycle",
+                                                  alert=lambda msg: notify(msg)))
 
     check_approver(st)
     save(STATUS_PATH, dict(at=time.time(), ok=True, positions=view, guard=guard, check_every_sec=CHECK_SEC,
