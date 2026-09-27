@@ -22,6 +22,10 @@ Rules:
     local ledger + bot unrealized). Deposits, withdrawals, manual positions excluded. If bot P&L cannot be
     confirmed (closed position missing from truncated history), entries are blocked (fail closed).
     Caps BLOCK NEW ENTRIES only; closing needs a human-approved plan (the watcher offers "Close all").
+  - PROTECTIVE EXIT (owner's standing rule, 2026-09-27): a bot-owned position from an approved entry that cannot
+    be protected (stop not confirmed, liquidation unknown), breaks the approved notional, the loss budgets or the
+    allocation after the fill, or hits an unexpected error, is closed at once without a further tap. It only
+    ever exits the bot's own validated position; it never opens anything and is not blocked by STOP.
   - Hedge rate: Mudrex exposes no quote endpoint, so the most recent rate Mudrex itself applied (open position
     or INR order) is used; entries are sized with HEDGE_BUFFER headroom and the order's actual hedge_rate is
     checked after the fill.
@@ -48,6 +52,7 @@ MAX_DRIFT = 0.02            # refuse an entry if the live price moved >2% from t
 HEDGE_BUFFER = 1.03         # size as if INR were 3% weaker than the last applied rate
 HEDGE_MAX_AGE = 7 * 86400
 POLL_TRIES, LOOKUP_TRIES = 10, 6
+LEASE = 300                 # a running execute() renews this before every order; reconcile skips leased plans
 TERMINAL_OK = {"FILLED"}
 TERMINAL_BAD = {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED", "FAILED"}
 
@@ -77,9 +82,13 @@ def db(path=None):
         opened_at INTEGER, closed_at INTEGER, realized_pnl REAL);
     CREATE TABLE IF NOT EXISTS ledger(day TEXT PRIMARY KEY, start_equity REAL);
     CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, at INTEGER, kind TEXT, msg TEXT);
+    CREATE TABLE IF NOT EXISTS marks(at INTEGER PRIMARY KEY, equity REAL);
+    CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value REAL);
     """)
-    if "realized_pnl" not in {r["name"] for r in con.execute("PRAGMA table_info(owned)")}:
-        con.execute("ALTER TABLE owned ADD COLUMN realized_pnl REAL")
+    for table, col in (("owned", "realized_pnl REAL"), ("plans", "lease_until INTEGER"),
+                       ("ledger", "trusted INTEGER DEFAULT 1")):
+        if col.split()[0] not in {r["name"] for r in con.execute(f"PRAGMA table_info({table})")}:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
     return con
 
 
@@ -288,25 +297,47 @@ def ist_day(t=None):
     return time.strftime("%Y-%m-%d", time.gmtime((t or time.time()) + config.IST_OFFSET))
 
 
+MARK_WINDOW = 15 * 60       # a pre-midnight equity mark this recent is a trustworthy day-start baseline
+
+
 def caps_state(con, equity, unreal=0.0, now=None):
-    """Bot day P&L vs 5% caps (IST day). The day-start baseline = allocation + P&L realized BEFORE today's IST
-    midnight + unrealized at the first check of the day, so realized losses earlier today always count even if
-    the process restarted. (Unrealized moves between midnight and the first check are the one blind spot.)"""
+    """Bot day P&L vs 5% caps (IST day). Every call records an equity mark. The day-start baseline is:
+      - the last equity mark in the 15 min before IST midnight (the watcher marks every 5 min), else
+      - with NO open bot position: allocation + P&L realized before midnight (exact), else
+      - UNKNOWN (baseline_ok False): open positions moved while nobody watched, so today's loss cannot be
+        measured; callers block new entries for the day."""
     now = now or time.time()
     day = ist_day(now)
-    row = con.execute("SELECT start_equity FROM ledger WHERE day=?", (day,)).fetchone()
+    con.execute("INSERT OR REPLACE INTO marks(at, equity) VALUES(?,?)", (int(now), equity))
+    con.execute("DELETE FROM marks WHERE at < ?", (int(now) - 3 * 86400,))
+    row = con.execute("SELECT start_equity, trusted FROM ledger WHERE day=?", (day,)).fetchone()
     if row is None:
         midnight = int((now + config.IST_OFFSET) // 86400 * 86400 - config.IST_OFFSET)
+        mark = con.execute("SELECT equity FROM marks WHERE at < ? AND at >= ? ORDER BY at DESC LIMIT 1",
+                           (midnight, midnight - MARK_WINDOW)).fetchone()
         before = con.execute("SELECT COALESCE(SUM(realized_pnl), 0) FROM owned WHERE closed_at IS NOT NULL "
                              "AND closed_at < ?", (midnight,)).fetchone()[0]
-        start = s1.CAPITAL_CAP_INR + before + unreal
-        con.execute("INSERT INTO ledger(day, start_equity) VALUES(?,?)", (day, start))
+        open_bot = con.execute("SELECT 1 FROM owned WHERE closed_at IS NULL").fetchone()
+        if mark:
+            start, trusted = mark["equity"], 1
+        elif not open_bot:
+            start, trusted = s1.CAPITAL_CAP_INR + before, 1
+        else:
+            start, trusted = s1.CAPITAL_CAP_INR + before + unreal, 0
+        con.execute("INSERT INTO ledger(day, start_equity, trusted) VALUES(?,?,?)", (day, start, trusted))
     else:
-        start = row["start_equity"]
+        start, trusted = row["start_equity"], row["trusted"] if row["trusted"] is not None else 1
     cap = s1.DAILY_CAP_PCT * start
     pnl = equity - start
-    return dict(day=day, start=start, pnl=pnl, cap=cap,
+    return dict(day=day, start=start, pnl=pnl, cap=cap, baseline_ok=bool(trusted),
                 hit="loss" if pnl <= -cap else "profit" if pnl >= cap else None)
+
+
+def update_peak(con, equity):
+    """Highest bot equity ever seen, kept in the database (survives lost watcher state)."""
+    con.execute("INSERT INTO kv(key, value) VALUES('bot_peak', ?) ON CONFLICT(key) DO UPDATE SET "
+                "value=max(value, excluded.value)", (max(equity, s1.CAPITAL_CAP_INR),))
+    return con.execute("SELECT value FROM kv WHERE key='bot_peak'").fetchone()[0]
 
 
 def guard_tripped():
@@ -495,12 +526,71 @@ def verify_entry(con, client, oid, sleep, alert):
 
 
 def protect_and_check(con, client, row, o, sleep, alert):
-    """Stop first (protection before accounting), then the approved-notional check; VERIFIED only if both pass."""
+    """Stop first (protection before accounting), then the approved-notional check and the post-fill loss budget
+    / exposure check; VERIFIED only if all pass. A bot-owned position (identity validated) that cannot be
+    protected or breaks a limit is EXITED at once: owner's standing rule (2026-09-27), protective exits need no
+    extra approval. A position that did not match its order is never touched (alert only)."""
     protected = verify_entry(con, client, row["id"], sleep, alert)
     within = fill_within_approval(con, order_row(con, row["id"]), o, alert)
-    if protected and within:
+    budget = protected and within and after_fill_budget(con, client, order_row(con, row["id"]), o, alert)
+    if protected and within and budget:
         set_order(con, row["id"], state="VERIFIED")
         return True
+    cur = order_row(con, row["id"])
+    if cur["position_id"] in owned_ids(con) and not quarantined(con, cur["position_id"]):
+        protective_close(con, client, cur, cur["error"] or "limits not confirmed", sleep, alert)
+    return False
+
+
+def after_fill_budget(con, client, row, o, alert):
+    """Loss budgets and total exposure recomputed from the ACTUAL fill, applied INR rate and verified stop."""
+    positions = client.positions()
+    rate = float(o.get("hedge_rate") or 0) or config.INR_PER_USDT
+    try:
+        eq = bot_equity(con, client, positions, rate)
+    except PnlUnknown:
+        eq = float(s1.CAPITAL_CAP_INR)
+    owned = owned_ids(con)
+    fill, qty = row["fill_price"], float(row["filled_qty"])
+    why = over_loss_budget([p for p in positions if p["id"] != row["position_id"]], owned, rate, eq,
+                           qty * fill * rate, fill, float(row["stop_price"]))
+    exposure = sum(float(p["quantity"]) * float(p["entry_price"]) * rate for p in positions if p["id"] in owned)
+    if not why and exposure > s1.LEV * s1.CAPITAL_CAP_INR:
+        why = f"allocation cap: bot holds Rs {exposure:,.0f} after this fill"
+    if why:
+        set_order(con, row["id"], state="RECONCILE_REQUIRED", error=f"after fill: {why}")
+        return False
+    return True
+
+
+def protective_close(con, client, row, why, sleep, alert):
+    """Exit a bot-owned position whose approved entry could not be protected or broke a limit. Not blocked by
+    STOP (it only reduces risk). Idempotent: a position that is already gone counts as exited."""
+    pid = row["position_id"]
+    event(con, "protect", f"{row['coin']}: {why}. EXITING this position now (automatic protective exit).", alert)
+    try:
+        if any(p["id"] == pid for p in client.positions()):
+            client.close_position(pid)
+    except Rejected as e:
+        set_order(con, row["id"], state="RECONCILE_REQUIRED", error=f"protective exit rejected: {e.errors}"[:300])
+        event(con, "protect", f"{row['coin']}: protective exit REJECTED. CLOSE IT IN THE MUDREX APP NOW.", alert)
+        return False
+    except (Ambiguous, Locked):
+        pass                                                           # unknown: verify by position state
+    for i in range(POLL_TRIES):
+        try:
+            gone = not any(p["id"] == pid for p in client.positions())
+        except (Ambiguous, Locked):
+            gone = False
+        if gone:
+            con.execute("UPDATE owned SET closed_at=? WHERE position_id=? AND closed_at IS NULL",
+                        (int(time.time()), pid))
+            set_order(con, row["id"], state="FAILED", error=f"exited automatically: {why}"[:300])
+            event(con, "protect", f"{row['coin']}: protective exit done; position closed.", alert)
+            return True
+        sleep(min(1 + i, 5))
+    set_order(con, row["id"], state="RECONCILE_REQUIRED", error=f"protective exit not confirmed: {why}"[:300])
+    event(con, "protect", f"{row['coin']}: protective exit NOT confirmed. Check Mudrex now.", alert)
     return False
 
 
@@ -561,6 +651,8 @@ def run_open(con, client, row, sleep, alert):
     caps = caps_state(con, eq, unrealized_inr(con, positions, rate))
     if caps["hit"]:
         return fail(con, row["id"], f"daily {caps['hit']} cap hit")
+    if not caps["baseline_ok"]:
+        return fail(con, row["id"], "today's starting balance unknown (bot was not watching at midnight)")
     if guard_tripped():
         return fail(con, row["id"], "performance guard tripped")
     a = client.asset(sym)
@@ -661,6 +753,19 @@ def fill_within_approval(con, row, o, alert):
     return False
 
 
+def fail_safe_exit(con, client, row, why, sleep, alert):
+    """After an unexpected error on an ENTRY: exit its position if it is bot-owned and validated (never raises)."""
+    cur = order_row(con, row["id"])
+    if row["action"] != "OPEN" or not cur["position_id"] or cur["position_id"] not in owned_ids(con) \
+            or quarantined(con, cur["position_id"]):
+        return
+    try:
+        protective_close(con, client, cur, why, sleep, alert)
+    except Exception as e:                                             # noqa: BLE001
+        event(con, "protect", f"{row['coin']}: protective exit failed ({type(e).__name__}). "
+                              f"CLOSE IT IN THE MUDREX APP NOW.", alert)
+
+
 def plan_outcome(con, plan_id):
     states = [r["state"] for r in con.execute("SELECT state FROM orders WHERE plan_id=?", (plan_id,))]
     if any(s in ("RECONCILE_REQUIRED", "SUBMITTED", "ACCEPTED", "FILLED") for s in states):
@@ -680,7 +785,7 @@ def execute(con, client, plan_id, approver, sleep=time.sleep, alert=None):
     why = claim(con, plan_id, approver)
     if why:
         return "REFUSED", [why]
-    con.execute("UPDATE plans SET state='EXECUTING' WHERE id=?", (plan_id,))
+    con.execute("UPDATE plans SET state='EXECUTING', lease_until=? WHERE id=?", (int(time.time()) + LEASE, plan_id))
     event(con, "execute", f"plan {plan_id} approved by {approver}")
     try:
         recover_ownership(con, client)
@@ -689,6 +794,7 @@ def execute(con, client, plan_id, approver, sleep=time.sleep, alert=None):
     entries_allowed = True
     # closes first; any close that is not confirmed halts every entry (exposure would exceed the allocation)
     for row in con.execute("SELECT * FROM orders WHERE plan_id=? ORDER BY action='OPEN', seq", (plan_id,)).fetchall():
+        con.execute("UPDATE plans SET lease_until=? WHERE id=?", (int(time.time()) + LEASE, plan_id))   # still alive
         why = preflight()
         if why:
             set_order(con, row["id"], state="FAILED", error=f"halted: {why}")
@@ -713,26 +819,32 @@ def execute(con, client, plan_id, approver, sleep=time.sleep, alert=None):
             event(con, "error", f"{row['coin']}: unexpected {type(e).__name__} during {row['action']}; "
                                 f"entries halted, reconcile required.", alert)
             entries_allowed = False
+            fail_safe_exit(con, client, row, f"unexpected {type(e).__name__} after the fill", sleep, alert)
     final = plan_outcome(con, plan_id)
-    con.execute("UPDATE plans SET state=? WHERE id=?", (final, plan_id))
+    con.execute("UPDATE plans SET state=?, lease_until=NULL WHERE id=?", (final, plan_id))
     summary = [f"{r['action']} {r['coin']}: {r['state']}" + (f" ({r['error']})" if r["error"] else "")
                for r in con.execute("SELECT * FROM orders WHERE plan_id=? ORDER BY seq", (plan_id,))]
     event(con, "execute", f"plan {plan_id} finished {final}: " + "; ".join(summary), alert)
     return final, summary
 
 
-def reconcile(con, client, sleep=time.sleep, alert=None, min_age=900):
-    """After a crash/restart: resolve every order that is not terminal, by client_order_id. Never resubmits.
-    Only touches plans approved more than min_age seconds ago, so it cannot race a run still in progress."""
+def reconcile(con, client, sleep=time.sleep, alert=None, min_age=0):
+    """After a crash/restart: resolve every order that is not terminal, by client_order_id. Never resubmits
+    entries. Skips any plan whose execution lease is still live (a run in progress renews it before every
+    order), so it cannot race execute(); a crashed run's lease expires within LEASE seconds."""
+    now = int(time.time())
     stale = [r["id"] for r in con.execute(
-        "SELECT id FROM plans WHERE state IN ('EXECUTING','APPROVED','RECONCILE_REQUIRED') AND approved_at <= ?",
-        (int(time.time()) - min_age,))]
+        "SELECT id FROM plans WHERE state IN ('EXECUTING','APPROVED','RECONCILE_REQUIRED') AND approved_at <= ? "
+        "AND COALESCE(lease_until, 0) < ?", (now - min_age, now))]
     if not stale:
         return
     marks = ",".join("?" * len(stale))
     for row in con.execute(f"SELECT * FROM orders WHERE plan_id IN ({marks}) AND state IN "
                            "('SUBMITTED','ACCEPTED','FILLED','RECONCILE_REQUIRED')", stale).fetchall():
         try:
+            if row["action"] == "OPEN" and "protective exit" in (row["error"] or ""):
+                protective_close(con, client, row, row["error"], sleep, alert)   # finish an unconfirmed exit
+                continue
             if row["action"] == "CLOSE":
                 if not any(p["id"] == row["position_id"] for p in client.positions()):
                     set_order(con, row["id"], state="VERIFIED")
@@ -754,6 +866,9 @@ def reconcile(con, client, sleep=time.sleep, alert=None, min_age=900):
             protect_and_check(con, client, row, o, sleep, alert)
         except ApiError as e:
             event(con, "reconcile", f"{row['coin']}: reconcile deferred ({e})", alert)
+        except Exception as e:                                         # noqa: BLE001 - malformed exchange data etc.
+            event(con, "reconcile", f"{row['coin']}: reconcile error {type(e).__name__}: {e}"[:300], alert)
+            fail_safe_exit(con, client, row, f"reconcile could not verify it ({type(e).__name__})", sleep, alert)
     for pid in stale:
         # orders a crashed run never sent stay unsent: FAILED, never resumed without a new approval
         con.execute("UPDATE orders SET state='FAILED', error='not submitted (run interrupted)' "

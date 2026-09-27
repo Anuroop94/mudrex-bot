@@ -132,6 +132,7 @@ def plan(client=None, con=None):
                "performance guard tripped" if ex.guard_tripped() else
                f"bot P&L unconfirmed ({pnl_unknown})" if pnl_unknown else
                f"daily {caps['hit']} cap hit" if caps["hit"] else
+               "today's starting balance unknown (not watched at midnight)" if not caps["baseline_ok"] else
                "no recent INR hedge rate from Mudrex" if not rate else None)
     bad = bad_data(uni, last_closed)
     orders = build_orders(targets, owned, manual, {c: closes[c].get(last_closed) for c in s1.BASKET},

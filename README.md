@@ -11,6 +11,8 @@ Backtests are not guarantees. **Every real order needs a human approval** (termi
 | `STOP` file | this folder | Kill switch: blocks every order, checked before the plan AND before each order |
 | Performance guard | `guard.json` (`tripped`) | Set by the watcher when live results break backtest limits; blocks new entries |
 | Daily caps | `execution.db` ledger | 5% of the bot's day-start equity; blocks new entries. Caps never close by themselves: the watcher sends a *Close all* plan for you to approve. So 5% is an entry-halt line, NOT a maximum loss: losses can run past it before you approve, or through a stop that gaps |
+| Protective exit | `execution.py` | your standing rule (2026-09-27): if a buy you approved fills but its stop-loss cannot be confirmed, or after the fill it breaks the approved amount, a loss budget or the Rs 10,000 exposure limit, the bot EXITS that position at once, with no extra tap. It only closes the bot's own validated position, never opens anything, and runs even when STOP is set |
+| Day-start balance | `execution.caps_state` | taken from the watcher's mark just before IST midnight; if the bot was not watching then while positions were open, no new buys that day |
 | Loss budgets | `s1.py` + `execution.py` | a new buy is refused if its stop would lose > 6% of bot equity, or if ALL open stops together would lose > 15% (hard, checked before every order). Gaps through a stop can still lose more |
 | Data freshness | `live_trader.bad_data` | a coin with a missing or gappy daily history gets no decision that day; unknown BTC mood blocks new buys |
 

@@ -150,8 +150,7 @@ def journal_and_guard(st, con, client, bot_open_upnl):
     for pnl in pnls:
         streak = streak + 1 if pnl <= 0 else 0
     bot_eq = s1.CAPITAL_CAP_INR + sum(pnls) + bot_open_upnl
-    st["bot_peak"] = max(st.get("bot_peak", s1.CAPITAL_CAP_INR), bot_eq)
-    dd = 1 - bot_eq / st["bot_peak"]
+    dd = 1 - bot_eq / ex.update_peak(con, bot_eq)             # peak lives in the database, not watcher state
     guard = load(ex.GUARD_PATH, dict(tripped=False))
     guard.update(streak=streak, drawdown=round(dd, 4), checked=time.time())
     if not guard.get("tripped") and (streak >= TRIP_STREAK or dd >= TRIP_DD):
@@ -270,6 +269,10 @@ def check(st, client=None, con=None, make_plan=None):
         st["warned_80"] = caps["day"]
         notify(f"Warning: bot down Rs {-caps['pnl']:,.0f} today (loss cap Rs {caps['cap']:,.0f}).")
 
+    if not caps["baseline_ok"] and st.get("baseline_warned") != caps["day"] and notify(
+            "Today's starting balance is unknown (the bot was not watching at midnight while positions were open). "
+            "No new buys today; tomorrow starts normally."):
+        st["baseline_warned"] = caps["day"]
     stuck = con.execute("SELECT DISTINCT plan_id FROM orders WHERE state IN "
                         "('SUBMITTED','ACCEPTED','FILLED','RECONCILE_REQUIRED') AND updated_at < ?",
                         (int(time.time()) - 1200,)).fetchall()

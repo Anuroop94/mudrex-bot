@@ -34,6 +34,11 @@ def plan(con, coins, notional=1000.0, action="OPEN", position_ids=None, atr_pct=
     return ex.record_plan(con, "2026-09-26", orders, {})
 
 
+def exited(st, fake):
+    """The protective-exit rule: the order ends FAILED with the reason and no position is left open."""
+    return st[0] == "FAILED" and "exited automatically" in st[1] and not fake.positions
+
+
 def states(con, pid):
     return {r["coin"]: (r["state"], r["error"]) for r in con.execute("SELECT * FROM orders WHERE plan_id=?", (pid,))}
 
@@ -192,8 +197,8 @@ def test_recovery_checks_fill_against_approved_notional():
     alerts = []
     ex.reconcile(con, client, NOSLEEP, alerts.append)
     st = states(con, pid)["XRP"]
-    assert st[0] == "RECONCILE_REQUIRED" and "allowed" in st[1], st
-    assert any("exceeds the approved" in a for a in alerts)
+    assert exited(st, fake) and "allowed" in st[1], st            # over its approval: exited automatically
+    assert any("exceeds the approved" in a for a in alerts) and any("EXITING" in a for a in alerts)
     fake.stop()
 
 
@@ -265,7 +270,7 @@ def test_missing_or_failed_stop_attachment_halts_entries():
     pid = plan(con, ["XRP", "ADA"])
     ex.execute(con, client, pid, "t", NOSLEEP, alerts.append)
     st = states(con, pid)
-    assert st["XRP"][0] == "RECONCILE_REQUIRED" and "stop" in st["XRP"][1]   # unprotected fill keeps entries blocked
+    assert exited(st["XRP"], fake) and "stop" in st["XRP"][1]    # unprotected fill: exited automatically
     assert "halted" in st["ADA"][1] and fake.submits == 1
     assert any("UNPROTECTED" in a or "NOT verified" in a for a in alerts)
     fake.stop()
@@ -325,7 +330,7 @@ def test_wrong_existing_stop_and_failed_amend_halts():
     pid = plan(con, ["XRP", "ADA"])
     ex.execute(con, client, pid, "t", NOSLEEP, alerts.append)
     st = states(con, pid)
-    assert st["XRP"][0] == "RECONCILE_REQUIRED" and "not verified" in st["XRP"][1] and "halted" in st["ADA"][1]
+    assert exited(st["XRP"], fake) and "not verified" in st["XRP"][1] and "halted" in st["ADA"][1]
     assert fake.submits == 1 and any("UNPROTECTED" in a for a in alerts)
     fake.stop()
 
@@ -355,7 +360,7 @@ def test_missing_liquidation_price_fails_closed():
     pid = plan(con, ["XRP", "ADA"])
     ex.execute(con, client, pid, "t", NOSLEEP, alerts.append)
     st = states(con, pid)
-    assert st["XRP"][0] == "RECONCILE_REQUIRED" and "halted" in st["ADA"][1]
+    assert exited(st["XRP"], fake) and "halted" in st["ADA"][1]
     assert any("liquidation" in a for a in alerts)
     fake.stop()
 
@@ -414,15 +419,19 @@ def test_position_mismatch_after_fill_halts():
 def test_crash_between_stop_check_and_notional_check_is_rechecked():
     tmp, fake, client, con = setup()
     real = ex.fill_within_approval
-    ex.fill_within_approval = lambda *a: (_ for _ in ()).throw(RuntimeError("crash"))
+    ex.fill_within_approval = lambda *a: (_ for _ in ()).throw(SystemExit("process killed"))   # a real crash
     try:
         pid = plan(con, ["XRP"])
         ex.execute(con, client, pid, "t", NOSLEEP)
+    except SystemExit:
+        pass
     finally:
         ex.fill_within_approval = real
     assert states(con, pid)["XRP"][0] != "VERIFIED"               # stop verified alone is not enough
-    con.execute("UPDATE plans SET approved_at=? WHERE id=?", (int(time.time()) - 3600, pid))
     ex.reconcile(con, client, NOSLEEP)
+    assert states(con, pid)["XRP"][0] == "FILLED"                  # crashed run's lease still live: not touched
+    con.execute("UPDATE plans SET lease_until=? WHERE id=?", (int(time.time()) - 1, pid))   # lease expired
+    ex.reconcile(con, client, NOSLEEP)                             # no 15-minute wait any more
     assert states(con, pid)["XRP"][0] == "VERIFIED" and fake.submits == 1
     fake.stop()
 
@@ -536,6 +545,64 @@ def test_loss_budgets_per_trade_and_total():
     fake.stop()
 
 
+def test_post_fill_budget_breach_exits_automatically():
+    tmp, fake, client, con = setup()
+    real = s1.MAX_TRADE_STOP_RISK
+    fake.hooks["after_fill"] = lambda o: setattr(s1, "MAX_TRADE_STOP_RISK", 0.001)   # limit breached by the fill
+    alerts = []
+    try:
+        pid = plan(con, ["XRP", "ADA"])
+        ex.execute(con, client, pid, "t", NOSLEEP, alerts.append)
+    finally:
+        s1.MAX_TRADE_STOP_RISK = real
+    st = states(con, pid)
+    assert exited(st["XRP"], fake) and "loss budget" in st["XRP"][1] and "halted" in st["ADA"][1], st
+    assert any("EXITING" in a for a in alerts) and any("exit done" in a for a in alerts)
+    fake.stop()
+
+
+def test_protective_exit_runs_even_with_stop_file_and_never_touches_manual():
+    tmp, fake, client, con = setup()
+    fake.riskorder_ok, fake.drop_order_stop = False, True
+    fake.add_manual("DOGE", "LONG")
+    fake.hooks["after_fill"] = lambda o: open(ex.STOP_PATH, "w").close()   # kill switch arrives after the fill
+    pid = plan(con, ["XRP"])
+    ex.execute(con, client, pid, "t", NOSLEEP)
+    assert states(con, pid)["XRP"][1].startswith("exited automatically")  # risk-reducing exit still ran
+    assert [p["symbol"] for p in fake.positions] == ["DOGEUSDT"]          # the manual position is untouched
+    fake.stop()
+
+
+def test_reconcile_survives_malformed_data_and_continues():
+    tmp, fake, client, con = setup()
+    pid = plan(con, ["XRP", "ADA"])
+    rows = {r["coin"]: r for r in con.execute("SELECT * FROM orders WHERE plan_id=?", (pid,))}
+    for c in ("XRP", "ADA"):
+        fake.create_order(c + "USDT", dict(client_order_id=rows[c]["client_order_id"], quantity="6"))
+    _simulate_crash(con, pid, "ACCEPTED")
+    fake.hooks["after_fill"] = lambda o: o["symbol"] == "XRPUSDT" and fake.positions[-1].update(quantity="n/a")
+    alerts = []
+    ex.reconcile(con, client, NOSLEEP, alerts.append)
+    st = states(con, pid)
+    assert st["ADA"][0] == "VERIFIED", st                            # one bad record does not block the rest
+    assert any("reconcile error" in a for a in alerts)
+    fake.stop()
+
+
+def test_daily_baseline_from_midnight_mark_or_blocked():
+    tmp, fake, client, con = setup()
+    D, off = 86400, ex.config.IST_OFFSET
+    midnight = (int(time.time()) + off) // D * D - off + D           # next IST midnight
+    ex.caps_state(con, 5000, 0, now=midnight - 300)                   # watcher mark 5 min before midnight
+    c = ex.caps_state(con, 4900, 0, now=midnight + 3600)
+    assert c["baseline_ok"] and c["start"] == 5000 and round(c["pnl"]) == -100
+    con.execute("INSERT INTO owned(position_id, coin, client_order_id, opened_at) VALUES('p','XRP','s1-z',1)")
+    c = ex.caps_state(con, 4600, -400, now=midnight + D + 7200)       # no mark before the next midnight
+    assert not c["baseline_ok"]                                       # unknown start: callers block new buys
+    assert ex.update_peak(con, 6000) == 6000 and ex.update_peak(con, 5500) == 6000   # peak kept in the DB
+    fake.stop()
+
+
 def test_nothing_to_do_plan_invalidates_older_approvals():
     tmp, fake, client, con = setup()
     old = plan(con, ["XRP"])
@@ -576,7 +643,7 @@ def test_missing_or_excessive_applied_fx_halts():
         pid = plan(con, ["XRP", "ADA"])
         ex.execute(con, client, pid, "t", NOSLEEP, alerts.append)
         st = states(con, pid)
-        assert st["XRP"][0] == "RECONCILE_REQUIRED" and "halted" in st["ADA"][1], (rate, st)
+        assert exited(st["XRP"], fake) and "halted" in st["ADA"][1], (rate, st)
         assert any("INR" in a for a in alerts)
         fake.stop()
 
