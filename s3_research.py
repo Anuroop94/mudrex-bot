@@ -25,7 +25,8 @@ import strategy
 
 HOUR, DAY = 3600, 86400
 RATE = config.INR_PER_USDT
-COST = config.TAKER_FEE * (1 + config.GST) + pf.SLIPPAGE          # per side, fraction of notional
+FEE = config.TAKER_FEE * (1 + config.GST)                          # per side; slippage is in the fill PRICE
+MAX_TRADE_STOP_RISK = 0.07                                          # S3's own per-trade loss limit (of equity)
 ALLOC, LEV, CAP = 2500.0, 2, 0.05
 WAKE = (8, 23)                                                      # IST hours a set may start (approval taps)
 
@@ -69,10 +70,13 @@ def setups(D, t, kind, filters=True):
     return [c for _, c in sorted(out, reverse=True)]
 
 
-def run(D, kind, tp, sl, hold=24, max_coins=2, scale="h", filters=True, start=None):
-    """start: first hour to trade (paper trading replays from its own start date with fresh Rs 2,500)."""
+def run(D, kind, tp, sl, hold=24, max_coins=2, scale="h", filters=True, start=None, target_first=False):
+    """start: first hour to trade (paper trading replays from its own start date with fresh Rs 2,500).
+    target_first: sensitivity - when one 1h bar touches both stop and target, assume the target came first
+    (the default, stop first, is the conservative guess; OHLC data cannot tell)."""
     eq, open_pos, trades, marks, log = ALLOC, [], [], [], []
     day, day_start, blocked, sets = None, eq, False, 0
+    stats = dict(signal_hours=0, rejected_min=0, rejected_risk=0, ruin_day=None)
     t0 = max(min(f["t"]) for f in D["f"].values()) + 400 * HOUR
     t0 = max(t0, start) if start else t0
     t1 = min(max(f["t"]) for f in D["f"].values())
@@ -83,12 +87,13 @@ def run(D, kind, tp, sl, hold=24, max_coins=2, scale="h", filters=True, start=No
             if day is not None:
                 marks.append((t, eq + sum(p["u"] for p in open_pos)))
             day, day_start, blocked = ist_day, eq + sum(p["u"] for p in open_pos), False
-        # entries decided at the previous close, filled at this hour's open
+        # entries decided at the previous close, filled at this hour's open; fill slots with VALID candidates
         if pending and not open_pos:
             budget = LEV * min(eq, ALLOC)
-            chosen = pending[:max_coins]
-            each = budget / len(chosen)
-            for c in chosen:
+            each = budget / min(max_coins, len(pending))
+            for c in pending:
+                if len(open_pos) >= max_coins:
+                    break
                 f = D["f"][c]
                 i = f["idx"].get(t)
                 if i is None:
@@ -100,18 +105,22 @@ def run(D, kind, tp, sl, hold=24, max_coins=2, scale="h", filters=True, start=No
                 spec = D["specs"][c]
                 qty = math.floor(each / RATE / px / spec["step"]) * spec["step"]
                 if qty < spec["min_qty"] or qty * px < spec["min_notional"]:
+                    stats["rejected_min"] += 1
+                    if stats["ruin_day"] is None and eq < 2 * 510 / LEV:
+                        stats["ruin_day"] = t
                     continue
-                if qty * sl * atr * RATE > s1.MAX_TRADE_STOP_RISK * eq:
+                if qty * sl * atr * RATE > MAX_TRADE_STOP_RISK * eq:
+                    stats["rejected_risk"] += 1
                     continue
                 n = qty * px * RATE
-                eq -= n * COST
+                eq -= n * FEE
                 open_pos.append(dict(c=c, qty=qty, entry=px, tp=px + tp * atr, sl=px - sl * atr, t=t,
-                                     deadline=t + hold * HOUR, cost=n * COST, fund=0.0, u=0.0))
+                                     deadline=t + hold * HOUR, cost=n * FEE, fund=0.0, u=0.0))
             if open_pos:
                 sets += 1
                 log.append(dict(t=t, event="SET", coins=[p["c"] for p in open_pos]))
         pending = None
-        # manage the set on this hour's bar
+        # manage the set on this hour's bar: time exit and gaps at the OPEN first, then the bar's range
         still = []
         for p in open_pos:
             f = D["f"][p["c"]]
@@ -119,47 +128,66 @@ def run(D, kind, tp, sl, hold=24, max_coins=2, scale="h", filters=True, start=No
             if i is None:
                 still.append(p)
                 continue
-            fund = p["qty"] * f["o"][i] * RATE * config.FUNDING_PER_DAY / 24
-            eq -= fund
-            p["fund"] += fund
-            exit_px = (min(f["o"][i], p["sl"]) if f["l"][i] <= p["sl"] else p["tp"] if f["h"][i] >= p["tp"]
-                       else f["c"][i] if t >= p["deadline"] else None)
-            if exit_px is None:
-                p["u"] = p["qty"] * (f["c"][i] - p["entry"]) * RATE
-                still.append(p)
-                continue
+            o, h, lo = f["o"][i], f["h"][i], f["l"][i]
+            if t >= p["deadline"]:
+                exit_px, why = o, "time"                            # max hold reached: out at this hour's open
+            elif o <= p["sl"]:
+                exit_px, why = o, "stop"                            # gapped through the stop
+            elif o >= p["tp"]:
+                exit_px, why = o, "target"                          # gapped through the target
+            else:
+                fund = p["qty"] * o * RATE * config.FUNDING_PER_DAY / 24
+                eq -= fund
+                p["fund"] += fund
+                hit_sl, hit_tp = lo <= p["sl"], h >= p["tp"]
+                if hit_sl and hit_tp:
+                    exit_px, why = (p["tp"], "target") if target_first else (p["sl"], "stop")
+                elif hit_sl:
+                    exit_px, why = p["sl"], "stop"
+                elif hit_tp:
+                    exit_px, why = p["tp"], "target"
+                else:
+                    p["u"] = p["qty"] * (f["c"][i] - p["entry"]) * RATE
+                    still.append(p)
+                    continue
             exit_px *= 1 - pf.SLIPPAGE
             gross = p["qty"] * (exit_px - p["entry"]) * RATE
-            fee = p["qty"] * exit_px * RATE * COST
+            fee = p["qty"] * exit_px * RATE * FEE
             eq += gross - fee
-            trades.append(dict(coin=p["c"], entry_t=p["t"], exit_t=t, entry=p["entry"], exit=exit_px,
-                               why="stop" if exit_px < p["entry"] and f["l"][i] <= p["sl"] else
-                               "target" if f["h"][i] >= p["tp"] else "time", net=gross - fee - p["cost"] - p["fund"]))
+            trades.append(dict(coin=p["c"], entry_t=p["t"], exit_t=t, entry=p["entry"], exit=exit_px, why=why,
+                               net=gross - fee - p["cost"] - p["fund"]))
         open_pos = still
         day_pnl = eq + sum(p["u"] for p in open_pos) - day_start
         if abs(day_pnl) >= CAP * day_start:
             blocked = True                                          # 5% line: no NEW sets today (like live)
-        hour_ist = ((t + config.IST_OFFSET) % DAY) // HOUR
-        if not open_pos and not blocked and WAKE[0] <= hour_ist < WAKE[1]:
-            pending = setups(D, t, kind, filters) or None
+        entry_hour_ist = ((t + HOUR + config.IST_OFFSET) % DAY) // HOUR   # the set would START next hour
+        if WAKE[0] <= entry_hour_ist < WAKE[1]:
+            found = setups(D, t, kind, filters)
+            stats["signal_hours"] += bool(found)                    # raw setups, even while a set is open
+            if found and not open_pos and not blocked:
+                pending = found
     daily = [(marks[k + 1][0], marks[k + 1][1] / marks[k][1] - 1) for k in range(len(marks) - 1)]
     return dict(daily=daily, trades=trades, sets=sets, days=len(marks), equity=eq, open=open_pos, log=log,
-                blocked=blocked, last_t=t1 - HOUR)
-
+                blocked=blocked, last_t=t1 - HOUR, stats=stats)
 
 def main():
     D = load()
     print("DEV = before 2025-09-25 (evidence).  POST* = after (descriptive only).  Rs 2,500, 2x, fixed target/stop.")
-    grid = [(k, tp, sl, 24, "h", True) for k in ("BRK", "DIP") for tp, sl in ((1.0, 1.0), (1.5, 1.0), (2.0, 1.0))]
-    grid += [(k, tp, sl, 48, "d", f) for k in ("BRK", "DIP") for f in (True, False) for tp, sl in ((0.5, 0.5), (1.0, 0.5))]
-    for kind, tp, sl, hold, scale, filt in grid:
-            r = run(D, kind, tp, sl, hold, scale=scale, filters=filt)
-            label = (f"{kind} tgt {tp} stop {sl} x{'1h' if scale == 'h' else 'daily'}ATR {hold}h"
-                     f"{'' if filt else ' NO-FILTER'}")
-            per_day = len(r["trades"]) / max(1, r["days"])
-            print(audit.line(label, dict(daily=r["daily"], trades=r["trades"]))
-                  + f"  | sets/day {r['sets'] / max(1, r['days']):.2f} trades/day {per_day:.2f}", flush=True)
-
+    print("sets/day = over days BEFORE the account got too small to trade; signals/day = hours with a raw setup.")
+    grid = [(k, tp, sl, 24, "h", True, False) for k in ("BRK", "DIP") for tp, sl in ((1.0, 1.0), (1.5, 1.0), (2.0, 1.0))]
+    grid += [(k, tp, sl, 48, "d", f, False) for k in ("BRK", "DIP") for f in (True, False)
+             for tp, sl in ((0.5, 0.5), (1.0, 0.5))]
+    grid += [("BRK", 1.0, 1.0, 24, "h", True, True), ("BRK", 1.0, 0.5, 48, "d", True, True)]   # target-first check
+    for kind, tp, sl, hold, scale, filt, tf in grid:
+        r = run(D, kind, tp, sl, hold, scale=scale, filters=filt, target_first=tf)
+        s = r["stats"]
+        live_days = r["days"] if s["ruin_day"] is None else max(1, sum(1 for t, _ in r["daily"] if t < s["ruin_day"]))
+        label = (f"{kind} tgt {tp} stop {sl} x{'1h' if scale == 'h' else 'daily'}ATR {hold}h"
+                 f"{'' if filt else ' NO-FILTER'}{' TARGET-FIRST' if tf else ''}")
+        print(audit.line(label, dict(daily=r["daily"], trades=r["trades"]))
+              + f"  | sets/day {r['sets'] / live_days:.2f} signals/day {s['signal_hours'] / max(1, r['days']):.2f}"
+              f" rejected(min {s['rejected_min']}, risk {s['rejected_risk']})"
+              + (" RUINED" if s["ruin_day"] else ""), flush=True)
 
 if __name__ == "__main__":
     main()
