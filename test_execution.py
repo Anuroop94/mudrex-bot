@@ -580,13 +580,123 @@ def test_reconcile_survives_malformed_data_and_continues():
     for c in ("XRP", "ADA"):
         fake.create_order(c + "USDT", dict(client_order_id=rows[c]["client_order_id"], quantity="6"))
     _simulate_crash(con, pid, "ACCEPTED")
-    fake.hooks["after_fill"] = lambda o: o["symbol"] == "XRPUSDT" and fake.positions[-1].update(quantity="n/a")
+    fake.hooks["after_fill"] = lambda o: o["symbol"] == "XRPUSDT" and fake.specs["XRP"].pop("price_step")
     alerts = []
     ex.reconcile(con, client, NOSLEEP, alerts.append)
     st = states(con, pid)
     assert st["ADA"][0] == "VERIFIED", st                            # one bad record does not block the rest
     assert any("reconcile error" in a for a in alerts)
+    assert st["XRP"][1].startswith("exited automatically"), st       # unverifiable validated fill: fail-safe exit
     fake.stop()
+
+
+def _unprotectable(fake):
+    fake.riskorder_ok, fake.drop_order_stop = False, True
+
+
+def close_posts(fake):
+    return sum(1 for m, p, c in fake.requests if m == "POST" and p.endswith("/close"))
+
+
+def test_protective_exit_is_order_bound_and_revalidated():
+    tmp, fake, client, con = setup()
+    _unprotectable(fake)
+    real = ex.verify_entry
+
+    def verify_then_rebind(con_, client_, oid, sleep, alert):
+        ok = real(con_, client_, oid, sleep, alert)
+        con_.execute("UPDATE owned SET client_order_id='s1-other-plan-O'")      # now owned by ANOTHER order
+        return ok
+    ex.verify_entry = verify_then_rebind
+    try:
+        pid = plan(con, ["XRP"])
+        ex.execute(con, client, pid, "t", NOSLEEP)
+    finally:
+        ex.verify_entry = real
+    assert close_posts(fake) == 0 and fake.positions                          # not this order's: never closed
+    assert "not bound" in states(con, pid)["XRP"][1]
+    fake.stop()
+    tmp, fake, client, con = setup()
+    _unprotectable(fake)
+    real_close = ex.protective_close
+
+    def change_then_close(con_, client_, row, why, sleep, alert):
+        fake.positions[0]["quantity"] = "99"                                   # user changed it in the app
+        return real_close(con_, client_, row, why, sleep, alert)
+    ex.protective_close = change_then_close
+    try:
+        pid = plan(con, ["XRP"])
+        ex.execute(con, client, pid, "t", NOSLEEP)
+    finally:
+        ex.protective_close = real_close
+    assert close_posts(fake) == 0 and "position changed" in states(con, pid)["XRP"][1]
+    fake.stop()
+
+
+def test_unknown_balance_after_fill_exits():
+    tmp, fake, client, con = setup()
+    fake.hooks["after_fill"] = lambda o: ex.db(os.path.join(tmp, "exec.db")).execute(
+        "INSERT INTO owned(position_id, coin, client_order_id, opened_at, closed_at) VALUES('gone','LINK','s1-q',1,2)")
+    pid = plan(con, ["XRP"])
+    ex.execute(con, client, pid, "t", NOSLEEP)
+    st = states(con, pid)["XRP"]
+    assert exited(st, fake) and "balance unknown" in st[1], st
+    fake.stop()
+
+
+def test_protective_exit_is_not_resent_until_proven_needed():
+    tmp, fake, client, con = setup()
+    _unprotectable(fake)
+    fake.faults["close"] = ["timeout"] * 10                    # every close times out and is NOT applied
+    alerts = []
+    pid = plan(con, ["XRP"])
+    ex.execute(con, client, pid, "t", NOSLEEP, alerts.append)
+    assert close_posts(fake) == 1 and "not confirmed" in states(con, pid)["XRP"][1]
+    ex.reconcile(con, client, NOSLEEP, alerts.append)
+    assert close_posts(fake) == 1                              # within 10 min: waits, no second close
+    for n in (2, 3):
+        con.execute("UPDATE orders SET exit_sent_at=? WHERE plan_id=?", (int(time.time()) - 601, pid))
+        ex.reconcile(con, client, NOSLEEP, alerts.append)
+        assert close_posts(fake) == n                          # re-sent only after 10 min, still open
+    con.execute("UPDATE orders SET exit_sent_at=? WHERE plan_id=?", (int(time.time()) - 601, pid))
+    ex.reconcile(con, client, NOSLEEP, alerts.append)
+    assert close_posts(fake) == 3 and any("failed 3 times" in a for a in alerts)   # then it hands over to you
+    fake.stop()
+
+
+def test_existing_positions_use_their_own_inr_rate():
+    pos = [dict(id="a", quantity="100", entry_price="1", entry_hedge_rate="130", stoploss=dict(price="0.8"))]
+    # 100 x 1 x 130 = Rs 13,000 at a 20% stop = Rs 2,600 > 15% of 5,000, even though today's rate says 102
+    assert "all stops" in ex.over_loss_budget(pos, {"a"}, 102, 5000, 0, 1, 1)
+    assert ex.pos_rate(dict(entry_hedge_rate=""), 102) == 102
+
+
+def test_execution_lease_is_fenced():
+    tmp, fake, client, con = setup()
+    pid = plan(con, ["XRP"])
+    assert ex.claim(con, pid, "t") is None
+    assert not ex.take_lease(con, pid)                         # live lease: reconcile cannot take it
+    con.execute("UPDATE plans SET lease_until=? WHERE id=?", (int(time.time()) - 1, pid))
+    mine = ex.LEASES.pop(pid)
+    assert ex.take_lease(con, pid)                             # expired: another process takes over
+    ex.LEASES[pid] = mine                                      # ... while the old run thinks it still owns it
+    try:
+        ex.renew(con, pid)
+        raise AssertionError("old run kept going")
+    except ex.LeaseLost:
+        pass                                                   # the old run stops instead of racing
+    fake.stop()
+
+
+def test_legacy_baseline_marked_untrusted_on_upgrade():
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "old.db")
+    con = ex.db(path)
+    con.execute("INSERT INTO owned(position_id, coin, client_order_id, opened_at) VALUES('p','XRP','s1-a',1)")
+    con.execute("INSERT INTO ledger(day, start_equity, trusted) VALUES(?, 5000, 1)", (ex.ist_day(),))
+    con.execute("DELETE FROM kv WHERE key='ledger_v2'")        # as if written by the old version
+    con = ex.db(path)
+    assert con.execute("SELECT trusted FROM ledger WHERE day=?", (ex.ist_day(),)).fetchone()[0] == 0
 
 
 def test_daily_baseline_from_midnight_mark_or_blocked():
