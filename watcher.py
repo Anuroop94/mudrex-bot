@@ -218,7 +218,7 @@ def check(st, client=None, con=None, make_plan=None):
         if st.get("pnl_unknown_warned") != ist_str("%Y-%m-%d"):
             st["pnl_unknown_warned"] = ist_str("%Y-%m-%d")
             notify(f"Bot P&L not confirmed yet ({pnl_unknown}): new entries are blocked until Mudrex shows it.")
-    caps = ex.caps_state(con, bot_eq, ex.unrealized_inr(con, positions, rate))
+    caps = ex.caps_state(con, bot_eq, ex.unrealized_inr(con, positions, rate), trusted=pnl_unknown is None)
 
     verified = {r["position_id"]: r["stop_price"] for r in con.execute(
         "SELECT position_id, stop_price FROM orders WHERE action='OPEN' AND stop_price IS NOT NULL")}

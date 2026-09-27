@@ -694,11 +694,100 @@ def test_crashed_approved_close_is_finished_by_reconcile():
     fake.stop()
 
 
+def _one_verified_xrp():
+    tmp, fake, client, con = setup()
+    assert ex.execute(con, client, plan(con, ["XRP"]), "t", NOSLEEP)[0] == "COMPLETE"
+    return tmp, fake, client, con, next(iter(ex.owned_ids(con)))
+
+
+def _close_plan(con, pos_id):
+    return ex.record_plan(con, "d", [dict(coin="XRP", action="CLOSE", position_id=pos_id)], {})
+
+
+def test_no_second_close_while_another_close_is_unresolved():
+    tmp, fake, client, con, xrp = _one_verified_xrp()
+    first = _close_plan(con, xrp)
+    fake.faults["close"] = ["timeout"] * 20                          # first close: outcome unknown
+    ex.execute(con, client, first, "t", NOSLEEP)
+    assert states(con, first)["XRP"][0] == "RECONCILE_REQUIRED" and close_posts(fake) == 1
+    second = _close_plan(con, xrp)
+    ex.execute(con, client, second, "t", NOSLEEP)
+    assert close_posts(fake) == 1 and "still unresolved" in states(con, second)["XRP"][1]
+    fake.stop()
+
+
+def test_approved_close_refused_if_position_changed():
+    tmp, fake, client, con, xrp = _one_verified_xrp()
+    fake.positions[0]["quantity"] = "99"                             # you added to it in the app
+    pid = _close_plan(con, xrp)
+    alerts = []
+    ex.execute(con, client, pid, "t", NOSLEEP, alerts.append)
+    assert close_posts(fake) == 0 and "position changed" in states(con, pid)["XRP"][1]
+    assert any("close NOT sent" in a for a in alerts)
+    fake.stop()
+
+
+def test_crash_before_approved_close_was_sent_is_finished_and_respects_stop():
+    tmp, fake, client, con, xrp = _one_verified_xrp()
+    pid = _close_plan(con, xrp)
+    _simulate_crash(con, pid, "PLANNED")                              # approved, crashed before sending
+    open(ex.STOP_PATH, "w").close()
+    ex.reconcile(con, client, NOSLEEP)
+    assert close_posts(fake) == 0 and "paused" in states(con, pid)["XRP"][1]   # human close obeys STOP
+    os.remove(ex.STOP_PATH)
+    ex.reconcile(con, client, NOSLEEP)
+    assert close_posts(fake) == 1
+    ex.reconcile(con, client, NOSLEEP)
+    assert states(con, pid)["XRP"][0] == "VERIFIED" and not fake.positions
+    fake.stop()
+
+
+def test_estimated_equity_never_becomes_a_trusted_baseline():
+    tmp, fake, client, con = setup()
+    D, off = 86400, ex.config.IST_OFFSET
+    midnight = (int(time.time()) + off) // D * D - off + D
+    con.execute("INSERT INTO owned(position_id, coin, client_order_id, opened_at) VALUES('p','XRP','s1-z',1)")
+    ex.caps_state(con, 6000, 0, now=midnight - 300, trusted=False)   # P&L unconfirmed: an estimate
+    assert not ex.caps_state(con, 5000, 0, now=midnight + 3600)["baseline_ok"]
+    fake.stop()
+
+
+def test_held_position_without_inr_rate_blocks_entries():
+    tmp, fake, client, con, xrp = _one_verified_xrp()
+    fake.positions[0]["entry_hedge_rate"] = ""
+    pid = plan(con, ["ADA"])
+    ex.execute(con, client, pid, "t", NOSLEEP)
+    assert "rate unknown" in states(con, pid)["ADA"][1] and len(fake.positions) == 1
+    fake.stop()
+
+
+def test_price_rechecked_before_a_resend_after_423():
+    tmp, fake, client, con = setup()
+    fake.faults["order"] = ["423"]
+    moved = lambda s: fake.prices.__setitem__("XRP", PRICES["XRP"] * 1.05)   # price jumps during the back-off
+    pid = plan(con, ["XRP"])
+    ex.execute(con, client, pid, "t", moved)
+    st = states(con, pid)["XRP"]
+    assert st[0] == "FAILED" and "drifted" in st[1] and not fake.positions, st
+    fake.stop()
+
+
+def test_position_missing_from_one_snapshot_is_reopened():
+    tmp, fake, client, con, xrp = _one_verified_xrp()
+    con.execute("UPDATE owned SET closed_at=? WHERE position_id=?", (int(time.time()), xrp))   # a bad snapshot
+    ex.sync_owned(con, client, client.positions())
+    assert xrp in ex.owned_ids(con)                                   # back to bot-owned and monitored
+    fake.stop()
+
+
 def test_existing_positions_use_their_own_inr_rate():
-    pos = [dict(id="a", quantity="100", entry_price="1", entry_hedge_rate="130", stoploss=dict(price="0.8"))]
+    pos = [dict(id="a", symbol="XRPUSDT", quantity="100", entry_price="1", entry_hedge_rate="130",
+                stoploss=dict(price="0.8"))]
     # 100 x 1 x 130 = Rs 13,000 at a 20% stop = Rs 2,600 > 21% of 5,000, even though today's rate says 102
     assert "all stops" in ex.over_loss_budget(pos, {"a"}, 102, 5000, 0, 1, 1)
-    assert ex.pos_rate(dict(entry_hedge_rate=""), 102) == 102
+    assert ex.pos_rate(dict(entry_hedge_rate=""), 102) is None           # unknown rate is never guessed
+    no_rate = [dict(pos[0], entry_hedge_rate="")]
+    assert "rate unknown" in ex.over_loss_budget(no_rate, {"a"}, 102, 5000, 0, 1, 1)   # fails closed
 
 
 def test_execution_lease_is_fenced():

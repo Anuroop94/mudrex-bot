@@ -121,7 +121,8 @@ def plan(client=None, con=None):
         bot_eq = ex.bot_equity(con, client, positions, rate or config.INR_PER_USDT)
     except ex.PnlUnknown as e:
         bot_eq, pnl_unknown = float(s1.CAPITAL_CAP_INR), str(e)
-    caps = ex.caps_state(con, bot_eq, ex.unrealized_inr(con, positions, rate or config.INR_PER_USDT))
+    caps = ex.caps_state(con, bot_eq, ex.unrealized_inr(con, positions, rate or config.INR_PER_USDT),
+                         trusted=pnl_unknown is None)
     targets = s1.targets(ctx, closes, last_closed, s1.sizing_equity(bot_eq), specs, btc)
     for c in s1.BASKET:
         if targets.get(c, 0) <= 0:
