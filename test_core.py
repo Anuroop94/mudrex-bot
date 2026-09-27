@@ -496,7 +496,8 @@ def test_telegram_approval_security():
     saved = {k: os.environ.get(k) for k in ("TELEGRAM_CHAT_ID", "TELEGRAM_USER_ID")}
     os.environ.update(TELEGRAM_CHAT_ID="111", TELEGRAM_USER_ID="222")
     ran, sent = [], []
-    orig, orig_db = (tg.answer, tg.edit, tg.send), ex.DB_PATH
+    orig, orig_db, orig_log = (tg.answer, tg.edit, tg.send), ex.DB_PATH, approver.LOG_PATH
+    approver.LOG_PATH = os.path.join(tmp, "approver.log")                   # never write the real log
     tg.answer = lambda *a: sent.append(a)
     tg.edit = lambda *a: sent.append(a)
     tg.send = lambda *a, **k: sent.append(a)
@@ -538,7 +539,7 @@ def test_telegram_approval_security():
         assert tap(111, 222, data=f"approve:{cap}", runner=expired) == "cap expired"
         assert replans == [1, 1]                                   # an expired Close-all never becomes a buy plan
     finally:
-        ex.DB_PATH = orig_db
+        ex.DB_PATH, approver.LOG_PATH = orig_db, orig_log
         tg.answer, tg.edit, tg.send = orig
         for k, v in saved.items():
             if v is None:
