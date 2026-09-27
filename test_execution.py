@@ -534,14 +534,14 @@ def test_loss_budgets_per_trade_and_total():
     wide = ex.record_plan(con, "d", [dict(coin="XRP", action="OPEN", planned_price=1.5, notional_inr=2000,
                                           atr=0.1)], {})                     # stop 0.3 below: 20% x Rs 2000 = Rs 400
     ex.execute(con, client, wide, "t", NOSLEEP)
-    assert "loss budget" in states(con, wide)["XRP"][1] and fake.submits == 0   # > 6% of Rs 5,000
-    for c in ["XRP", "ADA", "DOGE", "LINK", "AVAX"]:                        # each ~Rs 970 at 18% stop = ~Rs 175
-        pid = ex.record_plan(con, "d", [dict(coin=c, action="OPEN", planned_price=PRICES[c], notional_inr=1000,
+    assert "loss budget" in states(con, wide)["XRP"][1] and fake.submits == 0   # > 7% of Rs 5,000
+    for c in ["XRP", "ADA", "DOGE", "LINK", "AVAX", "TRX"]:                 # each ~Rs 1,070 at 18% stop = ~Rs 192
+        pid = ex.record_plan(con, "d", [dict(coin=c, action="OPEN", planned_price=PRICES[c], notional_inr=1100,
                                              atr=PRICES[c] * 0.06)], {})
         ex.execute(con, client, pid, "t", NOSLEEP)
     last = states(con, pid)[c]
-    assert last[0] == "FAILED" and "all stops" in last[1], last             # 5th would pass 15% of Rs 5,000
-    assert len(fake.positions) == 4
+    assert last[0] == "FAILED" and "all stops" in last[1], last             # 6th would pass 21% of Rs 5,000
+    assert len(fake.positions) == 5
     fake.stop()
 
 
@@ -696,7 +696,7 @@ def test_crashed_approved_close_is_finished_by_reconcile():
 
 def test_existing_positions_use_their_own_inr_rate():
     pos = [dict(id="a", quantity="100", entry_price="1", entry_hedge_rate="130", stoploss=dict(price="0.8"))]
-    # 100 x 1 x 130 = Rs 13,000 at a 20% stop = Rs 2,600 > 15% of 5,000, even though today's rate says 102
+    # 100 x 1 x 130 = Rs 13,000 at a 20% stop = Rs 2,600 > 21% of 5,000, even though today's rate says 102
     assert "all stops" in ex.over_loss_budget(pos, {"a"}, 102, 5000, 0, 1, 1)
     assert ex.pos_rate(dict(entry_hedge_rate=""), 102) == 102
 

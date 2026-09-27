@@ -251,7 +251,7 @@ def test_live_build_orders_safety():
     # sized on the Rs 5,000 allocation even though bot equity says Rs 20,000: 0.2 * 2x * 5000 = Rs 2000
     assert o["XRP"]["action"] == "OPEN" and o["XRP"]["notional_inr"] == 2000
     assert abs(o["XRP"]["est_stop"] - 1.44) < 1e-9                  # 3x ATR (final stop re-anchored to the fill)
-    # a stop 20% away on Rs 2,000 risks Rs 400 > 6% of Rs 5,000: skipped at planning
+    # a stop 20% away on Rs 2,000 risks Rs 400 > 7% of Rs 5,000: skipped at planning
     o = {x["coin"]: x for x in lt.build_orders(targets, {}, set(), prices, {c: 0.1 for c in s1.BASKET}, specs,
                                                5000, {}, None, 102)}
     assert o["XRP"]["action"] == "SKIP" and "loss budget" in o["XRP"]["reason"]

@@ -215,8 +215,8 @@ def run(D, **over):
             cash -= fee_in
             pos[c] = dict(qty=qty, entry=entry, sl=px - P["sl_atr"] * atr, risk_px=P["sl_atr"] * atr, t=t_fill,
                           fee_in=fee_in, funding=0.0)
-            risk_log.append((qty * P["sl_atr"] * atr * RATE / plan_eq,
-                             sum(p["qty"] * p["risk_px"] * RATE for p in pos.values()) / plan_eq))
+            risk_log.append((qty * P["sl_atr"] * atr * RATE / size_eq,     # as the live check sees it (Rs 5,000 base)
+                             sum(p["qty"] * p["risk_px"] * RATE for p in pos.values()) / size_eq))
 
         # ---- rest of the day's price path: hourly stops + funding (daily bar fallback)
         if use_h:

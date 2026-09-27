@@ -24,10 +24,12 @@ DAILY_CAP_PCT = 0.05     # user rule: daily profit cap AND loss cap = 5% of the 
 
 
 # Hard loss budgets (safety nets, not sizing rules): money lost if stops fill exactly at their level, as a share of
-# bot equity. Set just above the worst seen in s1_audit.py (per trade 5.5%, all open positions 14.8%), so they
-# never changed a historical trade; they stop anything unusual. Gaps through a stop can still lose more.
-MAX_TRADE_STOP_RISK = 0.06
-MAX_TOTAL_STOP_RISK = 0.15
+# bot equity. Set just above the worst seen in s1_audit.py measured on the Rs 5,000 sizing base (per trade 6.7%,
+# all open positions 20.2%), so they never changed a historical trade; they stop anything unusual. (The first
+# figures, 6% / 15%, were measured on grown equity and would have blocked normal S1 baskets.) Gaps through a stop
+# can still lose more.
+MAX_TRADE_STOP_RISK = 0.07
+MAX_TOTAL_STOP_RISK = 0.21
 
 
 def stop_risk_inr(notional_inr, entry, stop):
