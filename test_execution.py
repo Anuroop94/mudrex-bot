@@ -836,6 +836,34 @@ def test_exit_fence_claim_is_atomic():
     fake.stop()
 
 
+def test_a_finished_exit_still_fences_a_second_close():
+    tmp, fake, client, con, xrp = _one_verified_xrp()
+    a = _close_plan(con, xrp)
+    row_a = con.execute("SELECT * FROM orders WHERE plan_id=?", (a,)).fetchone()
+    con.execute("UPDATE plans SET state='APPROVED' WHERE id=?", (a,))
+    assert ex.claim_exit(con, row_a) is None
+    con.execute("UPDATE orders SET state='VERIFIED' WHERE id=?", (row_a["id"],))   # A finished its close
+    b = ex.record_plan(con, "d2", [dict(coin="XRP", action="CLOSE", position_id=xrp)], {"reason": "cap"})
+    row_b = con.execute("SELECT * FROM orders WHERE plan_id=?", (b,)).fetchone()
+    assert "still closing" in ex.claim_exit(con, row_b)             # B still cannot send a second close
+    con.execute("UPDATE orders SET exit_sent_at=? WHERE id=?", (int(time.time()) - 601, row_a["id"]))
+    con.execute("UPDATE owned SET closed_at=? WHERE position_id=?", (int(time.time()), xrp))
+    assert "already recorded as closed" in ex.claim_exit(con, row_b)
+    fake.stop()
+
+
+def test_vanished_position_is_not_closed_in_the_books_without_history():
+    tmp, fake, client, con, xrp = _one_verified_xrp()
+    fake.positions.pop()                                            # not visible, not in history
+    try:
+        ex.bot_equity(con, client, client.positions(), 102)
+        raise AssertionError("equity should be unknown")
+    except ex.PnlUnknown:
+        pass                                                        # entries blocked, position still bot-owned
+    assert con.execute("SELECT closed_at FROM owned WHERE position_id=?", (xrp,)).fetchone()[0] is None
+    fake.stop()
+
+
 def test_position_missing_from_one_snapshot_is_reopened():
     tmp, fake, client, con, xrp = _one_verified_xrp()
     con.execute("UPDATE owned SET closed_at=? WHERE position_id=?", (int(time.time()), xrp))   # a bad snapshot

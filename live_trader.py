@@ -103,10 +103,14 @@ def plan(client=None, con=None):
     positions = client.positions()
     owned_ids = ex.owned_ids(con)
     st = read_state()
-    for r in con.execute("SELECT position_id, coin FROM owned WHERE closed_at IS NULL").fetchall():
-        if r["position_id"] not in {p["id"] for p in positions}:      # gone without our CLOSE => stop hit
-            con.execute("UPDATE owned SET closed_at=? WHERE position_id=?", (now, r["position_id"]))
-            st["armed"][r["coin"]] = False
+    gone = [r for r in con.execute("SELECT position_id, coin FROM owned WHERE closed_at IS NULL").fetchall()
+            if r["position_id"] not in {p["id"] for p in positions}]
+    if gone:                                   # closed without our CLOSE => stop hit, but only if Mudrex confirms
+        closed = {p.get("id") for p in client.history("positions")[0]}
+        for r in gone:
+            if r["position_id"] in closed:
+                con.execute("UPDATE owned SET closed_at=? WHERE position_id=?", (now, r["position_id"]))
+                st["armed"][r["coin"]] = False
     owned = {p["symbol"].removesuffix("USDT"): p["id"] for p in positions if p["id"] in owned_ids}
     manual = {p["symbol"].removesuffix("USDT") for p in positions if p["id"] not in owned_ids}
     rate = ex.hedge_rate(client, positions)

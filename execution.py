@@ -304,8 +304,9 @@ def recover_ownership(con, client):
 
 
 def sync_owned(con, client, positions):
-    """Mark bot positions that disappeared as closed and fill in their realized P&L from history.
-    Returns the number of closed bot positions whose P&L is still unknown."""
+    """Mark bot positions closed ONLY when Mudrex closed-position history lists them, and fill in realized P&L.
+    Returns how many bot positions have unknown P&L: closed without P&L yet, or vanished but not confirmed
+    closed (either way bot equity is unknown and entries are blocked)."""
     open_ids = {p["id"] for p in positions}
     now = int(time.time())
     # a position marked closed from one incomplete snapshot that shows up again (P&L never confirmed) is reopened,
@@ -314,18 +315,26 @@ def sync_owned(con, client, positions):
                          ).fetchall():
         if r["position_id"] in open_ids:
             con.execute("UPDATE owned SET closed_at=NULL WHERE position_id=?", (r["position_id"],))
-    for r in con.execute("SELECT position_id FROM owned WHERE closed_at IS NULL").fetchall():
-        if r["position_id"] not in open_ids:
-            con.execute("UPDATE owned SET closed_at=? WHERE position_id=?", (now, r["position_id"]))
+    absent = [r["position_id"] for r in con.execute("SELECT position_id FROM owned WHERE closed_at IS NULL")
+              if r["position_id"] not in open_ids]
     missing = con.execute("SELECT position_id FROM owned WHERE closed_at IS NOT NULL AND realized_pnl IS NULL"
                           ).fetchall()
-    if missing:
+    unconfirmed = 0
+    if absent or missing:
         hist = {p["id"]: p for p in client.history("positions")[0]}
+        for pid in absent:                     # closed only when Mudrex history lists it; else still unknown
+            if pid in hist:
+                con.execute("UPDATE owned SET closed_at=? WHERE position_id=?", (now, pid))
+            else:
+                unconfirmed += 1
+        missing = con.execute("SELECT position_id FROM owned WHERE closed_at IS NOT NULL AND realized_pnl IS NULL"
+                              ).fetchall()
         for r in missing:
             p = hist.get(r["position_id"])
             if p is not None and p.get("pnl") is not None:
                 con.execute("UPDATE owned SET realized_pnl=? WHERE position_id=?", (float(p["pnl"]), r["position_id"]))
-    return con.execute("SELECT COUNT(*) FROM owned WHERE closed_at IS NOT NULL AND realized_pnl IS NULL").fetchone()[0]
+    return unconfirmed + con.execute("SELECT COUNT(*) FROM owned WHERE closed_at IS NOT NULL AND realized_pnl IS NULL"
+                                     ).fetchone()[0]
 
 
 def unrealized_inr(con, positions, rate):
@@ -690,9 +699,11 @@ def position_state(client, pid):
 def exit_in_flight(con, pid, exclude_id):
     """Another order (an automatic exit or an approved close) may still be closing this position: it sent a close
     less than EXIT_RETRY_AFTER ago and is not finished, or it is an approved close about to be sent."""
+    # ANY close sent in the last EXIT_RETRY_AFTER counts, even if that order already finished (a finished exit
+    # must still fence off a second close); plus an approved close that is about to be sent
     r = con.execute("SELECT o.plan_id, o.action FROM orders o JOIN plans p ON p.id=o.plan_id WHERE o.position_id=? "
-                    "AND o.id<>? AND o.state NOT IN ('VERIFIED','FAILED') AND (o.exit_sent_at > ? OR "
-                    "(o.action='CLOSE' AND o.state='PLANNED' AND p.state IN ('APPROVED','EXECUTING')))",
+                    "AND o.id<>? AND (o.exit_sent_at > ? OR (o.action='CLOSE' AND o.state='PLANNED' AND "
+                    "p.state IN ('APPROVED','EXECUTING')))",
                     (pid, exclude_id, int(time.time()) - EXIT_RETRY_AFTER)).fetchone()
     return (f"another {'automatic exit' if r['action'] == 'OPEN' else 'close'} (plan {r['plan_id']}) is still "
             f"closing this position") if r else None
@@ -711,6 +722,9 @@ def claim_exit(con, row, state=None):
     con.execute("BEGIN IMMEDIATE")
     try:
         busy = exit_in_flight(con, row["position_id"], row["id"])
+        if not busy and con.execute("SELECT 1 FROM owned WHERE position_id=? AND closed_at IS NOT NULL",
+                                    (row["position_id"],)).fetchone():
+            busy = "position already recorded as closed"
         if busy:
             con.execute("ROLLBACK")
             return busy
