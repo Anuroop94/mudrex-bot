@@ -55,6 +55,11 @@ Real read-only check: builds today's plan correctly and refuses to trade while l
 5. Each morning ~05:35 IST: Telegram sends the plan. Tap **Approve** within 15 minutes, or ignore it.
 6. Emergency: send `/stop` in Telegram (or `python ops.py stop` on the PC). Your exchange stop-losses stay on.
 
+## PC not shut down
+You asked me to shut the PC down when done. At 1:45 AM **Freebuff was still running** (9 Freebuff processes,
+building your dashboard), so I did NOT shut down: it would have lost its work. The watcher and paper trading
+kept running. The keep-awake helper stops at 4 AM, after which Windows may sleep on its own schedule.
+
 ## Still open (not blockers)
 - New dashboard (Freebuff/Lovable): wire it to the bot when you share it.
 - Paper trading keeps running daily; S1 and 5 challengers are compared automatically.
