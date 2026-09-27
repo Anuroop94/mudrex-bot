@@ -3,7 +3,9 @@ both touch in one bar, SL wins. Fees + GST + slippage on every fill; flat worst-
 
 ponytail: liquidation not modelled; at 3x the SL always sits inside the liquidation price.
 ponytail: funding is a flat always-paid rate; real rates flip sign and spike. Use /futures/fee/history live.
-ponytail: drawdown uses realized equity, not mark-to-market; open-trade dips are invisible to it.
+Drawdown is on MARKED equity (every bar's close), so open-trade dips count (fixed 2026-09-27; older reports
+used realized equity and understated drawdowns). state/carry let walk-forward windows hand an open position to
+the next window instead of force-closing it at every window end.
 """
 import config
 import risk
@@ -28,8 +30,9 @@ def _stats(trades, start_equity, equity, curve):
     )
 
 
-def run(candles, ind, p, start, end, equity=config.START_EQUITY, peak=None):
-    """Simulate bars [start, end). Returns stats + trades + final equity/peak/halted."""
+def run(candles, ind, p, start, end, equity=config.START_EQUITY, peak=None, state=None, carry=False):
+    """Simulate bars [start, end). Returns stats + trades + final equity/peak/halted + state (open position and
+    pending decisions). carry=True leaves an open position open at `end` for the next call (walk-forward)."""
     start = max(start, config.WARMUP, 1)
     end = min(end, len(candles))
     start_equity = equity
@@ -38,6 +41,9 @@ def run(candles, ind, p, start, end, equity=config.START_EQUITY, peak=None):
     trades, curve = [], [equity]
     pos, want_entry, want_exit = None, 0, False
     day, day_equity, halted = None, equity, False
+    if state:
+        pos, want_entry, want_exit, day, day_equity = (state[k] for k in
+                                                        ("pos", "want_entry", "want_exit", "day", "day_equity"))
 
     def close(px_raw, t, reason):
         nonlocal equity, peak, pos
@@ -99,19 +105,21 @@ def run(candles, ind, p, start, end, equity=config.START_EQUITY, peak=None):
             else:
                 pos["sl"] = min(pos["sl"], l + trail)
 
-        # 3. decide at close; acted on next bar
-        if i < end - 1:
+        # 3. decide at close; acted on next bar (on the next call's first bar when carrying)
+        if i < end - 1 or carry:
             sig = strategy.signal(ind, i)
             if pos and strategy.exit_signal(ind, i, pos["side"]):
                 want_exit = True
             if sig and (pos is None or want_exit):
                 want_entry = sig
+        curve.append(equity + (pos["side"] * (candles[i][4] - pos["entry"]) * pos["qty"] if pos else 0))
 
-    if pos:
+    if pos and not carry:
         close(candles[end - 1][4], candles[end - 1][0], "end")
 
     r = _stats(trades, start_equity, equity, curve)
-    r.update(equity=equity, peak=peak, halted=halted, trade_list=trades)
+    r.update(equity=equity, peak=peak, halted=halted, trade_list=trades, curve=curve,
+             state=dict(pos=pos, want_entry=want_entry, want_exit=want_exit, day=day, day_equity=day_equity))
     return r
 
 

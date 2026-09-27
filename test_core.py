@@ -99,6 +99,24 @@ def test_trailing_stop_ratchets():
     assert t["pnl"] > 0  # trailed stop locked in profit
 
 
+def test_backtest_carry_equals_one_continuous_run_and_marks_drawdown():
+    c = random_walk(3000, seed=4)
+    p = {**P, "entry": "breakout", "adx_min": 0, "trend": 0}
+    ind = strategy.indicators(c, p)
+    whole = backtest.run(c, ind, p, 0, 3000)
+    assert whole["trades"] >= 3
+    a = backtest.run(c, ind, p, 0, 1500, carry=True)
+    b = backtest.run(c, ind, p, 1500, 3000, a["equity"], a["peak"], state=a["state"])
+    assert [t["entry_time"] for t in a["trade_list"] + b["trade_list"]] == [t["entry_time"] for t in whole["trade_list"]]
+    assert math.isclose(b["equity"], whole["equity"])
+    # marked drawdown: a long that dips 5% and recovers shows a drawdown even though it closes flat
+    n = W + 10
+    fc = flat(n)
+    fc[W + 2] = [fc[W + 2][0], 100.0, 100.5, 94.0, 95.0, 1.0]
+    r = backtest.run(fc, forced_long_ind(n, W), {**P, "rr": 0, "sl_atr": 50}, 0, n)
+    assert r["max_dd"] > 0.001
+
+
 def test_size():
     # 1% of 1000 = 10 risk / 2 stop = 5 qty, leverage cap 1000*3/100 = 30 -> 5
     assert risk.size(1000, 100, 98) == 5.0
@@ -259,6 +277,47 @@ def test_btc_mood_fails_closed_on_missing_data():
     gap = up[:280] + up[281:]                                         # a missing day inside the 200-day window
     assert s1.btc_mood(gap, 299 * D) is None
     assert s1.entries_only_for_held({"XRP": 0.1, "ADA": 0.1}, {"ADA": {}}) == {"ADA": 0.1}
+
+
+def test_live_orders_identical_at_any_equity_above_the_cap():
+    """Rounding and sizing use the same capped equity: a profitable bot must not shrink orders below minimum."""
+    import live_trader as lt
+    import s1
+    specs = {c: dict(step=0.1, min_qty=0.1, min_notional=5.0) for c in s1.BASKET}
+    closes = {c: {0: 1.5} for c in s1.BASKET}
+    ctx = dict(sig={c: {0: s} for c, s in zip(s1.BASKET, (0.2, 0.3, 0.4, 0.6, 0.8, 1.0))})
+    books = []
+    for eq in (5000, 7500, 10000, 20000):
+        t = s1.targets(ctx, closes, 0, s1.sizing_equity(eq), specs)
+        books.append(lt.build_orders(t, {}, set(), {c: 1.5 for c in s1.BASKET}, {c: 0.1 for c in s1.BASKET},
+                                     specs, eq, {}, None, 102))
+    assert all(b == books[0] for b in books)
+    assert all(o["action"] == "OPEN" and o["notional_inr"] >= 1000 for o in books[0] if o["coin"] != "XRP")
+
+
+def test_paper_mood_gate_two_close_reentry():
+    import paper_s1
+    D = 86400
+    closes = [100.0 + i for i in range(250)] + [50.0] + [400.0, 400.0]      # up, one crash day, recovery
+    btc = [[i * D, 0, 0, 0, x, 0] for i, x in enumerate(closes)]
+    st = dict(S=dict(pos={}))
+    seq = [paper_s1.mood_gate(st, btc, d * D, "two") for d in (249, 250, 251, 252)]
+    assert seq == [True, False, False, True]                               # 2nd close above re-enables
+    assert [paper_s1.mood_gate({}, btc, d * D, True) for d in (250, 251)] == [False, True]
+    assert paper_s1.gated(dict(S=dict(pos={"ADA": {}})), {"XRP": 0.1, "ADA": 0.1}, btc, 999 * D, True) == {"ADA": 0.1}
+
+
+def test_paper_promotion_needs_two_monthly_reviews():
+    import tempfile
+    import paper_s1
+    assert paper_s1.PROMOTE_T > 2.0                                    # Bonferroni-corrected, stricter than 2
+    assert paper_s1.weekly_t([0.001] * 14) == 0.0                      # no variation: no evidence
+    path = os.path.join(tempfile.mkdtemp(), "promo.json")
+    rows = [dict(name="S1-x", promote=True)]
+    oct1, oct2, nov1 = 1790812800, 1790899200, 1793491200             # 2026-10-01, 2026-10-02, 2026-11-01 UTC
+    assert paper_s1.monthly_review(oct2, rows, path) == []           # not a review day
+    assert paper_s1.monthly_review(oct1, rows, path) == []           # first pass: quarantine
+    assert paper_s1.monthly_review(nov1, rows, path) == ["S1-x"]     # second review in a row: reported
 
 
 def test_live_execute_requires_yes():

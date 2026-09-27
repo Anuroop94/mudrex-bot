@@ -64,18 +64,20 @@ def setups(coin, c):
                  hour_cos=math.cos(2 * math.pi * ((t + IST) % 86400) / 86400))
         entry = o[i + 1]
         stop, target = entry - SL_ATR * atr[i], entry + RR * SL_ATR * atr[i]
-        exit_px, exit_i = cl[i + MAX_HOLD], i + MAX_HOLD
+        exit_px, exit_i, hit = cl[i + MAX_HOLD], i + MAX_HOLD, False
         for j in range(i + 1, i + 1 + MAX_HOLD):
             if l[j] <= stop:
                 exit_px, exit_i = min(o[j], stop), j
                 break
             if h[j] >= target:
-                exit_px, exit_i = target, j
+                exit_px, exit_i, hit = target, j, True
                 break
         risk = (entry - stop) / entry
-        ret = exit_px / entry - 1 - cost
+        held_days = (exit_i - i) / 24
+        ret = exit_px / entry - 1 - cost - config.FUNDING_PER_DAY * held_days
+        # label = what the docstring promises: target reached before the stop (not merely "net positive")
         out.append(dict(coin=coin, t=t, i=i, entry=entry, stop=stop, target=target, exit_t=c[exit_i][0],
-                        path=None, ret=ret, R=ret / risk, risk=risk, y=int(ret > 0), f=f))
+                        path=None, ret=ret, R=ret / risk, risk=risk, y=int(hit), f=f))
     return out
 
 
@@ -124,18 +126,22 @@ def score_walk_forward(all_setups, min_train_days=365):
             r["p"], r["cut"] = float(p), cut
 
 
-def simulate(all_setups, hourly, equity_inr=5000.0, use_model=True, start=None, end=None):
-    """Portfolio simulation with the day rules. hourly: {coin: {t: (o,h,l,c)}} for marking and cap exits."""
+def simulate(all_setups, hourly, equity_inr=5000.0, use_model=True, start=None, end=None, specs=None):
+    """Portfolio simulation with the day rules. hourly: {coin: {t: (o,h,l,c)}} for marking and cap exits.
+    A setup found at hour t ENTERS at hour t+1's open and is booked on that hour's IST day. Funding is charged
+    hourly on marked notional; exposure uses marked notional; everything open at `end` is closed there, so a
+    development run never borrows hold-out prices. specs: {coin: min_notional, min_qty} (default: Rs 510 minimum)."""
     eq = 1.0
     by_hour = {}
     for r in all_setups:
-        if (start is None or r["t"] >= start) and (end is None or r["t"] < end) and (not use_model or r["p"] is not None):
-            by_hour.setdefault(r["t"], []).append(r)
+        if (start is None or r["t"] >= start) and (end is None or r["t"] + H < end) and (not use_model or r["p"] is not None):
+            by_hour.setdefault(r["t"] + H, []).append(r)                 # keyed by ENTRY hour
     if not by_hour:
         return None
     t0, t1 = min(by_hour), max(by_hour)
-    hours = range(t0, t1 + MAX_HOLD * H, H)
-    cost1 = pf.cost_per_turnover()
+    stop_t = min(t1 + MAX_HOLD * H, end) if end else t1 + MAX_HOLD * H
+    hours = range(t0, stop_t, H)
+    cost1, fund1 = pf.cost_per_turnover(), config.FUNDING_PER_DAY / 24
     open_pos, day, day_start_eq, taken, stopped, days_log, trades = [], None, eq, 0, False, [], []
     mark = lambda pos, t: hourly[pos["coin"]].get(t)
     for t in hours:
@@ -144,7 +150,31 @@ def simulate(all_setups, hourly, equity_inr=5000.0, use_model=True, start=None, 
             if day is not None:
                 days_log.append(dict(day=day, trades=taken, pnl=eq / day_start_eq - 1, capped=stopped))
             day, day_start_eq, taken, stopped = d, eq, 0, False
-        # manage open positions on this bar
+        # entries at this hour's open (setups found at the previous hour's close)
+        if not stopped and taken < MAX_TRADES and t in by_hour:
+            hour_ist = ((t + IST) % 86400) // H
+            for r in sorted(by_hour[t], key=lambda r: -(r["p"] if use_model else r["f"]["brk_atr"])):
+                if taken >= MAX_TRADES or any(p["coin"] == r["coin"] for p in open_pos):
+                    continue
+                good = (r["p"] >= r["cut"]) if use_model else True
+                if not (good or (hour_ist >= LATE_HOUR and taken < MIN_TRADES)):
+                    continue
+                budget = CAP_PCT - max(0.0, -(eq / day_start_eq - 1))            # loss budget left today
+                risk_frac = min(RISK_PER_TRADE, budget * 0.9)
+                if risk_frac <= 0.002:
+                    break
+                # n = notional in units of STARTING equity (eq is too); exposure on MARKED notional
+                held = sum(p["n"] * p["last"] / p["entry"] for p in open_pos)
+                n = min(risk_frac / r["risk"], LEV - held / eq) * eq
+                s = (specs or {}).get(r["coin"])
+                need = max(s["min_notional"], s["min_qty"] * r["entry"]) * config.INR_PER_USDT if s else 510
+                if n * equity_inr < need:                                      # Mudrex minimum order
+                    continue
+                eq -= n * cost1
+                open_pos.append(dict(coin=r["coin"], n=n, entry=r["entry"], last=r["entry"], stop=r["stop"],
+                                     target=r["target"], deadline=t + MAX_HOLD * H, fund=0.0))
+                taken += 1
+        # manage open positions on this bar (including positions entered at this bar's open)
         still = []
         for p in open_pos:
             bar = mark(p, t)
@@ -152,6 +182,9 @@ def simulate(all_setups, hourly, equity_inr=5000.0, use_model=True, start=None, 
                 still.append(p)
                 continue
             o_, h_, l_, c_ = bar
+            f = p["n"] * p["last"] / p["entry"] * fund1
+            eq -= f
+            p["fund"] += f
             px = None
             if l_ <= p["stop"]:
                 px = min(o_, p["stop"])
@@ -161,7 +194,7 @@ def simulate(all_setups, hourly, equity_inr=5000.0, use_model=True, start=None, 
                 px = c_
             if px is not None:
                 eq += p["n"] * (px / p["last"] - 1) - p["n"] * cost1
-                trades.append(p["n"] * (px / p["entry"] - 1 - 2 * cost1))
+                trades.append(p["n"] * (px / p["entry"] - 1 - 2 * cost1) - p["fund"])
             else:
                 eq += p["n"] * (c_ / p["last"] - 1)
                 p["last"] = c_
@@ -172,31 +205,11 @@ def simulate(all_setups, hourly, equity_inr=5000.0, use_model=True, start=None, 
         if not stopped and (day_pnl >= CAP_PCT or day_pnl <= -CAP_PCT):
             for p in open_pos:
                 eq -= p["n"] * cost1
-                trades.append(p["n"] * (p["last"] / p["entry"] - 1 - 2 * cost1))
+                trades.append(p["n"] * (p["last"] / p["entry"] - 1 - 2 * cost1) - p["fund"])
             open_pos, stopped = [], True
-        if stopped or taken >= MAX_TRADES or t not in by_hour:
-            continue
-        hour_ist = ((t + IST) % 86400) // H
-        cands = sorted(by_hour[t], key=lambda r: -(r["p"] if use_model else r["f"]["brk_atr"]))
-        for r in cands:
-            if taken >= MAX_TRADES or any(p["coin"] == r["coin"] for p in open_pos):
-                continue
-            good = (r["p"] >= r["cut"]) if use_model else True
-            late_fill = hour_ist >= LATE_HOUR and taken < MIN_TRADES
-            if not (good or late_fill):
-                continue
-            budget = CAP_PCT - max(0.0, -(eq / day_start_eq - 1))            # loss budget left today
-            risk_frac = min(RISK_PER_TRADE, budget * 0.9)
-            if risk_frac <= 0.002:
-                break
-            # n = notional in units of STARTING equity (eq is too), so size follows the current account
-            n = min(risk_frac / r["risk"], LEV - sum(p["n"] for p in open_pos) / eq) * eq
-            if n * equity_inr < 510:                                       # Mudrex minimum order
-                continue
-            eq -= n * cost1
-            open_pos.append(dict(coin=r["coin"], n=n, entry=r["entry"], last=r["entry"], stop=r["stop"],
-                                 target=r["target"], deadline=t + MAX_HOLD * H))
-            taken += 1
+    for p in open_pos:                                  # period end: close at the last mark, never peek past it
+        eq -= p["n"] * cost1
+        trades.append(p["n"] * (p["last"] / p["entry"] - 1 - 2 * cost1) - p["fund"])
     days_log.append(dict(day=day, trades=taken, pnl=eq / day_start_eq - 1, capped=stopped))
     daily = [x["pnl"] for x in days_log]
     s = pf.stats(daily)

@@ -4,9 +4,12 @@ Every day after the 05:30 IST close, for each basket coin, 9 Donchian trend "jud
 position = votes x volatility scaling (50% vol target), rounded to what Mudrex accepts. Buy-only. Exits: the
 judges' trailing midpoint (trend exit, next open) or a safety stop-loss on Mudrex at 3x ATR below entry.
 No fixed target. Exposure 2x (Mudrex leverage 2). Capital capped at Rs 5,000. Daily profit/loss caps 5% each.
-Market mood: no positions while BTC is below its 200-day average (2026-09-27; backtest +327% / +14.1% hold-out).
-Backtest (Rs 5,000, exact rounding): 2020-25 +277% (31%/yr, max DD 27%, worst day -Rs 757);
-last 12 months +9.8% (max DD 13%). Backtests are not guarantees.
+Market mood: no positions while BTC is below its 200-day average; unknown mood blocks new entries.
+Evidence (s1_audit.py, 2026-09-27; ONE continuous run of these exact live rules with hourly stops, net of all
+costs; data starts May 2021): development May 2021 - Sep 2025 +232% (27.6%/yr, max DD 25%, worst day -Rs 563,
+111 trades, 34% net win rate), Newey-West t 1.79, deflated Sharpe 44%: suggestive, NOT proven. The year after
+(+4.3%) was looked at many times and is descriptive only. Earlier figures (+327%, +277%, +14%, +9.8%) came
+from simulations that did not match these rules and are withdrawn. Backtests are not guarantees.
 """
 import config
 import portfolio as pf
@@ -18,6 +21,13 @@ LEV = 2
 SL_ATR = 3
 CAPITAL_CAP_INR = 5000
 DAILY_CAP_PCT = 0.05     # user rule: daily profit cap AND loss cap = 5% of the day's starting equity (raise to 0.10 later)
+
+
+def sizing_equity(equity_inr):
+    """Equity used BOTH to round weights to Mudrex minimums and to size orders (capped at the allocation).
+    Rounding on the full equity but sizing on the capped one shrank min-size orders below the exchange minimum
+    whenever the bot was in profit (s1_audit.py 2026-09-27: 233 of 337 buy signals lost)."""
+    return min(equity_inr, CAPITAL_CAP_INR)
 
 
 def daily_cap_inr(day_start_equity_inr):

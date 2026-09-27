@@ -60,14 +60,24 @@ def walk(candles, log_path=None):
     first = i = config.WARMUP + n_train
     equity = peak = config.START_EQUITY
     current, rows, trades, halted = config.DEFAULT_PARAMS, [], [], False
+    state, curve = None, [config.START_EQUITY]
 
     while i + n_test <= len(candles) and not halted:
         params, reason, s = choose(candles, cache, i - n_train, i, current)
-        if params:
-            r = backtest.run(candles, strategy.indicators(candles, params, cache), params, i, i + n_test, equity, peak)
-            equity, peak, halted = r["equity"], r["peak"], r["halted"]
+        last = i + 2 * n_test > len(candles)
+        # ponytail: a "sit out" window that inherits an open position runs under the last params and may also
+        # enter; add a no-entries flag to backtest.run if this legacy strategy is ever revived.
+        if params or (state and state["pos"]):          # an open position keeps running under the last params
+            params = params or current
+            # continuous: an open position and pending decisions carry into the next window (like live)
+            r = backtest.run(candles, strategy.indicators(candles, params, cache), params, i, i + n_test, equity,
+                             peak, state=state, carry=not last)
+            equity, peak, halted, state = r["equity"], r["peak"], r["halted"], r["state"]
             trades += r["trade_list"]
+            curve += r["curve"][1:]
             current = params
+        else:
+            state = None
         rows.append(dict(
             window_start=time.strftime("%Y-%m-%d", time.gmtime(candles[i][0])),
             decision=reason, train_score=f"{s:.3f}" if s != NEG else "",
@@ -87,17 +97,9 @@ def walk(candles, log_path=None):
 
     p = config.DEFAULT_PARAMS
     base = backtest.run(candles, strategy.indicators(candles, p, cache), p, first, i)
-    learned = backtest._stats(trades, config.START_EQUITY, equity, [config.START_EQUITY] + _curve(trades))
+    learned = backtest._stats(trades, config.START_EQUITY, equity, curve)      # marked, stitched equity curve
     learned.update(equity=equity, peak=peak, halted=halted, trade_list=trades)
     return learned, base, rows
-
-
-def _curve(trades):
-    e, out = config.START_EQUITY, []
-    for t in trades:
-        e += t["pnl"]
-        out.append(e)
-    return out
 
 
 if __name__ == "__main__":

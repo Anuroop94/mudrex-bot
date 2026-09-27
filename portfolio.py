@@ -207,8 +207,11 @@ def trade_day(S, bars, atrs, coins, x_all, d, d1, d2, sl_atr=0.0, tp_atr=0.0, le
     r = 0.0
 
     def close(c, p, px, reason):
+        """pnl is NET of entry/exit costs and funding (fraction of starting equity at entry)."""
+        costs = p.get("costs", 0.0) + cost * p["w"]
         S["closed"].append(dict(coin=c, side=p["side"], w=p["w"], entry=p["entry"], exit=px, entry_day=p["day"],
-                                exit_day=d1, reason=reason, pnl=p["side"] * (px / p["entry"] - 1) * p["w"]))
+                                exit_day=d1, reason=reason, costs=costs,
+                                pnl=p["side"] * (px / p["entry"] - 1) * p["w"] - costs))
         S["pos"].pop(c)
 
     for c in coins:
@@ -223,7 +226,7 @@ def trade_day(S, bars, atrs, coins, x_all, d, d1, d2, sl_atr=0.0, tp_atr=0.0, le
             p = None
         if pend.get("entry") and not p:
             s = pend["entry"]
-            p = S["pos"][c] = dict(side=s, w=pend["w"], entry=o1, mark=o1, day=d1,
+            p = S["pos"][c] = dict(side=s, w=pend["w"], entry=o1, mark=o1, day=d1, costs=cost * pend["w"],
                                    sl=o1 - s * sl_atr * pend["atr"] if sl_atr else None,
                                    tp=o1 + s * tp_atr * pend["atr"] if tp_atr else None)
             r -= cost * p["w"]
@@ -236,10 +239,12 @@ def trade_day(S, bars, atrs, coins, x_all, d, d1, d2, sl_atr=0.0, tp_atr=0.0, le
             px, why = p["tp"], "target"
         if px is not None:
             r += s * p["w"] * (px / p["mark"] - 1) - cost * p["w"] - fund * p["w"]
+            p["costs"] = p.get("costs", 0.0) + fund * p["w"]
             close(c, p, px, why)
             S["armed"][c] = False
         elif b2:
             r += s * p["w"] * (b2[1] / p["mark"] - 1) - fund * p["w"]
+            p["costs"] = p.get("costs", 0.0) + fund * p["w"]
             p["mark"] = b2[1]
     S["equity"] = max(S["equity"] * (1 + r), 0.0)
     S["low"] = min(S["low"], S["equity"])

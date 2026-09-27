@@ -21,7 +21,8 @@ Backtests are not guarantees. **Every real order needs a human approval** (termi
 
 ## Daily routine
 1. ~05:35 IST the watcher builds the plan and sends it (Telegram + Windows notification).
-2. Review it; approve (terminal or Telegram) within 3 hours, or ignore/Reject it.
+2. Review it; a plan that BUYS must be approved within 15 minutes (prices move). Later, tap Approve anyway (or send
+   `/plan`): nothing trades, you get a fresh plan at current prices to approve. Close-only plans stay valid 3 hours.
 3. `python dashboard.py` -> http://127.0.0.1:8765 for positions, caps, guard, paper leaderboards.
 
 ## Emergency shutdown

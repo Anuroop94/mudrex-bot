@@ -48,7 +48,7 @@ def build_orders(targets, owned, manual_symbols, prices, atrs, specs, size_equit
                  rate):
     """targets: {coin: 1x weight}; owned: {coin: position_id} of bot-owned open positions.
     Returns actions. CLOSE only for bot-owned positions; never plans anything on a symbol with a manual position."""
-    size_eq = min(size_equity_inr, s1.CAPITAL_CAP_INR)
+    size_eq = s1.sizing_equity(size_equity_inr)
     out = []
     for c in s1.BASKET:
         w, px, s = targets.get(c, 0.0), prices[c], specs[c]
@@ -105,7 +105,7 @@ def plan(client=None, con=None):
     except ex.PnlUnknown as e:
         bot_eq, pnl_unknown = float(s1.CAPITAL_CAP_INR), str(e)
     caps = ex.caps_state(con, bot_eq, ex.unrealized_inr(con, positions, rate or config.INR_PER_USDT))
-    targets = s1.targets(ctx, closes, last_closed, bot_eq, specs, btc)
+    targets = s1.targets(ctx, closes, last_closed, s1.sizing_equity(bot_eq), specs, btc)
     for c in s1.BASKET:
         if targets.get(c, 0) <= 0:
             st["armed"][c] = True
