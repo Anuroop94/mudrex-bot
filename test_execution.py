@@ -772,6 +772,14 @@ def test_price_rechecked_before_a_resend_after_423():
     fake.stop()
 
 
+def test_you_can_still_close_a_position_whose_entry_needs_reconciling():
+    tmp, fake, client, con, xrp = _one_verified_xrp()
+    con.execute("UPDATE orders SET state='RECONCILE_REQUIRED' WHERE action='OPEN'")   # e.g. auto-exit gave up
+    pid = _close_plan(con, xrp)
+    assert ex.execute(con, client, pid, "t", NOSLEEP)[0] == "COMPLETE" and not fake.positions
+    fake.stop()
+
+
 def test_position_missing_from_one_snapshot_is_reopened():
     tmp, fake, client, con, xrp = _one_verified_xrp()
     con.execute("UPDATE owned SET closed_at=? WHERE position_id=?", (int(time.time()), xrp))   # a bad snapshot

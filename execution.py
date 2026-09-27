@@ -92,6 +92,8 @@ def db(path=None):
                        ("marks", "trusted INTEGER DEFAULT 1")):
         if col.split()[0] not in {r["name"] for r in con.execute(f"PRAGMA table_info({table})")}:
             con.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
+            if table == "marks":                                       # older marks may have been estimates
+                con.execute("UPDATE marks SET trusted=0")
     if con.execute("SELECT 1 FROM kv WHERE key='ledger_v2'").fetchone() is None:
         # baselines written before equity marks existed are only exact if no bot position was open
         if con.execute("SELECT 1 FROM owned WHERE closed_at IS NULL").fetchone():
@@ -741,13 +743,15 @@ def close_problem(con, pos, row):
         return "position not owned by the bot"
     opener = con.execute("SELECT * FROM orders WHERE client_order_id=? AND action='OPEN'",
                          (own["client_order_id"],)).fetchone()
-    if opener is None or opener["state"] != "VERIFIED":
-        return "its opening order is not verified"
+    if opener is None or not opener["fill_price"] or opener["state"] not in ("VERIFIED", "RECONCILE_REQUIRED"):
+        return "its opening order never confirmed a fill"
     problems = identity_problems(pos, opener)
     if problems:
         return "position changed since it was opened (" + "; ".join(problems) + ")"
-    other = con.execute("SELECT plan_id FROM orders WHERE action='CLOSE' AND position_id=? AND id<>? AND state IN "
-                        "('SUBMITTED','ACCEPTED','RECONCILE_REQUIRED')", (row["position_id"], row["id"])).fetchone()
+    other = con.execute("SELECT o.plan_id FROM orders o JOIN plans p ON p.id=o.plan_id WHERE o.action='CLOSE' "
+                        "AND o.position_id=? AND o.id<>? AND (o.state IN ('SUBMITTED','ACCEPTED','RECONCILE_REQUIRED') "
+                        "OR (o.state='PLANNED' AND p.state IN ('APPROVED','EXECUTING')))",
+                        (row["position_id"], row["id"])).fetchone()
     if other:
         return f"another close (plan {other['plan_id']}) for this position is still unresolved"
     return None
@@ -1069,7 +1073,8 @@ def reconcile(con, client, sleep=time.sleep, alert=None, min_age=0):
 
 def reconcile_plan(con, client, pid, sleep, alert):
     for row in con.execute("SELECT * FROM orders WHERE plan_id=? AND (state IN ('SUBMITTED','ACCEPTED','FILLED',"
-                           "'RECONCILE_REQUIRED') OR (state='PLANNED' AND action='CLOSE'))", (pid,)).fetchall():
+                           "'RECONCILE_REQUIRED') OR (state='PLANNED' AND action='CLOSE')) "
+                           "ORDER BY action='OPEN', seq", (pid,)).fetchall():         # closes first, like execute()
         try:
             renew(con, pid)
             if row["action"] == "OPEN" and "protective exit" in (row["error"] or ""):
