@@ -22,3 +22,9 @@ STOP
 *.db-shm
 
 *_results.txt
+
+# new dashboard UI (mudrex-bot/ui)
+ui/node_modules/
+ui/.output/
+ui/.wrangler/
+ui/dist/
