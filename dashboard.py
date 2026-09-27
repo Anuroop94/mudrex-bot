@@ -254,7 +254,7 @@ def ui():
         for o in porders:
             plan_items.append(dict(tone=tone.get(o["action"], "idle"), label=f"{o['action'].title()} {o['coin']}",
                                    detail=(o["state"] or "").replace("_", " ").lower()
-                                   + (f" · {o['error']}" if o["error"] and o["state"] != "VERIFIED" else ""),
+                                   + (" · not sent" if "halted" in (o["error"] or "") else ""),
                                    count=_rs(o["planned_notional_inr"] or 0)))
         fresh = now - prow["created_at"] < ex.ENTRY_MAX_AGE
         needs = prow["state"] == "PLANNED" and fresh
