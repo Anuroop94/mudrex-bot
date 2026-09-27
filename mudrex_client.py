@@ -90,7 +90,16 @@ class Client:
         return self.get("/v1/futures/funds", {"trade_currency": "INR"})
 
     def positions(self):
-        return self.get("/v1/futures/positions", {"trade_currency": "INR"}) or []
+        """Open INR positions. Live Mudrex omits any mark price, so each gets `mark_price` from the asset's live
+        `price` (one quick GET, no retries). If that lookup fails it stays unset and callers fall back to entry."""
+        ps = self.get("/v1/futures/positions", {"trade_currency": "INR"}) or []
+        for p in ps:
+            if not p.get("mark_price"):
+                try:
+                    p["mark_price"] = (self.get(f"/v1/futures/{p['symbol']}", {"is_symbol": ""}, tries=1) or {}).get("price")
+                except ApiError:
+                    pass
+        return ps
 
     def asset(self, symbol):
         return self.get(f"/v1/futures/{symbol}", {"is_symbol": ""})

@@ -1073,6 +1073,18 @@ def test_client_id_lookup_uses_history_like_live_mudrex():
     fake.stop()
 
 
+def test_open_pnl_uses_live_price_not_entry():
+    """Live Mudrex positions carry no mark price: without the asset price, open P&L (and the daily limit) read 0."""
+    tmp, fake, client, con = setup()
+    pid = plan(con, ["XRP"])
+    assert ex.execute(con, client, pid, "t", NOSLEEP)[0] == "COMPLETE"
+    fake.prices["XRP"] *= 0.9                                     # price falls 10% after the fill
+    ps = client.positions()
+    assert float(ps[0]["mark_price"]) == fake.prices["XRP"]
+    assert ex.unrealized_inr(con, ps, 102.0) < 0
+    fake.stop()
+
+
 def test_reconcile_never_fails_a_young_or_acknowledged_order():
     """History may lag a just-sent order: absence only means 'not placed' after RECONCILE_GRACE, and an order
     with a Mudrex order id is resolved by that id, never called 'not placed'."""
