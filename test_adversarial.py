@@ -170,8 +170,9 @@ def test_close_applied_late_recorded_as_exited_once():
     st = states(con, pid)["XRP"]
     assert st[0] == "RECONCILE_REQUIRED" and "not confirmed" in st[1]
 
-    # Now simulate the close actually succeeding on the exchange
-    fake.positions.clear()
+    # Now simulate the close actually succeeding on the exchange (it also appears in Mudrex's closed history)
+    p = fake.positions.pop()
+    fake.closed.append(dict(id=p["id"], symbol=p["symbol"], status="CLOSED", pnl="0"))
 
     # Reconcile should find the position gone
     ex.reconcile(con, client, NOSLEEP)

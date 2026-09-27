@@ -103,7 +103,7 @@ def test_close_refused_if_another_close_unresolved():
 
     # Second close must be refused
     st = states(con, second)["XRP"]
-    assert st[0] == "FAILED" and "still unresolved" in st[1], st
+    assert st[0] == "FAILED" and "still closing" in st[1], st
     assert close_posts(fake) == 1  # no additional close sent
     fake.stop()
 

@@ -92,8 +92,9 @@ def db(path=None):
                        ("marks", "trusted INTEGER DEFAULT 1")):
         if col.split()[0] not in {r["name"] for r in con.execute(f"PRAGMA table_info({table})")}:
             con.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
-            if table == "marks":                                       # older marks may have been estimates
-                con.execute("UPDATE marks SET trusted=0")
+    if con.execute("SELECT 1 FROM kv WHERE key='marks_v2'").fetchone() is None:
+        con.execute("UPDATE marks SET trusted=0")                  # marks written before 1998532 may be estimates
+        con.execute("INSERT INTO kv(key, value) VALUES('marks_v2', 1)")
     if con.execute("SELECT 1 FROM kv WHERE key='ledger_v2'").fetchone() is None:
         # baselines written before equity marks existed are only exact if no bot position was open
         if con.execute("SELECT 1 FROM owned WHERE closed_at IS NULL").fetchone():
@@ -425,12 +426,14 @@ def gate():
 
 # ---------- order lifecycle
 
-def lookup_until_known(client, cid, sleep, tries=LOOKUP_TRIES):
+def lookup_until_known(client, cid, sleep, tries=LOOKUP_TRIES, con=None, plan_id=None):
     """The order, or None only if EVERY lookup got a definitive 'not found' (404).
     Raises Ambiguous if any lookup failed (timeout/5xx/423): a partly unanswered lookup must never be read as
     'not placed' (the exchange may be slow to show it, or the failing call may have been the one that knew)."""
     failed = 0
     for i in range(tries):
+        if con is not None and plan_id is not None:
+            renew(con, plan_id)                                        # long lookups never outlive our fence
         try:
             o = client.order_by_client_id(cid)
             if o is not None:
@@ -450,7 +453,7 @@ def submit_with_reconcile(con, client, row, send, sleep, alert, fresh=None):
     cid = row["client_order_id"]
     for attempt in range(3):
         if attempt:
-            existing = lookup_until_known(client, cid, sleep, tries=2)
+            existing = lookup_until_known(client, cid, sleep, tries=2, con=con, plan_id=row["plan_id"])
             if existing:
                 set_order(con, row["id"], state="ACCEPTED",
                           exchange_order_id=existing.get("id") or existing.get("order_id"))
@@ -468,17 +471,18 @@ def submit_with_reconcile(con, client, row, send, sleep, alert, fresh=None):
             return resp or {}
         except Rejected as e:
             if e.status == 409:                                        # cid already exists: it was accepted
-                o = lookup_until_known(client, cid, sleep)
+                o = lookup_until_known(client, cid, sleep, con=con, plan_id=row["plan_id"])
                 set_order(con, row["id"], state="ACCEPTED", exchange_order_id=(o or {}).get("id"))
                 return o or {}
             set_order(con, row["id"], state="FAILED", error=f"rejected {e.status}: {e.errors}")
             return None
         except Locked:
             set_order(con, row["id"], state="PLANNED")                 # 423/429: exchange did not take it
+            renew(con, row["plan_id"])
             sleep(min(2 ** attempt, 8))
             continue
         except Ambiguous as e:                                         # UNKNOWN: never resubmit blindly
-            o = lookup_until_known(client, cid, sleep)
+            o = lookup_until_known(client, cid, sleep, con=con, plan_id=row["plan_id"])
             if o:
                 set_order(con, row["id"], state="ACCEPTED", exchange_order_id=o.get("id") or o.get("order_id"))
                 return o
@@ -589,6 +593,7 @@ def verify_entry(con, client, oid, sleep, alert):
         except ApiError as e:
             event(con, "stop", f"{row['coin']}: stop attach/edit error {e}", None)
         for _ in range(3):
+            renew(con, row["plan_id"])
             sleep(1)
             pos = next((p for p in client.positions() if p["id"] == row["position_id"]), None)
             current = float(((pos or {}).get("stoploss") or {}).get("price") or 0)
@@ -672,6 +677,34 @@ def exit_authorized(con, row):
         (row["position_id"], row["client_order_id"])).fetchone() is not None
 
 
+def position_state(client, pid):
+    """('open', position) if Mudrex shows it; ('closed', None) only if it is absent AND listed in Mudrex's closed
+    position history (authoritative); ('unknown', None) otherwise - one incomplete snapshot never ends an exit."""
+    pos = next((p for p in client.positions() if p["id"] == pid), None)
+    if pos is not None:
+        return "open", pos
+    closed = {p.get("id") for p in client.history("positions")[0]}
+    return ("closed" if pid in closed else "unknown"), None
+
+
+def exit_in_flight(con, pid, exclude_id):
+    """Another order (an automatic exit or an approved close) may still be closing this position: it sent a close
+    less than EXIT_RETRY_AFTER ago and is not finished, or it is an approved close about to be sent."""
+    r = con.execute("SELECT o.plan_id, o.action FROM orders o JOIN plans p ON p.id=o.plan_id WHERE o.position_id=? "
+                    "AND o.id<>? AND o.state NOT IN ('VERIFIED','FAILED') AND (o.exit_sent_at > ? OR "
+                    "(o.action='CLOSE' AND o.state='PLANNED' AND p.state IN ('APPROVED','EXECUTING')))",
+                    (pid, exclude_id, int(time.time()) - EXIT_RETRY_AFTER)).fetchone()
+    return (f"another {'automatic exit' if r['action'] == 'OPEN' else 'close'} (plan {r['plan_id']}) is still "
+            f"closing this position") if r else None
+
+
+def exited(con, row, why, alert):
+    con.execute("UPDATE owned SET closed_at=? WHERE position_id=? AND closed_at IS NULL",
+                (int(time.time()), row["position_id"]))
+    set_order(con, row["id"], state="FAILED", error=f"exited automatically: {why}"[:300])
+    event(con, "protect", f"{row['coin']}: protective exit done; position closed.", alert)
+    return True
+
 def protective_close(con, client, row, why, sleep, alert):
     """Exit a bot-owned position whose approved entry could not be protected or broke a limit. Not blocked by
     STOP (it only reduces risk). Order-bound (exit_authorized) and identity re-validated right before every
@@ -683,8 +716,11 @@ def protective_close(con, client, row, why, sleep, alert):
                                                                      "to this order")
         event(con, "protect", f"{row['coin']}: cannot auto-exit (not this order's position). Check Mudrex now.", alert)
         return False
-    pos = next((p for p in client.positions() if p["id"] == pid), None)
-    if pos is not None:
+    state, pos = position_state(client, pid)
+    if state == "closed":
+        return exited(con, row, why, alert)
+    busy = exit_in_flight(con, pid, row["id"])
+    if pos is not None and not busy:
         problems = identity_problems(pos, row)
         if problems:
             set_order(con, row["id"], state="RECONCILE_REQUIRED",
@@ -718,15 +754,11 @@ def protective_close(con, client, row, why, sleep, alert):
     for i in range(POLL_TRIES):
         renew(con, row["plan_id"])                                   # a live wait keeps the lease
         try:
-            gone = not any(p["id"] == pid for p in client.positions())
+            gone = position_state(client, pid)[0] == "closed"
         except (Ambiguous, Locked):
             gone = False
         if gone:
-            con.execute("UPDATE owned SET closed_at=? WHERE position_id=? AND closed_at IS NULL",
-                        (int(time.time()), pid))
-            set_order(con, row["id"], state="FAILED", error=f"exited automatically: {why}"[:300])
-            event(con, "protect", f"{row['coin']}: protective exit done; position closed.", alert)
-            return True
+            return exited(con, row, why, alert)
         sleep(min(1 + i, 5))
     set_order(con, row["id"], state="RECONCILE_REQUIRED", error=f"protective exit not confirmed: {why}"[:300])
     event(con, "protect", f"{row['coin']}: protective exit NOT confirmed. Check Mudrex now.", alert)
@@ -748,23 +780,20 @@ def close_problem(con, pos, row):
     problems = identity_problems(pos, opener)
     if problems:
         return "position changed since it was opened (" + "; ".join(problems) + ")"
-    other = con.execute("SELECT o.plan_id FROM orders o JOIN plans p ON p.id=o.plan_id WHERE o.action='CLOSE' "
-                        "AND o.position_id=? AND o.id<>? AND (o.state IN ('SUBMITTED','ACCEPTED','RECONCILE_REQUIRED') "
-                        "OR (o.state='PLANNED' AND p.state IN ('APPROVED','EXECUTING')))",
-                        (row["position_id"], row["id"])).fetchone()
-    if other:
-        return f"another close (plan {other['plan_id']}) for this position is still unresolved"
-    return None
+    return exit_in_flight(con, row["position_id"], row["id"])
 
 
 def run_close(con, client, row, sleep, alert):
     if row["position_id"] not in owned_ids(con):
         set_order(con, row["id"], state="FAILED", error="refused: position not owned by the bot")
         return
-    pos = next((p for p in client.positions() if p["id"] == row["position_id"]), None)
-    if pos is None:
+    state, pos = position_state(client, row["position_id"])
+    if state == "closed":
         set_order(con, row["id"], state="VERIFIED", error="already closed (stop hit?)")
         con.execute("UPDATE owned SET closed_at=? WHERE position_id=?", (int(time.time()), row["position_id"]))
+        return
+    if state == "unknown":                             # not visible, not in history yet: never assume closed
+        set_order(con, row["id"], state="RECONCILE_REQUIRED", error="position not visible; closure not confirmed")
         return
     why = close_problem(con, pos, row)
     if why:
@@ -785,7 +814,7 @@ def run_close(con, client, row, sleep, alert):
     for i in range(POLL_TRIES):
         renew(con, row["plan_id"])                                   # a live wait keeps the lease
         try:
-            gone = not any(p["id"] == row["position_id"] for p in client.positions())
+            gone = position_state(client, row["position_id"])[0] == "closed"
         except (Ambiguous, Locked):
             gone = False
         if gone:
@@ -1012,12 +1041,14 @@ def resume_close(con, client, row, alert):
     finishing it: re-send only if never sent or the last send was >= EXIT_RETRY_AFTER ago (journaled first),
     at most EXIT_MAX_ATTEMPTS times, then hand over to the human. Only ever closes a bot-owned position."""
     now = int(time.time())
-    pos = next((p for p in client.positions() if p["id"] == row["position_id"]), None)
-    if pos is None:
+    state, pos = position_state(client, row["position_id"])
+    if state == "closed":
         set_order(con, row["id"], state="VERIFIED")
         con.execute("UPDATE owned SET closed_at=? WHERE position_id=? AND closed_at IS NULL",
                     (now, row["position_id"]))
         return
+    if state == "unknown":
+        return                                                         # wait for a definite answer
     why = close_problem(con, pos, row)
     if why:
         set_order(con, row["id"], state="FAILED", error=f"refused: {why}"[:300])
@@ -1083,7 +1114,7 @@ def reconcile_plan(con, client, pid, sleep, alert):
             if row["action"] == "CLOSE":
                 resume_close(con, client, row, alert)
                 continue
-            o = lookup_until_known(client, row["client_order_id"], sleep)   # raises if inconclusive -> deferred
+            o = lookup_until_known(client, row["client_order_id"], sleep, con=con, plan_id=pid)   # raises if inconclusive
             renew(con, pid)
             if o is None:
                 set_order(con, row["id"], state="FAILED", error="not found on exchange after restart")

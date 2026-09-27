@@ -712,7 +712,7 @@ def test_no_second_close_while_another_close_is_unresolved():
     assert states(con, first)["XRP"][0] == "RECONCILE_REQUIRED" and close_posts(fake) == 1
     second = _close_plan(con, xrp)
     ex.execute(con, client, second, "t", NOSLEEP)
-    assert close_posts(fake) == 1 and "still unresolved" in states(con, second)["XRP"][1]
+    assert close_posts(fake) == 1 and "still closing" in states(con, second)["XRP"][1]
     fake.stop()
 
 
@@ -777,6 +777,33 @@ def test_you_can_still_close_a_position_whose_entry_needs_reconciling():
     con.execute("UPDATE orders SET state='RECONCILE_REQUIRED' WHERE action='OPEN'")   # e.g. auto-exit gave up
     pid = _close_plan(con, xrp)
     assert ex.execute(con, client, pid, "t", NOSLEEP)[0] == "COMPLETE" and not fake.positions
+    fake.stop()
+
+
+def test_human_close_waits_while_an_automatic_exit_is_in_flight():
+    tmp, fake, client, con = setup()
+    _unprotectable(fake)
+    fake.faults["close"] = ["timeout"] * 20                          # automatic exit sent, outcome unknown
+    pid = plan(con, ["XRP"])
+    ex.execute(con, client, pid, "t", NOSLEEP)
+    assert close_posts(fake) == 1 and fake.positions
+    pos_id = fake.positions[0]["id"]
+    human = _close_plan(con, pos_id)
+    ex.execute(con, client, human, "t", NOSLEEP)
+    assert close_posts(fake) == 1 and "automatic exit" in states(con, human)["XRP"][1]   # no second request
+    fake.stop()
+
+
+def test_one_missing_snapshot_never_ends_a_close():
+    tmp, fake, client, con, xrp = _one_verified_xrp()
+    hidden = fake.positions.pop()                                   # Mudrex briefly omits it, not in history
+    pid = _close_plan(con, xrp)
+    ex.execute(con, client, pid, "t", NOSLEEP)
+    assert states(con, pid)["XRP"][0] == "RECONCILE_REQUIRED" and close_posts(fake) == 0   # not "closed"
+    fake.positions.append(hidden)                                   # it is back
+    ex.reconcile(con, client, NOSLEEP)
+    ex.reconcile(con, client, NOSLEEP)
+    assert close_posts(fake) == 1 and states(con, pid)["XRP"][0] == "VERIFIED" and not fake.positions
     fake.stop()
 
 
