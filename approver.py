@@ -51,6 +51,7 @@ def tg_alert(msg):
     """Execution alerts: an undelivered Telegram message raises, so execution.event() journals it as alert_failed."""
     if tg.send(msg) is None:
         raise ConnectionError("Telegram message not delivered")
+    return True
 
 
 def fresh_plan():
@@ -156,10 +157,10 @@ def main():
             continue
         try:
             for u in tg.updates(offset, timeout=30):
+                handle(u)
                 offset = u["update_id"] + 1
                 with open(OFFSET_PATH, "w") as f:
-                    json.dump({"offset": offset}, f)   # saved before handling: a crash never replays an approval
-                handle(u)
+                    json.dump({"offset": offset}, f)   # save after idempotent handling so crashes replay safely
         except Exception:
             log("error:\n" + traceback.format_exc())
             time.sleep(10)

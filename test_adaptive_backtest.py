@@ -55,6 +55,19 @@ def test_brackets_are_side_aware():
         assert t["stop"] < t["target"] if t["side"] == "LONG" else t["target"] < t["stop"]
 
 
+def test_bar_exit_gap_and_ambiguous_touch_are_conservative():
+    b = ab.Bar(T0, 100, 112, 88, 100)
+    assert ab._bar_exit("LONG", b, 90, 110) == (90, "stop")
+    assert ab._bar_exit("SHORT", b, 110, 90) == (110, "stop")
+    assert ab._bar_exit("LONG", ab.Bar(T0, 85, 90, 80, 88), 90, 110) == (85, "stop-gap")
+    assert ab._bar_exit("SHORT", ab.Bar(T0, 115, 120, 112, 118), 110, 90) == (115, "stop-gap")
+
+
+def test_slippage_reanchors_both_sides_without_changing_distance():
+    assert ab._reanchor_bracket("LONG", 100, 101, 95, 110) == (96, 111)
+    assert ab._reanchor_bracket("SHORT", 100, 99, 105, 90) == (104, 89)
+
+
 def test_daily_loss_never_starts_new_trades_past_cap():
     """Every trade opened in a cycle starts while cycle P&L is inside +/-Rs500 and at most 3 per cycle."""
     random.seed(5)

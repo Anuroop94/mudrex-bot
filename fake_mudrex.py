@@ -33,6 +33,7 @@ class FakeMudrex:
         self.no_liq = False
         self.fill_after = 1                  # detail lookups before a CREATED order becomes FILLED
         self.never_fill = False
+        self.boundary_prices = {}             # coin -> candle open at the IST boundary (default: live price)
         self.cid_detail = False              # live Mudrex: /orders/detail?client_order_id= is always 404
         self.leverage_store = {}
         self.leverage_stuck = None           # if set, POST leverage is ignored and this value is reported
@@ -164,6 +165,12 @@ class FakeMudrex:
                 p, q = self._parts()
                 fake.requests.append(("GET", p, q.get("client_order_id")))
                 ok = lambda d: (200, {"success": True, "data": d})     # noqa: E731
+                if p.endswith("/price/kline"):                  # candle OPEN at start_time = boundary price
+                    sym = q.get("assets", "")
+                    coin, ts = sym.split("/")[0], int(q.get("start_time", 0))
+                    px = fake.boundary_prices.get(coin, fake.prices.get(coin))
+                    ticks = [[ts, px, px, px, px, 1.0]] if px and ts % 900 == 0 else []
+                    return self._apply("kline", lambda: ok({"asset_ticks": {sym.lower(): ticks}}))
                 if p.endswith("/futures/funds"):
                     return self._send(*ok({"balance": str(fake.balance), "locked_amount": "0"}))
                 if p.endswith("/futures/positions"):
@@ -261,7 +268,8 @@ class FakeMudrex:
                         fake.positions.remove(pos)
                         fake.closed.append(dict(id=pos["id"], symbol=pos["symbol"], position_type=pos["order_type"],
                                                 status="CLOSED", entry_price=pos["entry_price"],
-                                                closed_price=pos["entry_price"], quantity=pos["quantity"], pnl="0"))
+                                                closed_price=pos["entry_price"], quantity=pos["quantity"], pnl="0",
+                                                created_at=pos.get("created_at"), updated_at=_iso(time.time())))
                         return 200, {"success": True, "data": {"position_id": pid, "status": "CREATED"}}
                     return self._apply("close", close)
                 return self._send(404, {"success": False})

@@ -114,6 +114,30 @@ def _fee(notional_inr: float) -> float:
     return notional_inr * TAKER_FEE * (1 + GST)
 
 
+def _bar_exit(side: str, bar: Bar, stop: float, target: float):
+    """Return (raw exit, reason). Gaps use the open; ambiguous same-bar touches conservatively stop first."""
+    if side == "LONG":
+        if bar.open <= stop: return bar.open, "stop-gap"
+        if bar.open >= target: return bar.open, "target-gap"
+        if bar.low <= stop: return stop, "stop"
+        if bar.high >= target: return target, "target"
+    else:
+        if bar.open >= stop: return bar.open, "stop-gap"
+        if bar.open <= target: return bar.open, "target-gap"
+        if bar.high >= stop: return stop, "stop"
+        if bar.low <= target: return target, "target"
+    return None, None
+
+
+def _reanchor_bracket(side: str, planned_entry: float, fill: float, stop: float, target: float):
+    shift = fill - planned_entry
+    moved = stop + shift, target + shift
+    if not ((side == "LONG" and moved[0] < fill < moved[1]) or
+            (side == "SHORT" and moved[1] < fill < moved[0])):
+        raise ValueError("slipped fill produced an invalid bracket")
+    return moved
+
+
 def run_backtest(data: Mapping[str, Sequence[Bar]], specs: Mapping[str, Spec] | None = None,
                  *, start: int | None = None, end: int | None = None) -> dict:
     """Simulate next-open entries, adaptive brackets, regime, costs and INR risk.
@@ -151,12 +175,13 @@ def run_backtest(data: Mapping[str, Sequence[Bar]], specs: Mapping[str, Spec] | 
     cycle_start_equity = CAPITAL_INR
     previous_equity = CAPITAL_INR
 
-    def marked_equity(ts):
+    def marked_equity(ts, field="close"):
         value = cash
         for coin, position in positions.items():
             bar = data[coin][maps[coin][ts]]
+            mark = getattr(bar, field)
             direction = 1 if position["side"] == "LONG" else -1
-            value += (bar.close - position["entry"]) * position["qty"] * INR_PER_USDT * direction
+            value += (mark - position["entry"]) * position["qty"] * INR_PER_USDT * direction
         return value
 
     for ti, ts in enumerate(timestamps):
@@ -178,42 +203,39 @@ def run_backtest(data: Mapping[str, Sequence[Bar]], specs: Mapping[str, Spec] | 
                 cycle_start_equity = previous_equity
             active_cycle = cycle
         cycle_pnls.setdefault(cycle, [])
-        # Existing positions are tested against this day's range before new entries.
+        existing_at_open = set(positions)
+        # Opening-gap protection and trend changes happen at the open. Full intraday ranges are deliberately
+        # evaluated only after every open-time entry decision, so one coin's future high/low cannot free risk for
+        # another order supposedly placed at that same open.
         for c in list(positions):
             p = positions[c]
             b = data[c][indices[c]]
-            exit_px, reason = None, None
             if p["side"] == "LONG":
-                if b.open <= p["stop"]: exit_px, reason = b.open, "stop-gap"
-                elif b.open >= p["target"]: exit_px, reason = b.open, "target-gap"
-                elif b.low <= p["stop"]: exit_px, reason = p["stop"], "stop"
-                elif b.high >= p["target"]: exit_px, reason = p["target"], "target"
-                elif regime != "LONG" or sig[c].get(decision_ts, 0) <= 0: exit_px, reason = b.open, "trend/regime"
+                exit_px, reason = ((b.open, "stop-gap") if b.open <= p["stop"] else
+                                   (b.open, "target-gap") if b.open >= p["target"] else (None, None))
             else:
-                if b.open >= p["stop"]: exit_px, reason = b.open, "stop-gap"
-                elif b.open <= p["target"]: exit_px, reason = b.open, "target-gap"
-                elif b.high >= p["stop"]: exit_px, reason = p["stop"], "stop"
-                elif b.low <= p["target"]: exit_px, reason = p["target"], "target"
-                elif regime != "SHORT" or sig[c].get(decision_ts, 0) >= 0: exit_px, reason = b.open, "trend/regime"
-            # One full daily funding charge per day held; reserved costs are modeled in plan_trade.
-            funding = p["qty"] * b.open * INR_PER_USDT * FUNDING_PER_DAY
-            cash -= funding
+                exit_px, reason = ((b.open, "stop-gap") if b.open >= p["stop"] else
+                                   (b.open, "target-gap") if b.open <= p["target"] else (None, None))
+            if exit_px is None and (regime != p["side"] or
+                    (p["side"] == "LONG" and sig[c].get(decision_ts, 0) <= 0) or
+                    (p["side"] == "SHORT" and sig[c].get(decision_ts, 0) >= 0)):
+                exit_px, reason = b.open, "trend/regime"
             if exit_px is not None:
                 px = exit_px * (1 - SLIPPAGE if p["side"] == "LONG" else 1 + SLIPPAGE)
                 direction = 1 if p["side"] == "LONG" else -1
                 gross = (px - p["entry"]) * p["qty"] * INR_PER_USDT * direction
                 fee_out = _fee(p["qty"] * px * INR_PER_USDT)
-                net = gross - fee_out - p["entry_cost"] - funding
+                net = gross - fee_out - p["entry_cost"] - p["funding_paid"]
                 cash += gross - fee_out
                 cycle_pnls[cycle].append(net)
                 trades.append({"coin": c, "side": p["side"], "entry_ts": p["ts"], "exit_ts": ts,
                                "reason": reason, "net_inr": net, "leverage": p["leverage"],
-                               "quantity": p["qty"], "stop": p["stop"], "target": p["target"]})
+                               "quantity": p["qty"], "stop": p["stop"], "target": p["target"],
+                               "funding_paid_inr": p["funding_paid"]})
                 del positions[c]
         if regime and decision_ts is not None:
             candidates = []
-            cycle_pnl = marked_equity(ts) - cycle_start_equity
-            pnl_blocked = cycle_pnl <= -DAILY_RISK_INR or cycle_pnl >= DAILY_RISK_INR
+            cycle_pnl = marked_equity(ts, "open") - cycle_start_equity
             for c in coins:
                 i = indices[c]
                 previous_i = decision_indices[c]
@@ -232,6 +254,8 @@ def run_backtest(data: Mapping[str, Sequence[Bar]], specs: Mapping[str, Spec] | 
             opened = 0
             completed = cycle_set_counts.get(cycle, 0)
             for confidence, c, b, atr in candidates:
+                cycle_pnl = marked_equity(ts, "open") - cycle_start_equity
+                pnl_blocked = cycle_pnl <= -DAILY_RISK_INR or cycle_pnl >= DAILY_RISK_INR
                 if pnl_blocked or completed + opened >= 3 or (completed + opened >= 2 and confidence < 0.85):
                     continue
                 realized = cycle_pnls[cycle]
@@ -255,32 +279,36 @@ def run_backtest(data: Mapping[str, Sequence[Bar]], specs: Mapping[str, Spec] | 
                                   for p in positions.values())
                 if used_margin + margin > CAPITAL_INR: continue
                 cash -= entry_cost
-                fill_shift = entry - b.open
+                stop, target = _reanchor_bracket(regime, b.open, entry, plan.stop_loss, plan.take_profit)
                 positions[c] = {"side": regime, "entry": entry, "ts": ts, "qty": qty,
-                    "stop": plan.stop_loss + fill_shift, "target": plan.take_profit + fill_shift,
+                    "stop": stop, "target": target,
                     "risk": plan.planned_stop_risk_inr,
-                    "leverage": plan.leverage, "entry_cost": entry_cost}
+                    "leverage": plan.leverage, "entry_cost": entry_cost, "funding_paid": 0.0}
                 opened += 1
-                p = positions[c]
-                stop_hit = (b.low <= p["stop"] if regime == "LONG" else b.high >= p["stop"])
-                target_hit = (b.high >= p["target"] if regime == "LONG" else b.low <= p["target"])
-                if stop_hit or target_hit:
-                    why = "stop" if stop_hit else "target"
-                    raw_exit = p["stop"] if stop_hit else p["target"]
-                    exit_px = raw_exit * (1 - SLIPPAGE if regime == "LONG" else 1 + SLIPPAGE)
-                    direction = 1 if regime == "LONG" else -1
-                    gross = (exit_px - entry) * qty * INR_PER_USDT * direction
-                    fee_out = _fee(qty * exit_px * INR_PER_USDT)
-                    funding = qty * b.open * INR_PER_USDT * FUNDING_PER_DAY
-                    cash -= funding
-                    net = gross - fee_out - entry_cost - funding
-                    cash += gross - fee_out
-                    cycle_pnls[cycle].append(net)
-                    trades.append({"coin": c, "side": regime, "entry_ts": ts, "exit_ts": ts,
-                                   "reason": why, "net_inr": net, "leverage": plan.leverage,
-                                   "quantity": qty, "stop": p["stop"], "target": p["target"]})
-                    del positions[c]
             cycle_set_counts[cycle] = completed + opened
+        # Intraday phase: all same-open orders already exist before any high/low outcome is observed.
+        for c in list(positions):
+            p = positions[c]
+            b = data[c][indices[c]]
+            if c in existing_at_open:
+                funding = p["qty"] * b.open * INR_PER_USDT * FUNDING_PER_DAY
+                cash -= funding
+                p["funding_paid"] += funding
+            raw_exit, reason = _bar_exit(p["side"], b, p["stop"], p["target"])
+            if raw_exit is None:
+                continue
+            px = raw_exit * (1 - SLIPPAGE if p["side"] == "LONG" else 1 + SLIPPAGE)
+            direction = 1 if p["side"] == "LONG" else -1
+            gross = (px - p["entry"]) * p["qty"] * INR_PER_USDT * direction
+            fee_out = _fee(p["qty"] * px * INR_PER_USDT)
+            net = gross - fee_out - p["entry_cost"] - p["funding_paid"]
+            cash += gross - fee_out
+            cycle_pnls[cycle].append(net)
+            trades.append({"coin": c, "side": p["side"], "entry_ts": p["ts"], "exit_ts": ts,
+                           "reason": reason, "net_inr": net, "leverage": p["leverage"],
+                           "quantity": p["qty"], "stop": p["stop"], "target": p["target"],
+                           "funding_paid_inr": p["funding_paid"]})
+            del positions[c]
         # Mark-to-market daily P&L, including estimated floating costs/funding.
         unreal = sum((data[c][maps[c][ts]].close - p["entry"]) * p["qty"] * INR_PER_USDT
                      * (1 if p["side"] == "LONG" else -1) for c, p in positions.items())

@@ -29,6 +29,7 @@ Rules:
     or INR order) is used; entries are sized with HEDGE_BUFFER headroom and the order's actual hedge_rate is
     checked after the fill.
 """
+import calendar
 import json
 import hashlib
 import math
@@ -58,6 +59,8 @@ POLL_TRIES, LOOKUP_TRIES = 10, 6
 LEASE = 300                 # a running execute() renews this before every order; reconcile skips leased plans
 TERMINAL_OK = {"FILLED"}
 TERMINAL_BAD = {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED", "FAILED"}
+OUTBOX_LEASE = 60
+ALLOW_TEST_ALERT_SINK = False       # tests may explicitly opt in; production never changes this constant
 
 
 class Halt(Exception):
@@ -94,6 +97,12 @@ def db(path=None):
     CREATE TABLE IF NOT EXISTS set_approvals(proposal_id TEXT PRIMARY KEY, cycle TEXT NOT NULL,
         expires_at INTEGER NOT NULL, channel TEXT NOT NULL, approved_by TEXT NOT NULL,
         approved_at INTEGER NOT NULL, consumed_at INTEGER);
+    CREATE TABLE IF NOT EXISTS telegram_outbox(id INTEGER PRIMARY KEY, event_id INTEGER UNIQUE,
+        dedupe_key TEXT UNIQUE, msg TEXT NOT NULL, critical INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL DEFAULT 0,
+        delivered_at INTEGER, last_error TEXT, lease_token TEXT, lease_until INTEGER);
+    CREATE INDEX IF NOT EXISTS telegram_outbox_pending ON telegram_outbox(delivered_at, next_attempt_at, created_at);
+    CREATE TABLE IF NOT EXISTS universe_snapshots(cycle TEXT PRIMARY KEY, created_at INTEGER NOT NULL, payload TEXT NOT NULL);
     """)
     for table, col in (("owned", "realized_pnl REAL"), ("plans", "lease_until INTEGER"), ("plans", "lease_token TEXT"),
                        ("ledger", "trusted INTEGER DEFAULT 1"), ("orders", "exit_sent_at INTEGER"),
@@ -102,7 +111,11 @@ def db(path=None):
                        ("orders", "planned_stop REAL"), ("orders", "planned_target REAL"),
                        ("orders", "planned_leverage REAL"), ("orders", "planned_risk_inr REAL"),
                        ("orders", "planned_qty REAL"), ("orders", "set_id INTEGER"),
-                       ("orders", "target_price TEXT")):
+                       ("orders", "target_price TEXT"),
+                       # exchange facts for the exact IST-boundary baseline (caps_state): Mudrex open/close times,
+                       # and the position's side/qty/entry/rate while it was open
+                       ("owned", "ex_opened_at INTEGER"), ("owned", "ex_closed_at INTEGER"), ("owned", "ex_side TEXT"),
+                       ("owned", "ex_qty REAL"), ("owned", "ex_entry REAL"), ("owned", "ex_rate REAL")):
         if col.split()[0] not in {r["name"] for r in con.execute(f"PRAGMA table_info({table})")}:
             con.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
     if con.execute("SELECT 1 FROM kv WHERE key='marks_v2'").fetchone() is None:
@@ -116,17 +129,88 @@ def db(path=None):
     return con
 
 
-def event(con, kind, msg, alert=None):
-    """Journal an event and (optionally) alert. An alert failure can never interrupt execution."""
-    con.execute("INSERT INTO events(at, kind, msg) VALUES(?,?,?)", (int(time.time()), kind, msg))
-    if alert:
-        try:
-            delivered = alert(msg)
-            if delivered is False:
-                raise ConnectionError("alert callback reported delivery failure")
-        except Exception as e:                                   # noqa: BLE001 - delivery must not break trading state
-            con.execute("INSERT INTO events(at, kind, msg) VALUES(?,?,?)",
-                        (int(time.time()), "alert_failed", f"{type(e).__name__}: {e}"[:300]))
+def enqueue_alert(con, msg, *, event_id=None, dedupe_key=None, critical=True):
+    now = int(time.time())
+    con.execute("INSERT OR IGNORE INTO telegram_outbox(event_id,dedupe_key,msg,critical,created_at,next_attempt_at) "
+                "VALUES(?,?,?,?,?,0)", (event_id, dedupe_key, msg, int(critical), now))
+    if event_id is not None:
+        return con.execute("SELECT id FROM telegram_outbox WHERE event_id=?", (event_id,)).fetchone()[0]
+    return con.execute("SELECT id FROM telegram_outbox WHERE dedupe_key=?", (dedupe_key,)).fetchone()[0]
+
+
+def _claim_alert(con, row_id=None, critical_only=False):
+    """Lease one due undelivered message. Sending is at-least-once; the event id makes duplicates visible."""
+    now, token = int(time.time()), uuid.uuid4().hex
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        where, args = ["delivered_at IS NULL", "next_attempt_at<=?", "COALESCE(lease_until,0)<?"], [now, now]
+        if row_id is not None:
+            where.append("id=?")
+            args.append(row_id)
+        if critical_only:
+            where.append("critical=1")
+        row = con.execute("SELECT * FROM telegram_outbox WHERE " + " AND ".join(where) +
+                          " ORDER BY created_at,id LIMIT 1", args).fetchone()
+        if row:
+            con.execute("UPDATE telegram_outbox SET lease_token=?,lease_until=? WHERE id=?",
+                        (token, now + OUTBOX_LEASE, row["id"]))
+        con.execute("COMMIT")
+        return row, token
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+
+
+def deliver_alert(con, alert, row_id=None, critical_only=False):
+    row, token = _claim_alert(con, row_id, critical_only)
+    if row is None:
+        return True
+    try:
+        if alert is None:
+            raise ConnectionError("Telegram callback unavailable")
+        delivered = alert(f"[event {row['event_id'] or row['id']}] {row['msg']}")
+        if delivered is not True and not (ALLOW_TEST_ALERT_SINK and delivered is None):
+            raise ConnectionError("Telegram callback did not explicitly confirm delivery")
+        con.execute("UPDATE telegram_outbox SET delivered_at=?,lease_token=NULL,lease_until=NULL,last_error=NULL "
+                    "WHERE id=? AND lease_token=?", (int(time.time()), row["id"], token))
+        return True
+    except Exception as e:
+        attempts = int(row["attempts"] or 0) + 1
+        con.execute("UPDATE telegram_outbox SET attempts=?,next_attempt_at=?,last_error=?,lease_token=NULL,"
+                    "lease_until=NULL WHERE id=? AND lease_token=?",
+                    (attempts, int(time.time()) + min(30 * 2 ** min(attempts, 6), 3600),
+                     f"{type(e).__name__}: {e}"[:300], row["id"], token))
+        con.execute("INSERT INTO events(at,kind,msg) VALUES(?,?,?)",
+                    (int(time.time()), "alert_failed", f"outbox {row['id']}: {type(e).__name__}: {e}"[:300]))
+        return False
+
+
+def retry_alerts(con, alert, limit=20, critical_only=False):
+    ok = True
+    for _ in range(limit):
+        due = con.execute("SELECT id FROM telegram_outbox WHERE delivered_at IS NULL AND next_attempt_at<=? "
+                          + ("AND critical=1 " if critical_only else "") + "ORDER BY created_at,id LIMIT 1",
+                          (int(time.time()),)).fetchone()
+        if due is None:
+            break
+        if not deliver_alert(con, alert, due["id"], critical_only):
+            ok = False
+            break
+    return ok
+
+
+def pending_alerts(con, critical_only=False):
+    return con.execute("SELECT COUNT(*) FROM telegram_outbox WHERE delivered_at IS NULL" +
+                       (" AND critical=1" if critical_only else "")).fetchone()[0]
+
+
+def event(con, kind, msg, alert=None, *, critical=True, dedupe_key=None):
+    """Journal and durably queue an alert. Delivery failure never interrupts protection or closing."""
+    cur = con.execute("INSERT INTO events(at, kind, msg) VALUES(?,?,?)", (int(time.time()), kind, msg))
+    if alert is not None:
+        oid = enqueue_alert(con, msg, event_id=cur.lastrowid, dedupe_key=dedupe_key, critical=critical)
+        return deliver_alert(con, alert, oid)
+    return True
 
 
 def set_order(con, oid, **kw):
@@ -460,12 +544,46 @@ def recover_ownership(con, client):
     return truncated
 
 
+def exchange_ts(value):
+    """Mudrex ISO time ('2026-09-27T16:00:11Z') -> epoch seconds, or None if missing/unparseable."""
+    try:
+        return calendar.timegm(time.strptime(str(value)[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _num(x):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) and v > 0 else None
+
+
+def record_exchange_facts(con, p, closed=False):
+    """Keep Mudrex's own open/close times and the position's side/qty/entry/rate on the owned row (never overwrite
+    a known value). These, not local discovery times, decide what was open at the IST boundary."""
+    side = str(p.get("order_type") or p.get("position_type") or "").upper() or None
+    con.execute("""UPDATE owned SET ex_opened_at=COALESCE(ex_opened_at, ?), ex_side=COALESCE(ex_side, ?),
+                   ex_qty=COALESCE(ex_qty, ?), ex_entry=COALESCE(ex_entry, ?), ex_rate=COALESCE(ex_rate, ?)
+                   WHERE position_id=?""",
+                (exchange_ts(p.get("created_at")), side, _num(p.get("quantity")), _num(p.get("entry_price")),
+                 _num(p.get("entry_hedge_rate")), p["id"]))
+    if closed:
+        con.execute("UPDATE owned SET ex_closed_at=COALESCE(ex_closed_at, ?) WHERE position_id=?",
+                    (exchange_ts(p.get("updated_at")), p["id"]))
+
+
 def sync_owned(con, client, positions):
     """Mark bot positions closed ONLY when Mudrex closed-position history lists them, and fill in realized P&L.
     Returns how many bot positions have unknown P&L: closed without P&L yet, or vanished but not confirmed
     closed (either way bot equity is unknown and entries are blocked)."""
     open_ids = {p["id"] for p in positions}
     now = int(time.time())
+    ours = owned_ids(con)
+    for p in positions:
+        if p["id"] in ours:
+            record_exchange_facts(con, p)
     # a position marked closed from one incomplete snapshot that shows up again (P&L never confirmed) is reopened,
     # so it stays bot-owned and monitored instead of silently turning "manual"
     for r in con.execute("SELECT position_id FROM owned WHERE closed_at IS NOT NULL AND realized_pnl IS NULL"
@@ -476,9 +594,14 @@ def sync_owned(con, client, positions):
               if r["position_id"] not in open_ids]
     missing = con.execute("SELECT position_id FROM owned WHERE closed_at IS NOT NULL AND realized_pnl IS NULL"
                           ).fetchall()
+    no_close_time = con.execute("SELECT position_id FROM owned WHERE closed_at IS NOT NULL AND ex_closed_at IS NULL"
+                                ).fetchall()
     unconfirmed = 0
-    if absent or missing:
+    if absent or missing or no_close_time:
         hist = {p["id"]: p for p in client.history("positions")[0]}
+        for pid in absent + [r["position_id"] for r in missing + no_close_time]:
+            if pid in hist:
+                record_exchange_facts(con, hist[pid], closed=True)
         for pid in absent:                     # closed only when Mudrex history lists it; else still unknown
             if pid in hist:
                 con.execute("UPDATE owned SET closed_at=? WHERE position_id=?", (now, pid))
@@ -532,37 +655,74 @@ def ist_day(t=None):
     return time.strftime("%Y-%m-%d", time.gmtime((t or time.time()) + config.IST_OFFSET))
 
 
-MARK_WINDOW = 15 * 60       # a pre-midnight equity mark this recent is a trustworthy day-start baseline
+def boundary_equity(con, midnight, open_price_at=None):
+    """Exact bot equity at the IST boundary from exchange evidence, or None (unknown: the caller fails closed).
+
+    Rs allocation + realized P&L of bot positions closed before `midnight` + every position OPEN at `midnight`
+    valued at Mudrex's candle open at exactly `midnight` (open_price_at(coin, midnight)).
+    Before/after midnight is decided by Mudrex's own times (ex_opened_at / ex_closed_at). A local discovery time
+    is used only where it is PROOF: the bot always notices a fill or a close after it happens, so a local time
+    earlier than midnight proves the event was before midnight; a later local time proves nothing."""
+    total = float(s1.CAPITAL_CAP_INR)
+    for r in con.execute("SELECT * FROM owned").fetchall():
+        closed_before = ((r["ex_closed_at"] is not None and r["ex_closed_at"] < midnight) or
+                         (r["closed_at"] is not None and r["closed_at"] < midnight))
+        if closed_before:
+            if r["realized_pnl"] is None or not math.isfinite(r["realized_pnl"]):
+                return None
+            total += r["realized_pnl"]
+            continue
+        if r["closed_at"] is not None and r["ex_closed_at"] is None:
+            return None                                             # closed, but when? unknown
+        if r["ex_opened_at"] is not None:
+            opened_before = r["ex_opened_at"] < midnight
+        elif r["opened_at"] is not None and r["opened_at"] < midnight:
+            opened_before = True
+        else:
+            return None                                             # discovered after midnight, open time unknown
+        if not opened_before:
+            continue                                                # opened in this cycle: not in the baseline
+        if open_price_at is None or None in (r["ex_qty"], r["ex_entry"], r["ex_side"]):
+            return None
+        try:
+            px = open_price_at(r["coin"], midnight)
+        except Exception:                                           # noqa: BLE001 - any failure means unknown
+            return None
+        if px is None or not math.isfinite(px) or px <= 0:
+            return None
+        d = 1 if r["ex_side"] == "LONG" else -1 if r["ex_side"] == "SHORT" else 0
+        if not d:
+            return None
+        total += r["ex_qty"] * (px - r["ex_entry"]) * d * (r["ex_rate"] or config.INR_PER_USDT)
+    return total if math.isfinite(total) else None
 
 
-def caps_state(con, equity, unreal=0.0, now=None, trusted=True):
-    """Bot day P&L vs the fixed rupee caps (IST day). Every call records an equity mark. The day-start baseline is:
-      - the last equity mark in the 15 min before IST midnight (the watcher marks every 5 min), else
-      - with NO open bot position: allocation + P&L realized before midnight (exact), else
-      - UNKNOWN (baseline_ok False): open positions moved while nobody watched, so today's loss cannot be
-        measured; callers block new entries for the day."""
+def caps_state(con, equity, unreal=0.0, now=None, trusted=True, open_price_at=None):
+    """Bot cycle P&L vs fixed rupee caps. The day-start baseline is exact or UNTRUSTED (entries fail closed):
+      - a trusted equity mark taken at exactly IST midnight, else
+      - boundary_equity(): exchange open/close times, positions carried across midnight valued at Mudrex's candle
+        open at exactly midnight (open_price_at). Nearby local marks are never used as a baseline.
+    An untrusted baseline is re-evaluated on later calls and upgraded once exact evidence is available."""
     now = now or time.time()
     day = ist_day(now)
     # trusted=False: equity was an estimate (bot P&L unconfirmed); such a mark can never become a baseline
     con.execute("INSERT OR REPLACE INTO marks(at, equity, trusted) VALUES(?,?,?)", (int(now), equity, int(trusted)))
     con.execute("DELETE FROM marks WHERE at < ?", (int(now) - 3 * 86400,))
     row = con.execute("SELECT start_equity, trusted FROM ledger WHERE day=?", (day,)).fetchone()
-    if row is None:
+    if row is None or not row["trusted"]:
         midnight = int((now + config.IST_OFFSET) // 86400 * 86400 - config.IST_OFFSET)
-        mark = con.execute("SELECT equity FROM marks WHERE at < ? AND at >= ? AND trusted=1 ORDER BY at DESC LIMIT 1",
-                           (midnight, midnight - MARK_WINDOW)).fetchone()
-        before = con.execute("SELECT COALESCE(SUM(realized_pnl), 0) FROM owned WHERE closed_at IS NOT NULL "
-                             "AND closed_at < ?", (midnight,)).fetchone()[0]
-        open_bot = con.execute("SELECT 1 FROM owned WHERE closed_at IS NULL").fetchone()
-        if mark:
-            start, trusted = mark["equity"], 1
-        elif not open_bot:
-            start, trusted = s1.CAPITAL_CAP_INR + before, 1
+        mark = con.execute("SELECT equity FROM marks WHERE at=? AND trusted=1", (midnight,)).fetchone()
+        # an unconfirmed bot P&L (trusted=False) can never produce a trusted baseline
+        exact = None if not trusted else mark["equity"] if mark else boundary_equity(con, midnight, open_price_at)
+        if exact is not None:
+            start, trusted = exact, 1
         else:
-            start, trusted = s1.CAPITAL_CAP_INR + before + unreal, 0
-        con.execute("INSERT INTO ledger(day, start_equity, trusted) VALUES(?,?,?)", (day, start, trusted))
+            before = con.execute("SELECT COALESCE(SUM(realized_pnl), 0) FROM owned WHERE closed_at IS NOT NULL "
+                                 "AND closed_at < ?", (midnight,)).fetchone()[0]
+            start, trusted = s1.CAPITAL_CAP_INR + before + unreal, 0     # diagnostic estimate only: fails closed
+        con.execute("INSERT OR REPLACE INTO ledger(day, start_equity, trusted) VALUES(?,?,?)", (day, start, trusted))
     else:
-        start, trusted = row["start_equity"], row["trusted"] if row["trusted"] is not None else 1
+        start, trusted = row["start_equity"], row["trusted"]
     cap = trade_policy.DAILY_LOSS_LIMIT_INR
     pnl = equity - start
     return dict(day=day, start=start, pnl=pnl, cap=cap, baseline_ok=bool(trusted),
@@ -1212,7 +1372,7 @@ def run_open(con, client, row, sleep, alert):
         eq = bot_equity(con, client, positions, rate)
     except PnlUnknown as e:
         return fail(con, row["id"], f"bot P&L unconfirmed: {e}")
-    caps = caps_state(con, eq, unrealized_inr(con, positions, rate))
+    caps = caps_state(con, eq, unrealized_inr(con, positions, rate), open_price_at=client.open_price_at)
     if caps["hit"]:
         return fail(con, row["id"], f"daily {caps['hit']} cap hit")
     if not caps["baseline_ok"]:
@@ -1268,6 +1428,8 @@ def run_open(con, client, row, sleep, alert):
         return fail(con, row["id"], why)
     qty_s = fmt_step(qty, step)
     set_order(con, row["id"], qty=qty_s)
+    if not ensure_entry_alerts(con, row, alert, "before leverage"):
+        return fail(con, row["id"], "Telegram delivery unavailable; entry not sent")
     renew(con, row["plan_id"])
     gate()
     try:
@@ -1282,7 +1444,9 @@ def run_open(con, client, row, sleep, alert):
     accepted = submit_with_reconcile(con, client, order_row(con, row["id"]),
                                      lambda: client.place_market(sym, qty_s, row["client_order_id"], side,
                                                                  initial_stop, initial_target),
-                                     sleep, alert, fresh=lambda: stale_at_submit(con, client, row, sym))
+                                     sleep, alert, fresh=lambda: entry_submit_block_reason(
+                                         con, client, row, sym, qty, float(initial_stop), float(initial_target),
+                                         side, cost_buffer, alert))
     if accepted is None:
         return order_row(con, row["id"])["state"] == "FAILED"        # unknown outcome -> halt
     o = poll_fill(con, client, row, sleep)
@@ -1351,9 +1515,67 @@ def over_loss_budget(positions, owned, rate, equity, notional_inr, price, stop, 
     return None
 
 
+def ensure_entry_alerts(con, row, alert, stage):
+    if alert is None and ALLOW_TEST_ALERT_SINK:
+        alert = lambda _msg: True
+    oid = enqueue_alert(con, f"{row['coin']} {row['side']}: entry checks passed ({stage}).",
+                        dedupe_key=f"entry-ready:{row['client_order_id']}:{stage}", critical=True)
+    deliver_alert(con, alert, oid)
+    retry_alerts(con, alert, critical_only=True)
+    return pending_alerts(con, critical_only=True) == 0
+
+
+def entry_submit_block_reason(con, client, row, sym, qty, stop, target, side, cost_buffer, alert):
+    """Recompute every mutable financial/ownership input immediately before each entry POST or retry."""
+    created = con.execute("SELECT created_at FROM plans WHERE id=?", (row["plan_id"],)).fetchone()[0]
+    if time.time() - created > ENTRY_MAX_AGE + SUBMIT_GRACE:
+        return "refused: plan too old by the time this order was due"
+    positions, owned = client.positions(), owned_ids(con)
+    if any(p["symbol"] == sym for p in positions):
+        return "position appeared on this symbol just before sending"
+    rate = hedge_rate(client, positions)
+    if not rate:
+        return "no recent INR hedge rate just before sending"
+    try:
+        eq = bot_equity(con, client, positions, rate)
+        caps = caps_state(con, eq, unrealized_inr(con, positions, rate), open_price_at=client.open_price_at)
+        realized = cycle_realized_pnls(con)
+    except PnlUnknown as e:
+        return f"bot P&L unconfirmed just before sending: {e}"
+    if not caps["baseline_ok"]:
+        return "today's exact starting balance unavailable just before sending"
+    if caps["hit"]:
+        return f"daily {caps['hit']} cap hit just before sending"
+    asset = client.asset(sym)
+    price, planned = float(asset["price"]), row["planned_price"]
+    if planned and abs(price / planned - 1) > MAX_DRIFT:
+        return f"price drifted {price / planned - 1:+.1%} just before sending"
+    try:
+        trade_policy.validate_bracket(side, price, stop, target)
+        loss_distance = abs(price - stop)
+        reward_distance = abs(target - price)
+        tick = float(asset.get("price_step") or 0.0)
+        if reward_distance + max(1e-12, tick) < adaptive_risk.MIN_REWARD_RISK * loss_distance:
+            return f"reward/risk fell below {adaptive_risk.MIN_REWARD_RISK:g}:1 just before sending"
+    except ValueError as e:
+        return f"invalid live bracket just before sending: {e}"
+    live_notional = qty * price * rate
+    try:
+        if live_notional > float(row["planned_notional_inr"]) + 0.01:
+            return "live notional exceeds the planned cost reserve just before sending"
+    except (TypeError, ValueError):
+        return "planned notional is invalid just before sending"
+    why = over_loss_budget(positions, owned, rate, eq, live_notional, price, stop, side, realized,
+                           cost_buffer, con=con, candidate_risk_limit=row["planned_risk_inr"])
+    if why:
+        return why + " just before sending"
+    if not ensure_entry_alerts(con, row, alert, "before order"):
+        return "Telegram delivery unavailable just before sending"
+    return None
+
+
 def stale_at_submit(con, client, row, sym):
-    """Freshness re-checked immediately before the entry POST: the plan's age (claim-time check + a short grace
-    for the basket's own execution time) and the live price vs the planned price."""
+    """Compatibility freshness check used by older callers/tests."""
     created = con.execute("SELECT created_at FROM plans WHERE id=?", (row["plan_id"],)).fetchone()[0]
     if time.time() - created > ENTRY_MAX_AGE + SUBMIT_GRACE:
         return "refused: plan too old by the time this order was due"
@@ -1421,7 +1643,7 @@ def execute(con, client, plan_id, approver, sleep=time.sleep, alert=None):
     if why:
         return "REFUSED", [why]
     con.execute("UPDATE plans SET state='EXECUTING' WHERE id=?", (plan_id,))
-    event(con, "execute", f"plan {plan_id} approved by {approver}")
+    event(con, "execute", f"plan {plan_id} approved by {approver}", alert)
     try:
         recover_ownership(con, client)
     except ApiError:

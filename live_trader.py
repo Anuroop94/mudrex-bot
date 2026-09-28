@@ -17,6 +17,7 @@ import sys
 import time
 
 import adaptive_risk
+import bounded_learning
 import config
 import data
 import execution as ex
@@ -24,6 +25,7 @@ import pick_coins
 import portfolio as pf
 import s1
 import trade_policy
+import live_universe
 from mudrex_client import Client
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -53,14 +55,16 @@ def bad_data(uni, last_closed, days=400):
     bad = set()
     for c, cs in uni.items():
         recent = [x[0] for x in cs if x[0] > last_closed - days * DAY]
-        if not recent or recent[-1] != last_closed or any(b - a != DAY for a, b in zip(recent, recent[1:])):
+        if (len(recent) < days or recent[-1] != last_closed or
+                any(b - a != DAY for a, b in zip(recent, recent[1:]))):
             bad.add(c)
     return bad
 
 
 def build_orders(targets, owned, manual_symbols, prices, atrs, specs, size_equity_inr, armed, entries_blocked,
                  rate, bad=(), realized_pnls=(), active_stop_risks=(), available_slots=3,
-                 candidate_cost_buffer_inr=10.0, completed_sets=0):
+                 candidate_cost_buffer_inr=10.0, completed_sets=0, basket=None, model_decisions=None,
+                 entry_basket=None):
     """Build side-aware actions with quantity determined from the fixed rupee risk ledger.
 
     targets: {coin: signed 1x weight}; owned values may be a legacy position id or {id, side}.
@@ -71,7 +75,10 @@ def build_orders(targets, owned, manual_symbols, prices, atrs, specs, size_equit
     candidates = []
     reserved = list(active_stop_risks)
     reserved_margin_inr = 0.0
-    for c in s1.BASKET:
+    basket = tuple(basket or s1.BASKET)
+    entry_basket = frozenset(entry_basket if entry_basket is not None else basket)
+    model_decisions = model_decisions or {}
+    for c in basket:
         if c in bad:
             out.append(dict(action="SKIP", coin=c, reason="price data stale or missing days: no decision today"))
             continue
@@ -88,18 +95,25 @@ def build_orders(targets, owned, manual_symbols, prices, atrs, specs, size_equit
         elif held_id:
             out.append(dict(action="HOLD", coin=c, reason=f"{held_side.lower()} trend still active"))
         elif desired_side:
+            if c not in entry_basket:
+                out.append(dict(action="SKIP", coin=c, reason="not eligible for a new entry in this cycle"))
+                continue
             if entries_blocked:
                 out.append(dict(action="SKIP", coin=c, reason=entries_blocked))
                 continue
             if not armed.get(c, True):
                 out.append(dict(action="SKIP", coin=c, reason="stopped out earlier; waits for trend to reset"))
                 continue
-            confidence = min(1.0, abs(float(w)) * len(s1.BASKET))
-            candidates.append((confidence, c, desired_side, px, s))
+            confidence = min(1.0, abs(float(w)) * len(basket))
+            learned = model_decisions.get((c, desired_side), bounded_learning.Decision())
+            if learned.active and learned.veto:
+                out.append(dict(action="SKIP", coin=c, reason=learned.reason, model_score=learned.score))
+                continue
+            candidates.append((learned.score if learned.active else 0.5, confidence, c, desired_side, px, s, learned))
 
     slots = max(0, min(int(available_slots), trade_policy.MAX_SETS_PER_CYCLE))
     opened = 0
-    for confidence, c, side, px, s in sorted(candidates, reverse=True):
+    for _, confidence, c, side, px, s, learned in sorted(candidates, reverse=True):
         if opened >= slots or (completed_sets + opened >= trade_policy.TARGET_SETS_PER_CYCLE and confidence < 0.85):
             out.append(dict(action="SKIP", coin=c, reason="daily set target filled; third set needs a very strong signal"))
             continue
@@ -139,7 +153,8 @@ def build_orders(targets, owned, manual_symbols, prices, atrs, specs, size_equit
                         est_stop=round(rp.stop_loss, 8), est_target=round(rp.take_profit, 8),
                         leverage=rp.leverage, planned_risk_inr=round(modeled_risk, 2),
                         volatility_tier=rp.volatility_tier, confidence=round(confidence, 3),
-                        reason=f"{side.lower()} trend; {rp.volatility_tier} volatility"))
+                        model_score=round(learned.score, 3), model_active=learned.active,
+                        reason=f"{side.lower()} trend; {rp.volatility_tier} volatility; {learned.reason}"))
     return out
 
 
@@ -166,8 +181,28 @@ def plan(client=None, con=None):
              for p in positions if p["id"] in owned_ids}
     manual = {p["symbol"].removesuffix("USDT") for p in positions if p["id"] not in owned_ids}
     rate = ex.hedge_rate(client, positions)
-    specs = s1.specs_from_listing(pick_coins.listing())
-    uni = {c: [x for x in data.load(2400, f"{c}/USDT", "1d", DAY) if x[0] <= last_closed] for c in s1.BASKET}
+    listing = pick_coins.listing() or []
+    selection = live_universe.select_rows(listing)
+    cycle = trade_policy.cycle_id(now)
+    snapshot = live_universe.archive(con, cycle, selection, now)
+    selection = live_universe.replay(selection, snapshot)
+    entry_basket = selection.coins
+    listing_by_coin = {str(r.get("symbol") or "").removesuffix("USDT"): r for r in listing}
+    management_rows = list(selection.rows)
+    management_missing = []
+    for coin in sorted(set(owned) - set(entry_basket)):
+        row = listing_by_coin.get(coin)
+        try:
+            s1.specs_from_listing([row] if row else [], [coin])
+        except (KeyError, TypeError, ValueError):
+            management_missing.append(coin)
+        else:
+            management_rows.append(row)
+    basket = entry_basket + tuple(c for c in sorted(owned) if c not in entry_basket and c not in management_missing)
+    if not basket:
+        raise RuntimeError("no positively verified, liquid crypto futures are eligible")
+    specs = s1.specs_from_listing(management_rows, basket)
+    uni = {c: [x for x in data.load(2400, f"{c}/USDT", "1d", DAY) if x[0] <= last_closed] for c in basket}
     closes = {c: {x[0]: x[4] for x in cs} for c, cs in uni.items()}
     ctx = pf.prepare(uni, pf.zarattini, **s1.SIGNAL_KW)
     _, atrs = pf.trade_lookups(uni)
@@ -178,15 +213,16 @@ def plan(client=None, con=None):
     except ex.PnlUnknown as e:
         bot_eq, pnl_unknown = float(s1.CAPITAL_CAP_INR), str(e)
     caps = ex.caps_state(con, bot_eq, ex.unrealized_inr(con, positions, rate or config.INR_PER_USDT),
-                         trusted=pnl_unknown is None)
-    targets = s1.targets(ctx, closes, last_closed, s1.sizing_equity(bot_eq), specs, btc)
-    for c in s1.BASKET:
+                         trusted=pnl_unknown is None, open_price_at=client.open_price_at)
+    targets = s1.targets(ctx, closes, last_closed, s1.sizing_equity(bot_eq), specs, btc, basket=basket)
+    for c in basket:
         if not targets.get(c, 0):
             st["armed"][c] = True
     mood = s1.btc_mood(btc, last_closed)
     import telegram_bot
     blocked = "STOP file present" if os.path.exists(ex.STOP_PATH) else trade_policy.migration_block_reason()
-    blocked = blocked or ("BTC market-mood data missing" if mood is None else
+    blocked = blocked or ("no positively verified, liquid crypto futures are eligible" if not entry_basket else
+                          "BTC market-mood data missing" if mood is None else
                           "Telegram is not fully configured" if not telegram_bot.enabled() else
                           "performance guard tripped" if ex.guard_tripped() else
                           f"bot P&L unconfirmed ({pnl_unknown})" if pnl_unknown else
@@ -200,17 +236,23 @@ def plan(client=None, con=None):
     except ex.PnlUnknown as e:
         realized_pnls, active_risks = (), ()
         blocked = blocked or f"collective risk is unknown ({e})"
-    cycle = trade_policy.cycle_id(now)
     completed_sets, unresolved_sets = ex.cycle_set_counts(con, cycle)
     if unresolved_sets:
         blocked = blocked or "an earlier set is unresolved; reconciling it before any new set"
     # Sets 1-3 are autonomous; above that ONE set per plan, so each extra set is bound to one Telegram approval.
     needs_approval = completed_sets >= trade_policy.AUTONOMOUS_SETS_PER_CYCLE
     available_slots = (1 if trade_policy.HUMAN_OVERRIDE_ABOVE_MAX else 0) if needs_approval else         trade_policy.MAX_SETS_PER_CYCLE - completed_sets
-    orders = build_orders(targets, owned, manual, {c: closes[c].get(last_closed) for c in s1.BASKET},
-                          {c: atrs[c].get(last_closed) for c in s1.BASKET}, specs, bot_eq, st["armed"], blocked,
+    candidate_keys = [(c, "LONG" if targets.get(c, 0) > 0 else "SHORT")
+                      for c in entry_basket if targets.get(c, 0)]
+    learned = bounded_learning.decisions_from_db(con, candidate_keys, now)
+    orders = build_orders(targets, owned, manual, {c: closes[c].get(last_closed) for c in basket},
+                          {c: atrs[c].get(last_closed) for c in basket}, specs, bot_eq, st["armed"], blocked,
                           rate or config.INR_PER_USDT, bad, realized_pnls, active_risks, available_slots,
-                          completed_sets=completed_sets)
+                          completed_sets=completed_sets, basket=basket, model_decisions=learned,
+                          entry_basket=entry_basket)
+    orders.extend(dict(action="HOLD", coin=c,
+                       reason="held coin is absent from usable listing data; exchange bracket remains monitored")
+                  for c in management_missing)
     todo = [o for o in orders if o["action"] in ("OPEN", "CLOSE")]
     decision = time.strftime("%Y-%m-%d", time.gmtime(last_closed))
     plan_id = ex.record_plan(con, decision, todo, dict(orders=orders)) if todo else None
@@ -261,14 +303,24 @@ def execute(client=None, con=None, confirm=input):
         print(f"  {o['action']} {o['coin']}" + (f" ~Rs {o['planned_notional_inr']:,.0f}" if o["action"] == "OPEN" else ""))
     if confirm("\nType YES to place these real orders: ").strip() != "YES":
         sys.exit("aborted: nothing placed")
-    final, summary = ex.execute(con, client or Client(), row["id"], "terminal YES", alert=print)
+    import telegram_bot
+    def telegram_alert(msg):
+        delivered = telegram_bot.send(msg) is not None
+        print(msg)
+        return delivered
+    final, summary = ex.execute(con, client or Client(), row["id"], "terminal YES", alert=telegram_alert)
     print(f"\nplan {row['id']}: {final}\n  " + "\n  ".join(summary))
     print("Check the Mudrex app: each new position should show its stop-loss.")
     return final
 
 
 def reconcile(client=None, con=None):
-    ex.reconcile(con or ex.db(), client or Client(), alert=print)
+    import telegram_bot
+    def telegram_alert(msg):
+        delivered = telegram_bot.send(msg) is not None
+        print(msg)
+        return delivered
+    ex.reconcile(con or ex.db(), client or Client(), alert=telegram_alert)
     print("reconcile done")
 
 

@@ -276,6 +276,19 @@ def test_live_build_orders_safety():
     o = {x["coin"]: x for x in lt.build_orders(targets, {}, set(), prices, atrs, specs, 5000, {"XRP": False},
                                                None, 102)}
     assert o["XRP"]["action"] == "SKIP" and "stopped out" in o["XRP"]["reason"]
+    # A bot-owned coin that is no longer entry-eligible remains in the management universe. It may be closed,
+    # but the same coin cannot be used for a new entry until a later cycle selects it again.
+    old_targets = {"XRP": 0.2, "OLD": -0.2}
+    old_specs = {"XRP": dict(spec), "OLD": dict(spec)}
+    old_prices, old_atrs = {"XRP": 1.5, "OLD": 1.5}, {"XRP": 0.02, "OLD": 0.02}
+    o = {x["coin"]: x for x in lt.build_orders(
+        old_targets, {"OLD": {"id": "old-pos", "side": "LONG"}}, set(), old_prices, old_atrs,
+        old_specs, 5000, {}, None, 102, basket=("XRP", "OLD"), entry_basket=("XRP",))}
+    assert o["OLD"]["action"] == "CLOSE" and o["OLD"]["position_id"] == "old-pos"
+    o = {x["coin"]: x for x in lt.build_orders(
+        old_targets, {}, set(), old_prices, old_atrs, old_specs, 5000, {}, None, 102,
+        basket=("XRP", "OLD"), entry_basket=("XRP",))}
+    assert o["OLD"]["action"] == "SKIP" and "not eligible" in o["OLD"]["reason"]
 
 
 def test_btc_mood_fails_closed_on_missing_data():

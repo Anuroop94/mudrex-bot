@@ -16,6 +16,7 @@ import trade_policy
 from mudrex_client import Client
 
 trade_policy.AUTONOMOUS_HEDGE_READY = True  # explicit in-process fake-exchange test unlock
+ex.ALLOW_TEST_ALERT_SINK = True              # explicit fake notifier; production remains fail-closed
 
 PRICES = {"XRP": 1.5, "ADA": 0.26, "DOGE": 0.1, "LINK": 14.0, "AVAX": 11.0, "TRX": 0.34}
 NOSLEEP = lambda s: None
@@ -254,7 +255,7 @@ def test_unknown_bot_equity_after_fill_leads_to_exit():
 
     def equity_fails_on_check(con_, client, positions, rate):
         call_count[0] += 1
-        if call_count[0] >= 2:  # fail on 2nd and later calls (after fill in after_fill_budget)
+        if call_count[0] >= 3:  # initial + immediate pre-submit pass; fail after fill in after_fill_budget
             raise ex.PnlUnknown("a closed bot position's P&L is not yet visible")
         return real_bot_equity(con_, client, positions, rate)
 

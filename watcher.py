@@ -11,6 +11,7 @@
   - writes watch_status.json (heartbeat) and alerts if the approver heartbeat goes stale
 """
 import csv
+import hashlib
 import json
 import os
 import subprocess
@@ -21,6 +22,7 @@ from datetime import datetime
 import config
 import execution as ex
 import s1
+import trade_policy
 from mudrex_client import Ambiguous, ApiError, Client
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -48,12 +50,29 @@ def log(msg):
         f.write(f"{ist_str()} IST  {msg}\n")
 
 
-def notify(msg, buttons=None):
-    """Telegram (if configured) + Windows balloon + log. Returns False only if Telegram is configured and the
-    message could not be delivered (callers that must be sure, like the daily plan, retry on False)."""
-    log(f"NOTIFY {msg}")
+def _telegram_send(msg, buttons=None):
+    """Low-level delivery callback. Callers that need durability must queue before using it."""
     import telegram_bot
-    delivered = (not telegram_bot.enabled()) or telegram_bot.send(msg, buttons) is not None
+    return telegram_bot.send(msg, buttons) is not None if telegram_bot.enabled() else False
+
+
+def notify(msg, buttons=None, *, con=None, dedupe_key=None):
+    """Telegram + local notice.
+
+    Plain watcher updates use the durable execution outbox. Interactive messages retain their own immutable-plan
+    retry state because the generic outbox intentionally stores no approval buttons.
+    """
+    log(f"NOTIFY {msg}")
+    if buttons:
+        delivered = _telegram_send(msg, buttons)
+    elif not trade_policy.TELEGRAM_UPDATES_REQUIRED:
+        delivered = _telegram_send(msg)
+    else:
+        outbox = con or ex.db()
+        key = dedupe_key or (f"watcher:{ist_str('%Y-%m-%d')}:" +
+                             hashlib.sha256(msg.encode("utf-8")).hexdigest())
+        oid = ex.enqueue_alert(outbox, msg, dedupe_key=key, critical=True)
+        delivered = ex.deliver_alert(outbox, _telegram_send, oid)
     safe = msg.replace("'", "").replace('"', "")[:240]
     ps = ("Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; "
           "$n=New-Object System.Windows.Forms.NotifyIcon; $n.Icon=[System.Drawing.SystemIcons]::Information; "
@@ -225,6 +244,7 @@ def check_approver(st, now=None):
 def check(st, client=None, con=None, make_plan=None):
     client = client or Client()
     con = con or ex.db()
+    ex.retry_alerts(con, _telegram_send)
     ex.recover_ownership(con, client)
     positions = client.positions()
     owned = ex.owned_ids(con)
@@ -249,15 +269,16 @@ def check(st, client=None, con=None, make_plan=None):
         if st.get("pnl_unknown_warned") != ist_str("%Y-%m-%d"):
             st["pnl_unknown_warned"] = ist_str("%Y-%m-%d")
             notify(f"Bot P&L not confirmed yet ({pnl_unknown}): new entries are blocked until Mudrex shows it.")
-    caps = ex.caps_state(con, bot_eq, ex.unrealized_inr(con, positions, rate), trusted=pnl_unknown is None)
+    caps = ex.caps_state(con, bot_eq, ex.unrealized_inr(con, positions, rate), trusted=pnl_unknown is None,
+                         open_price_at=client.open_price_at)
 
     verified = {r["position_id"]: (r["stop_price"], r["target_price"]) for r in con.execute(
         "SELECT position_id, stop_price, target_price FROM orders WHERE action='OPEN' AND stop_price IS NOT NULL")}
     for v in view:
         coin = v["symbol"].removesuffix("USDT")
-        if not v["bot"] and coin in s1.BASKET and v["id"] not in st.setdefault("warned_manual", []):
+        if not v["bot"] and v["id"] not in st.setdefault("warned_manual", []):
             st["warned_manual"].append(v["id"])
-            notify(f"Manual {v['side']} on {coin} (an S1 coin): the bot will not trade {coin} while it is open.")
+            notify(f"Manual {v['side']} on {coin}: the bot will not trade {coin} while it is open.")
         if not v["bot"]:
             continue
         wanted = verified.get(v["id"])
@@ -328,7 +349,7 @@ def check(st, client=None, con=None, make_plan=None):
         make_plan = lambda: live_trader.plan(client, con)   # noqa: E731
     maybe_plan(st, make_plan,
                auto_execute=lambda p: ex.execute(con, client, p["plan_id"], "autonomous cycle",
-                                                  alert=lambda msg: notify(msg)))
+                                                  alert=_telegram_send))
 
     check_approver(st)
     save(STATUS_PATH, dict(at=time.time(), ok=True, positions=view, guard=guard, check_every_sec=CHECK_SEC,

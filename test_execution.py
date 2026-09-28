@@ -18,6 +18,7 @@ import trade_policy                                     # noqa: E402
 from mudrex_client import Ambiguous, Client, Rejected   # noqa: E402
 
 trade_policy.AUTONOMOUS_HEDGE_READY = True              # explicit in-process fake-exchange test unlock
+ex.ALLOW_TEST_ALERT_SINK = True                          # explicit fake notifier; production stays fail-closed
 
 PRICES = {"XRP": 1.5, "ADA": 0.26, "DOGE": 0.1, "LINK": 14.0, "AVAX": 11.0, "TRX": 0.34}
 NOSLEEP = lambda s: None                                # noqa: E731
@@ -29,6 +30,8 @@ def setup(prices=PRICES):
     fake = fake_mudrex.FakeMudrex(prices)
     client = Client(base=fake.url, secret="test", timeout=0.5, sleep=NOSLEEP)
     con = ex.db(os.path.join(tmp, "exec.db"))
+    con.execute("INSERT OR REPLACE INTO ledger(day,start_equity,trusted) VALUES(?,?,1)",
+                (ex.ist_day(), s1.CAPITAL_CAP_INR))
     return tmp, fake, client, con
 
 
@@ -457,11 +460,13 @@ def test_unconfirmed_bot_pnl_blocks_entries():
 
 def test_daily_cap_counts_losses_realized_before_restart():
     tmp, fake, client, con = setup()
+    con.execute("DELETE FROM ledger WHERE day=?", (ex.ist_day(),))
     con.execute("INSERT INTO owned(position_id, coin, client_order_id, opened_at, closed_at, realized_pnl) "
                 "VALUES('p1','XRP','s1-x',?,?,-500)", (int(time.time()) - 60, int(time.time()) - 30))
     pid = plan(con, ["ADA"])                                  # fresh process/day: no ledger row yet
     ex.execute(con, client, pid, "t", NOSLEEP)
-    assert "loss cap" in states(con, pid)["ADA"][1] and fake.submits == 0   # absolute Rs500 owner limit
+    why = states(con, pid)["ADA"][1]
+    assert fake.submits == 0 and ("loss cap" in why or "starting balance" in why)
     fake.stop()
 
 
@@ -566,6 +571,24 @@ def test_freshness_rechecked_right_before_the_order_is_sent():
         assert st[0] == "FAILED" and ("drifted" in st[1] if hook == "price" else "too old" in st[1]), st
         assert fake.submits == 0
         fake.stop()
+
+
+def test_bracket_is_revalidated_against_price_immediately_before_submit():
+    tmp, fake, client, con = setup()
+    px = PRICES["XRP"]
+    pid = ex.record_plan(con, "d", [dict(
+        coin="XRP", action="OPEN", side="LONG", planned_price=px, notional_inr=1000,
+        atr=0.01, stop_loss=px - 0.01, take_profit=px + 0.015,
+        leverage=3, planned_risk_inr=20,
+    )], {})
+    # The move stays inside the general 2% drift allowance, but crosses the immutable target. The final
+    # pre-POST gate must reject this stale bracket rather than opening an already-invalid position.
+    fake.hooks["on_leverage"] = lambda: fake.prices.__setitem__("XRP", px + 0.02)
+    ex.execute(con, client, pid, "t", NOSLEEP)
+    st = states(con, pid)["XRP"]
+    assert st[0] == "FAILED" and "invalid live bracket" in st[1], st
+    assert fake.submits == 0
+    fake.stop()
 
 
 def test_recovery_only_owns_positions_the_journal_verified():
@@ -1005,12 +1028,18 @@ def test_legacy_baseline_marked_untrusted_on_upgrade():
     assert con.execute("SELECT trusted FROM ledger WHERE day=?", (ex.ist_day(),)).fetchone()[0] == 0
 
 
-def test_daily_baseline_from_midnight_mark_or_blocked():
+def test_daily_baseline_requires_exact_midnight_mark_or_blocks():
     tmp, fake, client, con = setup()
     D, off = 86400, ex.config.IST_OFFSET
     midnight = (int(time.time()) + off) // D * D - off + D           # next IST midnight
     ex.caps_state(con, 5000, 0, now=midnight - 300)                   # watcher mark 5 min before midnight
-    c = ex.caps_state(con, 4900, 0, now=midnight + 3600)
+    con.execute("INSERT INTO owned(position_id, coin, client_order_id, opened_at) VALUES('carry','XRP','s1-c',?)",
+                (midnight - 3600,))
+    c = ex.caps_state(con, 4900, -100, now=midnight + 3600)
+    assert not c["baseline_ok"]                         # a nearby pre-midnight mark is never called exact
+    con.execute("DELETE FROM ledger WHERE day=?", (c["day"],))
+    con.execute("INSERT OR REPLACE INTO marks(at,equity,trusted) VALUES(?,?,1)", (midnight, 5000))
+    c = ex.caps_state(con, 4900, -100, now=midnight + 3601)
     assert c["baseline_ok"] and c["start"] == 5000 and round(c["pnl"]) == -100
     con.execute("INSERT INTO owned(position_id, coin, client_order_id, opened_at) VALUES('p','XRP','s1-z',1)")
     c = ex.caps_state(con, 4600, -400, now=midnight + D + 7200)       # no mark before the next midnight
@@ -1088,25 +1117,62 @@ def test_unresolved_plan_blocks_entries_but_not_closes():
     fake.stop()
 
 
-def test_alert_failure_never_breaks_execution():
+def test_alert_failure_before_exposure_blocks_entry_and_is_durable():
     tmp, fake, client, con = setup()
 
     def broken(msg):
         raise ConnectionError("telegram down")
     pid = plan(con, ["XRP"])
     final, _ = ex.execute(con, client, pid, "t", NOSLEEP, broken)
-    assert final == "COMPLETE"
+    assert final == "FAILED" and fake.submits == 0
     assert con.execute("SELECT COUNT(*) FROM events WHERE kind='alert_failed'").fetchone()[0] >= 1
+    assert ex.pending_alerts(con, critical_only=True) >= 1
     fake.stop()
 
 
-def test_false_alert_result_is_journaled_without_breaking_execution():
+def test_false_alert_result_blocks_entry_and_is_journaled():
     tmp, fake, client, con = setup()
     pid = plan(con, ["XRP"])
     final, _ = ex.execute(con, client, pid, "t", NOSLEEP, lambda msg: False)
-    assert final == "COMPLETE"
+    assert final == "FAILED" and fake.submits == 0
     assert con.execute("SELECT COUNT(*) FROM events WHERE kind='alert_failed'").fetchone()[0] >= 1
     fake.stop()
+
+
+def test_outbox_survives_restart_and_retries_delivery():
+    tmp, fake, client, con = setup()
+    oid = ex.enqueue_alert(con, "durable", dedupe_key="test:durable")
+    assert not ex.deliver_alert(con, lambda _msg: False, oid)
+    path = con.execute("PRAGMA database_list").fetchone()[2]
+    con.close()
+    con = ex.db(path)
+    con.execute("UPDATE telegram_outbox SET next_attempt_at=0 WHERE id=?", (oid,))
+    sent = []
+    assert ex.retry_alerts(con, lambda msg: sent.append(msg) or True)
+    assert sent and ex.pending_alerts(con) == 0
+    fake.stop()
+
+
+def test_plain_watcher_updates_use_the_durable_outbox():
+    import watcher
+    tmp, fake, client, con = setup()
+    sent = []
+    original = watcher._telegram_send, watcher.LOG_PATH, watcher.subprocess.Popen
+    watcher.LOG_PATH = os.path.join(tmp, "watcher.log")
+    watcher._telegram_send = lambda msg, buttons=None: False
+    watcher.subprocess.Popen = lambda *a, **k: None
+    try:
+        assert not watcher.notify("durable watcher warning", con=con, dedupe_key="watcher:test")
+        assert ex.pending_alerts(con) == 1
+        con.execute("UPDATE telegram_outbox SET next_attempt_at=0")
+        watcher._telegram_send = lambda msg, buttons=None: sent.append(msg) or True
+        assert ex.retry_alerts(con, watcher._telegram_send)
+        assert sent and ex.pending_alerts(con) == 0
+        assert watcher.notify("durable watcher warning", con=con, dedupe_key="watcher:test")
+        assert con.execute("SELECT COUNT(*) FROM telegram_outbox WHERE dedupe_key='watcher:test'").fetchone()[0] == 1
+    finally:
+        watcher._telegram_send, watcher.LOG_PATH, watcher.subprocess.Popen = original
+        fake.stop()
 
 
 def test_watcher_flags_moved_stop_and_retries_cap_close_delivery():
@@ -1214,6 +1280,68 @@ def test_filled_then_failed_set_counts_but_rejected_set_does_not():
                     (cycle, int(time.time()), rows[coin]["set_id"]))
         con.execute("UPDATE orders SET state='FAILED', filled_qty=? WHERE id=?", (filled, rows[coin]["id"]))
     assert ex.cycle_set_counts(con, cycle) == (1, 0)
+    fake.stop()
+
+
+def test_exact_boundary_baseline_from_exchange_facts():
+    """The IST day-start balance is exact from exchange evidence, or untrusted; never a nearby local mark."""
+    tmp, fake, client, con = setup()
+    now = time.time()
+    midnight = int((now + 19800) // 86400 * 86400 - 19800)
+    day = ex.ist_day(now)
+    con.execute("DELETE FROM ledger")
+
+    def caps(price=None, trusted=True):
+        return ex.caps_state(con, 5000, 0, now=now, trusted=trusted, open_price_at=price)
+
+    c = caps()                                               # nothing ever owned: exactly the allocation
+    assert c["baseline_ok"] and c["start"] == s1.CAPITAL_CAP_INR
+    con.execute("DELETE FROM ledger")
+    # closed before midnight by Mudrex's own time, although the bot only noticed after midnight
+    con.execute("INSERT INTO owned(position_id, coin, client_order_id, opened_at, closed_at, realized_pnl, "
+                "ex_opened_at, ex_closed_at) VALUES('a','XRP','c-a',?,?,-100,?,?)",
+                (midnight - 7200, midnight + 60, midnight - 7200, midnight - 600))
+    c = caps()
+    assert c["baseline_ok"] and c["start"] == s1.CAPITAL_CAP_INR - 100
+    # a SHORT carried across midnight: valued at the exchange candle open at exactly midnight
+    con.execute("DELETE FROM ledger")
+    con.execute("INSERT INTO owned(position_id, coin, client_order_id, opened_at, ex_opened_at, ex_side, ex_qty, "
+                "ex_entry, ex_rate) VALUES('b','ADA','c-b',?,?,'SHORT',100,0.30,100)", (midnight - 3600, midnight - 3600))
+    assert not caps()["baseline_ok"]                         # no boundary price source: fails closed
+    asked = []
+    c = caps(price=lambda coin, ts: asked.append((coin, ts)) or 0.28)
+    assert c["baseline_ok"] and asked == [("ADA", midnight)]
+    assert abs(c["start"] - (s1.CAPITAL_CAP_INR - 100 + 100 * (0.28 - 0.30) * -1 * 100)) < 1e-6   # short gained Rs200
+    # an untrusted baseline is upgraded later; a trusted one is kept
+    con.execute("DELETE FROM ledger")
+    assert not caps(price=lambda coin, ts: None)["baseline_ok"]
+    assert caps(price=lambda coin, ts: 0.28)["baseline_ok"]
+    assert con.execute("SELECT trusted FROM ledger WHERE day=?", (day,)).fetchone()[0] == 1
+    # unconfirmed bot P&L can never produce a trusted baseline
+    con.execute("DELETE FROM ledger")
+    assert not caps(price=lambda coin, ts: 0.28, trusted=False)["baseline_ok"]
+    # a position first seen after midnight with no exchange open time: unknown -> fails closed
+    con.execute("DELETE FROM ledger")
+    con.execute("INSERT INTO owned(position_id, coin, client_order_id, opened_at) VALUES('c','DOGE','c-c',?)",
+                (midnight + 120,))
+    assert not caps(price=lambda coin, ts: 0.28)["baseline_ok"]
+    fake.stop()
+
+
+def test_sync_records_exchange_open_and_close_times():
+    tmp, fake, client, con = setup()
+    pid = plan(con, ["XRP"])
+    assert ex.execute(con, client, pid, "t", NOSLEEP)[0] == "COMPLETE"
+    positions = client.positions()
+    ex.sync_owned(con, client, positions)
+    r = con.execute("SELECT * FROM owned").fetchone()
+    assert r["ex_opened_at"] and r["ex_side"] == "LONG" and r["ex_qty"] > 0 and r["ex_entry"] > 0
+    client.close_position(r["position_id"])
+    ex.sync_owned(con, client, client.positions())
+    r = con.execute("SELECT * FROM owned").fetchone()
+    assert r["closed_at"] and r["ex_closed_at"] and r["ex_closed_at"] >= r["ex_opened_at"]
+    assert client.open_price_at("XRP", int(time.time()) // 900 * 900) == fake.prices["XRP"]
+    assert client.open_price_at("XRP", int(time.time()) // 900 * 900 + 1) is None   # not a candle boundary
     fake.stop()
 
 

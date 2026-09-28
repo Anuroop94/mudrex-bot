@@ -4,7 +4,9 @@
 `trade_policy.AUTONOMOUS_HEDGE_READY = False`. Keep `STOP` present through review and shadow testing. Backtests and
 paper fills are not guarantees.
 
-The strategy evaluates XRP, ADA, DOGE, LINK, AVAX and TRX for a qualified LONG or SHORT. The IST calendar day is the
+The strategy evaluates every positively verified, liquid crypto future in the point-in-time entry universe for a
+qualified LONG or SHORT. Explicit stocks/commodities and unknown classifications fail closed; rows without asset
+metadata are limited to the reviewed crypto allowlist. The IST calendar day is the
 durable 24-hour cycle. It targets two qualified sets, may take a third only with a strong signal, and never fabricates
 a weak trade to meet the target. After certification, sets 1-3 are autonomous; an extra set requires a fresh Telegram
 approval bound to exactly one immutable proposal. Every entry must have an exchange-verified stop and target.
@@ -19,7 +21,9 @@ approval bound to exactly one immutable proposal. Every entry must have an excha
 | Collective stop ledger | `adaptive_risk.py` + `execution.py` | gross realized losses + verified risk at every active stop + candidate risk/cost buffer must stay at or below Rs500. A candidate is capped at Rs250. Profits do not replenish this loss allowance |
 | Variable leverage | `adaptive_risk.py` + `execution.py` | per-coin isolated leverage is selected from confidence, volatility and exchange limits, hard-capped at 5x and read back before entry. Leverage never increases risk-sized quantity |
 | Protective exit | `execution.py` | if an owned fill cannot get both protections verified, has unsafe liquidation geometry, or breaks amount/risk/margin constraints, the bot exits that position without another tap. STOP cannot block risk-reducing protection or exit |
-| Day-start balance | `execution.caps_state` | taken from the watcher's mark just before IST midnight; if the bot was not watching then while positions were open, no new entries that day |
+| Day-start balance | `execution.caps_state` | exact IST-midnight mark, or exact flat-at-boundary ledger value; a nearby mark is never substituted and an unvalued carry blocks new entries |
+| Telegram delivery | `execution.telegram_outbox` | durable leased retries; all older critical updates and a current entry canary must be delivered before leverage/order mutation |
+| Bounded learning | `bounded_learning.py` | shadow by default; after explicit promotion it may only rank/veto base-qualified candidates and never changes risk inputs |
 | Data freshness | `live_trader.bad_data` | a coin with missing/gappy daily history gets no decision; unknown BTC regime blocks new entries |
 
 ## Modes
@@ -48,7 +52,8 @@ Run `python live_trader.py reconcile`. It looks up every unfinished order by its
 records fills, verifies (or repairs) both stop-loss and take-profit, and marks never-sent orders FAILED. It **never
 blindly resubmits** an ambiguous entry.
 Plans stuck in `RECONCILE_REQUIRED` mean Mudrex could not confirm an order: check the Mudrex app, then reconcile again.
-Journal: `execution.db` (tables `plans`, `orders`, `owned`, `ledger`, `events`).
+Journal: `execution.db` (including `plans`, `orders`, `owned`, `ledger`, `events`, `telegram_outbox`, and
+`universe_snapshots`).
 
 ## Manual trading
 The bot only touches positions it opened (tracked by Mudrex position ID). If you hold a manual position (long or
@@ -73,8 +78,11 @@ short) on an S1 coin, the bot refuses to trade that coin and alerts you. Manual 
   differs by more than 3%. No recent rate -> no entries.
 - **History**: order/position history supports only `limit` (no pagination). The local `owned` table (written on
   every verified fill) is authoritative; if a closed bot position's P&L is not visible, new entries are blocked.
-- **Daily cap baseline**: allocation + P&L realized before IST midnight + unrealized at the first check of the day.
-  Unrealized moves between midnight and that first check are not counted.
+- **Daily cap baseline**: exact IST-midnight equity is required for a carried position. Without a trustworthy exact
+  boundary valuation, new entries fail closed for that cycle. A pre-midnight or first-check estimate is not used.
+- **Universe**: the 24-hour liquidity threshold is 12,000,000 USDT notional. Unknown asset classes are excluded;
+  current-name heuristics never promote an unreviewed symbol.
+- **Learning**: `bounded_learning.PROMOTED` remains false until an independent walk-forward review approves it.
 - **Adaptive bracket**: normal volatility uses 1.5 ATR, elevated 2 ATR and high 2.5 ATR; extreme volatility is
   vetoed. Target is at least 1.5 times stop distance. Both legs are side-aware, adjusted to the fill and verified.
 - **Rs500 is a threshold, not a guarantee**: gaps, slippage, fees and exchange outages can produce a larger loss.

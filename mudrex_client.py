@@ -128,6 +128,18 @@ class Client:
         an order Mudrex acknowledged is never treated as 'not placed'."""
         return self.get("/v1/futures/orders/detail", {"order_id": order_id})
 
+    def open_price_at(self, coin, ts, interval="15t", sec=900):
+        """Mudrex candle OPEN price for the candle starting exactly at `ts` (a candle boundary such as IST midnight),
+        or None if Mudrex has no candle with that start time. Used to value positions carried across the boundary."""
+        if ts % sec:
+            return None
+        sym = f"{coin}/USDT"
+        d = self.get("/v1/price/kline", {"assets": sym, "aggregation": interval, "start_time": ts, "end_time": ts})
+        for r in ((d or {}).get("asset_ticks") or {}).get(sym.lower(), []):
+            if int(r[0]) == ts:
+                return float(r[1])
+        return None
+
     HISTORY_LIMIT = 500
 
     def history(self, kind):
