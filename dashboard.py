@@ -133,6 +133,8 @@ EVENT_ICON = {"stop": ("ShieldAlert", "amber"), "execute": ("Activity", "blue"),
 def ui():
     """Read-only. Every value comes from the bot's own files/journal; nothing is invented or sampled."""
     import data
+    import live_trader
+    import s4
     import execution as ex
     import s1
     now = time.time()
@@ -249,13 +251,23 @@ def ui():
                   message=msg, title=f"Plan {prow['id']}" if prow else "No plan yet",
                   decisionLabel=f"Decision on {prow['decision_day']} close" if prow else "",
                   time=_ist(prow["created_at"], "%d %b %H:%M IST") if prow else "", items=plan_items),
-        strategy=dict(name="Adaptive Two-Sided Trend", description="LONG/SHORT · IST 24-hour cycle · 6-coin basket",
-                      leverage=f"{L['leverage']}×", stop=f"{s1.SL_ATR}× ATR", btcFilter="200-day average",
-                      allocationCap=f"₹{L['allocation_inr']:,}", signal="9 Donchian trend judges (5-360 days)",
-                      marketFilter="BTC at/above its 200-day average", basket=" · ".join(s1.BASKET),
-                      entryMode="Sets 1-3 autonomous after certification; exact approval above three",
-                      stopModel=L["safety_stop"], target="At least 1.5:1 reward/risk; exchange verified",
-                      tradeRisk=f"₹{L['max_trade_stop_risk']:,.0f} candidate · ₹{L['max_total_stop_risk']:,.0f} collective"),
+        strategy=(dict(name="S4 Intraday Momentum Sets", description="LONG/SHORT · 24-hour IST cycle · all liquid coins",
+                       leverage=f"{L['leverage']}×", stop=f"{s4.SL_DATR:g}× daily ATR", btcFilter="200-day average",
+                       allocationCap=f"₹{L['allocation_inr']:,}", signal="strongest 24h mover each hour",
+                       marketFilter="LONG only above BTC 200-day average, SHORT only below",
+                       basket="verified liquid crypto futures (live_universe)",
+                       entryMode="Sets 1-3 autonomous after certification; a 4th needs your Telegram tap",
+                       stopModel=f"SL {s4.SL_DATR:g}× / TP {s4.TP_DATR:g}× daily ATR, on Mudrex with the order",
+                       target=f"{s4.TP_DATR:g}× daily ATR; closed after {s4.HOLD_H}h at most",
+                       tradeRisk=f"₹{s4.SET_RISK_INR:,.0f} per set · ₹{L['max_total_stop_risk']:,.0f} per day")
+                  if live_trader.STRATEGY == "S4" else
+                  dict(name="Adaptive Two-Sided Trend", description="LONG/SHORT · IST 24-hour cycle · daily signals",
+                       leverage=f"{L['leverage']}×", stop=f"{s1.SL_ATR}× ATR", btcFilter="200-day average",
+                       allocationCap=f"₹{L['allocation_inr']:,}", signal="9 Donchian trend judges (5-360 days)",
+                       marketFilter="BTC at/above its 200-day average", basket=" · ".join(s1.BASKET),
+                       entryMode="Sets 1-3 autonomous after certification; exact approval above three",
+                       stopModel=L["safety_stop"], target="At least 1.5:1 reward/risk; exchange verified",
+                       tradeRisk=f"₹{L['max_trade_stop_risk']:,.0f} candidate · ₹{L['max_total_stop_risk']:,.0f} collective")),
         positions=positions,
         activity=[dict(icon=EVENT_ICON.get(e["kind"], ("Activity", "gray"))[0], title=e["kind"].title(),
                        detail=e["msg"][:220], tone=EVENT_ICON.get(e["kind"], ("Activity", "gray"))[1],
