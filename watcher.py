@@ -135,7 +135,7 @@ def maybe_plan(st, make_plan, now_hm=None, today=None, auto_execute=None, now=No
         # Re-planning runs every 15 min: repeat a non-actionable message (nothing to do / blocked) only when it
         # changes, or Telegram gets ~75 identical messages a day. Actionable plans are always sent.
         sig = [p.get("blocked"), sorted((o.get("action"), o.get("coin"), o.get("side")) for o in p.get("orders", [])
-                                        if o.get("action") in ("OPEN", "CLOSE"))]
+                                        if o.get("action") in ("OPEN", "CLOSE", "PREVIEW"))]
         repeat = ((not actionable and buttons is None and st.get("last_plan_sig") == sig) or
                   bool(p.get("plan_id") and p.get("plan_id") == st.get("last_plan_id")))   # same plan: sent already
         sent = True if repeat else notify(text, buttons=buttons)

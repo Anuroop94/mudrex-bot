@@ -189,10 +189,13 @@ def s4_orders(owned, opened_at, D, datr, specs, now, blocked, rate, bot_eq, real
                             "S4 position with unknown open time: closed so it cannot be held without limit"))
         else:
             out.append(dict(action="HOLD", coin=c, reason=f"S4 set open {age / 3600:.0f}h; exchange SL/TP manage it"))
-    why = ("a set is open; the next set starts after it closes" if mine else blocked or
-           ("daily set limit reached" if available_slots <= 0 else None))
+    why = ("a set is open; the next set starts after it closes" if mine else
+           None if blocked else "daily set limit reached" if available_slots <= 0 else None)
     if why:
         return out + [dict(action="SKIP", coin="-", reason=why)]
+    # Blocked (STOP = dry run, caps, ...): still find the setup and show it as a PREVIEW. A PREVIEW is never
+    # recorded as a plan and never reaches execution (only OPEN/CLOSE are); it lets the owner watch the strategy.
+    action = "PREVIEW" if blocked else "OPEN"
     t = now // HOUR * HOUR - HOUR                                  # last CLOSED hour
     held = set(owned)                                              # one-way per symbol: never a held coin
     found = s4.setups(dict(D, coins=[c for c in D["coins"] if c not in held]), t)
@@ -230,10 +233,11 @@ def s4_orders(owned, opened_at, D, datr, specs, now, blocked, rate, bot_eq, real
     if qty < s["min_qty"] or qty * px < s["min_notional"] or not lev or lev > max_lev:
         return out + [dict(action="SKIP", coin=c, reason="risk-sized order below Mudrex minimum or above margin")]
     planned_risk = qty * per_unit + cost_buffer_inr
-    out.append(dict(action="OPEN", coin=c, side=side, planned_price=px, notional_inr=round(notional, 2), qty=qty,
+    out.append(dict(action=action, coin=c, side=side, planned_price=px, notional_inr=round(notional, 2), qty=qty,
                     atr=a, stop_loss=stop, take_profit=target, est_stop=round(stop, 8), est_target=round(target, 8),
                     leverage=float(lev), planned_risk_inr=round(planned_risk, 2), confidence=1.0, strategy="S4",
-                    volatility_tier="s4", reason=f"S4 {side.lower()} momentum (strongest 24h mover)"))
+                    volatility_tier="s4", reason=f"S4 {side.lower()} momentum (strongest 24h mover)"
+                    + (f"; not placed: {blocked}" if blocked else "")))
     return out
 
 

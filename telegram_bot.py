@@ -117,6 +117,13 @@ def plan_message(p):
     """(text, buttons) for a plan. Plain text with ``` blocks; render() styles it when it is sent."""
     tag = _tag(p)
     todo = [o for o in p["orders"] if o["action"] in ("OPEN", "CLOSE")]
+    previews = [o for o in p["orders"] if o["action"] == "PREVIEW"]
+    if not todo and previews:                              # blocked (e.g. STOP = dry run): what it WOULD trade
+        f = previews[0]
+        lines = [f"👀 {tag} DRY RUN · would trade {f['coin']} {f.get('side', 'LONG')}"]
+        for o in previews:
+            lines += _order_block(o)
+        return "\n".join(lines + [f"⛔ Not placed: {p.get('blocked')}"]), None
     if not todo:
         return (f"💤 {tag} · nothing to do now" +
                 (f"\n⛔ New trades blocked: {p['blocked']}" if p.get("blocked") else "")), None

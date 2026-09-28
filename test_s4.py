@@ -184,6 +184,21 @@ def test_s4_plans_around_the_clock_but_s1_waits_for_the_daily_close():
         watcher.notify, watcher.LOG_PATH, lt.STRATEGY = orig
 
 
+def test_dry_run_shows_a_preview_that_can_never_be_placed():
+    import telegram_bot as tg
+    out = orders(blocked="STOP file present")
+    prev = [x for x in out if x["action"] == "PREVIEW"]
+    assert prev and not any(x["action"] in ("OPEN", "CLOSE") for x in out)
+    assert "not placed: STOP file present" in prev[0]["reason"]
+    text, buttons = tg.plan_message(dict(plan_id=None, live_enabled=True, blocked="STOP file present",
+                                         strategy=s4.NAME, orders=out))
+    assert text.startswith("👀 S4 DRY RUN · would trade XRP LONG") and buttons is None
+    assert "Not placed: STOP file present" in text
+    # live_trader.plan records only OPEN/CLOSE: a preview never becomes a plan, so it can never be executed
+    import inspect
+    assert 'o["action"] in ("OPEN", "CLOSE")' in inspect.getsource(lt.plan)
+
+
 def test_research_and_live_share_one_setup_function():
     import s4_research
     assert s4_research.setups is s4.setups
