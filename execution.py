@@ -116,7 +116,9 @@ def db(path=None):
                        # and the position's side/qty/entry/rate while it was open
                        ("owned", "ex_opened_at INTEGER"), ("owned", "ex_closed_at INTEGER"), ("owned", "ex_side TEXT"),
                        ("owned", "ex_qty REAL"), ("owned", "ex_entry REAL"), ("owned", "ex_rate REAL"),
-                       ("orders", "strategy TEXT")):                 # which strategy opened it (S4 manages its own)
+                       ("orders", "strategy TEXT"),
+                       # Mudrex price at the IST boundary for a position carried across it (risk reserve)
+                       ("owned", "ex_boundary_at INTEGER"), ("owned", "ex_boundary_px REAL")):                 # which strategy opened it (S4 manages its own)
         if col.split()[0] not in {r["name"] for r in con.execute(f"PRAGMA table_info({table})")}:
             con.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
     if con.execute("SELECT 1 FROM kv WHERE key='marks_v2'").fetchone() is None:
@@ -683,8 +685,8 @@ def boundary_equity(con, midnight, open_price_at=None):
             return None                                             # discovered after midnight, open time unknown
         if not opened_before:
             continue                                                # opened in this cycle: not in the baseline
-        if open_price_at is None or None in (r["ex_qty"], r["ex_entry"], r["ex_side"]):
-            return None
+        if open_price_at is None or None in (r["ex_qty"], r["ex_entry"], r["ex_side"], r["ex_rate"]):
+            return None                                             # includes an unknown INR rate: not exact
         try:
             px = open_price_at(r["coin"], midnight)
         except Exception:                                           # noqa: BLE001 - any failure means unknown
@@ -694,15 +696,16 @@ def boundary_equity(con, midnight, open_price_at=None):
         d = 1 if r["ex_side"] == "LONG" else -1 if r["ex_side"] == "SHORT" else 0
         if not d:
             return None
-        total += r["ex_qty"] * (px - r["ex_entry"]) * d * (r["ex_rate"] or config.INR_PER_USDT)
+        total += r["ex_qty"] * (px - r["ex_entry"]) * d * r["ex_rate"]
+        con.execute("UPDATE owned SET ex_boundary_at=?, ex_boundary_px=? WHERE position_id=?",
+                    (midnight, px, r["position_id"]))
     return total if math.isfinite(total) else None
 
 
 def caps_state(con, equity, unreal=0.0, now=None, trusted=True, open_price_at=None):
     """Bot cycle P&L vs fixed rupee caps. The day-start baseline is exact or UNTRUSTED (entries fail closed):
-      - a trusted equity mark taken at exactly IST midnight, else
       - boundary_equity(): exchange open/close times, positions carried across midnight valued at Mudrex's candle
-        open at exactly midnight (open_price_at). Nearby local marks are never used as a baseline.
+        open at exactly midnight (open_price_at). Local equity marks are never used as a baseline.
     An untrusted baseline is re-evaluated on later calls and upgraded once exact evidence is available."""
     now = now or time.time()
     day = ist_day(now)
@@ -712,9 +715,9 @@ def caps_state(con, equity, unreal=0.0, now=None, trusted=True, open_price_at=No
     row = con.execute("SELECT start_equity, trusted FROM ledger WHERE day=?", (day,)).fetchone()
     if row is None or not row["trusted"]:
         midnight = int((now + config.IST_OFFSET) // 86400 * 86400 - config.IST_OFFSET)
-        mark = con.execute("SELECT equity FROM marks WHERE at=? AND trusted=1", (midnight,)).fetchone()
-        # an unconfirmed bot P&L (trusted=False) can never produce a trusted baseline
-        exact = None if not trusted else mark["equity"] if mark else boundary_equity(con, midnight, open_price_at)
+        # exchange evidence only: a local equity mark (even one stamped 00:00:00) is never the baseline, and an
+        # unconfirmed bot P&L (trusted=False) can never produce a trusted one
+        exact = boundary_equity(con, midnight, open_price_at) if trusted else None
         if exact is not None:
             start, trusted = exact, 1
         else:
@@ -850,12 +853,36 @@ def poll_fill(con, client, row, sleep):
                       filled_qty=float(o["filled_quantity"]), position_id=o.get("future_position_uuid"))
             return o
         if status in TERMINAL_BAD:
+            if moved_money(o):
+                return partial_fill(con, row, o)
             set_order(con, row["id"], state="FAILED", error=f"order {status}")
             set_trade_set_state(con, row, "FAILED")
             return None
         sleep(min(1 + i, 5))
     set_order(con, row["id"], state="RECONCILE_REQUIRED", error="no terminal status yet")
     return None
+
+
+def moved_money(o):
+    """A CANCELLED/EXPIRED/... order that still filled something (or opened a position) moved money."""
+    try:
+        q = float(o.get("filled_quantity") or 0)
+    except (TypeError, ValueError):
+        q = float("nan")
+    return not (math.isfinite(q) and q == 0) or bool(o.get("future_position_uuid"))
+
+
+def partial_fill(con, row, o):
+    """Treat a terminal order with a fill as FILLED, so the fill is verified (SL+TP) or exited, and the set counts.
+    Unreadable fill details: RECONCILE_REQUIRED (entries stay blocked). Returns the order or None."""
+    fp, fq = _num(o.get("filled_price")), _num(o.get("filled_quantity"))
+    if fp is None or fq is None:
+        set_order(con, row["id"], state="RECONCILE_REQUIRED",
+                  error=f"order {o.get('status')} with an unreadable partial fill")
+        return None
+    set_order(con, row["id"], state="FILLED", fill_price=fp, filled_qty=fq, position_id=o.get("future_position_uuid"),
+              error=f"order {o.get('status')} after a partial fill of {fq}")
+    return o
 
 
 def stop_tolerance(fill, step):
@@ -1062,6 +1089,17 @@ def active_stop_risks(con, positions, owned=None):
         if not valid or rate is None or not all(math.isfinite(x) and x > 0 for x in (entry, qty, stop)):
             raise PnlUnknown(f"verified stop/rate missing for held {p.get('symbol')}")
         actual = qty * abs(entry - stop) * rate
+        # A position carried across the IST boundary can lose, inside THIS cycle, everything from Mudrex's price
+        # at the boundary down to its stop (a profit at midnight given back counts against today's Rs500).
+        r = con.execute("SELECT opened_at, ex_opened_at, ex_boundary_at, ex_boundary_px FROM owned "
+                        "WHERE position_id=?", (p["id"],)).fetchone()
+        midnight = int((time.time() + config.IST_OFFSET) // 86400 * 86400 - config.IST_OFFSET)
+        opened = (r["ex_opened_at"] or r["opened_at"]) if r else None
+        if opened is None or opened < midnight:
+            if r is None or r["ex_boundary_at"] != midnight or not r["ex_boundary_px"]:
+                raise PnlUnknown(f"boundary price unknown for carried {p.get('symbol')}")
+            bpx = float(r["ex_boundary_px"])
+            actual = max(actual, qty * max(0.0, (bpx - stop) if side == "LONG" else (stop - bpx)) * rate)
         planned = con.execute("""SELECT planned_risk_inr FROM orders WHERE client_order_id=(
                               SELECT client_order_id FROM owned WHERE position_id=?) ORDER BY id DESC LIMIT 1""",
                               (p["id"],)).fetchone()
@@ -1780,6 +1818,10 @@ def reconcile_plan(con, client, pid, sleep, alert):
                     continue                                           # order history may lag a just-sent order
                 set_order(con, row["id"], state="FAILED", error="not found on exchange after restart")
                 set_trade_set_state(con, row, "FAILED")
+                continue
+            if o.get("status") in TERMINAL_BAD and moved_money(o):
+                if partial_fill(con, row, o) is not None:
+                    protect_and_check(con, client, order_row(con, row["id"]), o, sleep, alert)
                 continue
             if o.get("status") in TERMINAL_BAD:
                 set_order(con, row["id"], state="FAILED", error=f"order {o['status']}")

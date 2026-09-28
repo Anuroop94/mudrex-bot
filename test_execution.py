@@ -1040,7 +1040,7 @@ def test_daily_baseline_requires_exact_midnight_mark_or_blocks():
     con.execute("DELETE FROM ledger WHERE day=?", (c["day"],))
     con.execute("INSERT OR REPLACE INTO marks(at,equity,trusted) VALUES(?,?,1)", (midnight, 5000))
     c = ex.caps_state(con, 4900, -100, now=midnight + 3601)
-    assert c["baseline_ok"] and c["start"] == 5000 and round(c["pnl"]) == -100
+    assert not c["baseline_ok"]                         # even a local mark stamped 00:00:00 is never the baseline
     con.execute("INSERT INTO owned(position_id, coin, client_order_id, opened_at) VALUES('p','XRP','s1-z',1)")
     c = ex.caps_state(con, 4600, -400, now=midnight + D + 7200)       # no mark before the next midnight
     assert not c["baseline_ok"]                                       # unknown start: callers block new buys
@@ -1342,6 +1342,77 @@ def test_sync_records_exchange_open_and_close_times():
     assert r["closed_at"] and r["ex_closed_at"] and r["ex_closed_at"] >= r["ex_opened_at"]
     assert client.open_price_at("XRP", int(time.time()) // 900 * 900) == fake.prices["XRP"]
     assert client.open_price_at("XRP", int(time.time()) // 900 * 900 + 1) is None   # not a candle boundary
+    fake.stop()
+
+
+def test_cancelled_order_with_a_partial_fill_is_treated_as_filled():
+    """Codex r11 CRITICAL: a CANCELLED/EXPIRED order that still filled moved money: verify or exit it, count it."""
+    tmp, fake, client, con = setup()
+    pid = plan(con, ["XRP"])
+    row = con.execute("SELECT * FROM orders WHERE plan_id=?", (pid,)).fetchone()
+
+    class Stub:
+        def __init__(self, o):
+            self.o = o
+
+        def order_by_client_id(self, cid):
+            return self.o
+    o = dict(status="CANCELLED", filled_quantity="2.0", filled_price="1.5", future_position_uuid="pp")
+    assert ex.poll_fill(con, Stub(o), row, NOSLEEP) is o
+    r = con.execute("SELECT * FROM orders WHERE id=?", (row["id"],)).fetchone()
+    assert r["state"] == "FILLED" and r["filled_qty"] == 2.0 and r["position_id"] == "pp"
+    bad = dict(status="EXPIRED", filled_quantity="nan", filled_price=None)
+    assert ex.poll_fill(con, Stub(bad), row, NOSLEEP) is None
+    assert con.execute("SELECT state FROM orders WHERE id=?", (row["id"],)).fetchone()[0] == "RECONCILE_REQUIRED"
+    none = dict(status="CANCELLED", filled_quantity="0")
+    assert ex.poll_fill(con, Stub(none), row, NOSLEEP) is None
+    assert con.execute("SELECT state FROM orders WHERE id=?", (row["id"],)).fetchone()[0] == "FAILED"
+    # restart reconciliation takes the same path: the partial fill is protected, not dropped
+    con.execute("UPDATE orders SET state='RECONCILE_REQUIRED' WHERE id=?", (row["id"],))
+    con.execute("UPDATE plans SET state='RECONCILE_REQUIRED', approved_at=1, approved_by='t' WHERE id=?", (pid,))
+    seen, orig = [], (ex.protect_and_check, ex.lookup_until_known)
+    ex.protect_and_check = lambda con_, client_, row_, o_, sleep_, alert_: seen.append(o_) or True
+    ex.lookup_until_known = lambda *a_, **k_: o
+    try:
+        ex.reconcile(con, client, NOSLEEP)
+    finally:
+        ex.protect_and_check, ex.lookup_until_known = orig
+    assert seen == [o]
+    fake.stop()
+
+
+def test_carried_position_reserves_risk_from_the_boundary_price():
+    """Codex r11 CRITICAL: a position in profit at midnight can give it all back inside the new cycle."""
+    tmp, fake, client, con = setup()
+    midnight = int((time.time() + 19800) // 86400 * 86400 - 19800)
+    pos = dict(id="c1", symbol="XRPUSDT", order_type="LONG", entry_price="100", quantity="1",
+               stoploss=dict(price="99"), entry_hedge_rate="100")
+    con.execute("INSERT INTO owned(position_id, coin, client_order_id, opened_at, ex_opened_at) "
+                "VALUES('c1','XRP','s1-c1',?,?)", (midnight - 7200, midnight - 7200))
+    try:
+        ex.active_stop_risks(con, [pos], {"c1"})
+        assert False, "carried position without a boundary price must fail closed"
+    except ex.PnlUnknown:
+        pass
+    con.execute("UPDATE owned SET ex_boundary_at=?, ex_boundary_px=105 WHERE position_id='c1'", (midnight,))
+    assert ex.active_stop_risks(con, [pos], {"c1"}) == [600.0]           # (105 - 99) x 1 x Rs100, not Rs100
+    con.execute("UPDATE owned SET opened_at=?, ex_opened_at=? WHERE position_id='c1'", (midnight + 60, midnight + 60))
+    assert ex.active_stop_risks(con, [pos], {"c1"}) == [100.0]           # opened this cycle: entry to stop
+    fake.stop()
+
+
+def test_boundary_valuation_needs_the_exchange_inr_rate():
+    """Codex r11 HIGH: a carried position without its exchange rate is not an exact valuation."""
+    tmp, fake, client, con = setup()
+    now = time.time()
+    midnight = int((now + 19800) // 86400 * 86400 - 19800)
+    con.execute("DELETE FROM ledger")
+    con.execute("INSERT INTO owned(position_id, coin, client_order_id, opened_at, ex_opened_at, ex_side, ex_qty, "
+                "ex_entry) VALUES('r','ADA','c-r',?,?,'LONG',10,0.3)", (midnight - 60, midnight - 60))
+    assert not ex.caps_state(con, 5000, 0, now=now, open_price_at=lambda c, t: 0.31)["baseline_ok"]
+    con.execute("UPDATE owned SET ex_rate=100 WHERE position_id='r'")
+    c = ex.caps_state(con, 5000, 0, now=now, open_price_at=lambda c, t: 0.31)
+    assert c["baseline_ok"] and abs(c["start"] - (5000 + 10 * 0.01 * 100)) < 1e-6
     fake.stop()
 
 
