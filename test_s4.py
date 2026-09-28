@@ -101,6 +101,17 @@ def test_blocked_or_no_slots_or_no_budget_never_opens():
     assert small and small[0]["planned_risk_inr"] <= 500 - 400 + 1e-6              # risk shrinks to what is left
 
 
+def test_invalid_numbers_skip_instead_of_crashing_or_overleveraging():
+    nan = float("nan")
+    for kw in (dict(rate=0.0), dict(rate=nan), dict(bot_eq=nan), dict(bot_eq=0.0), dict(datr={"XRP": nan}),
+               dict(specs={c: dict(SPECS[c], step=0.0) for c in SPECS}),
+               dict(specs={c: dict(SPECS[c], max_leverage=0.0) for c in SPECS}),
+               dict(specs={c: dict(SPECS[c], max_leverage=nan) for c in SPECS}),
+               dict(specs={c: dict(SPECS[c], min_qty=nan) for c in SPECS})):
+        out = orders(**kw)
+        assert not any(x["action"] == "OPEN" for x in out), kw
+
+
 def test_stale_hour_means_no_decision():
     d = D({"XRP": 0.002})
     d["f"]["XRP"]["idx"].pop(LAST)                                              # the last closed hour is missing

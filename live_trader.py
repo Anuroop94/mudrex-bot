@@ -200,8 +200,18 @@ def s4_orders(owned, opened_at, D, datr, specs, now, blocked, rate, bot_eq, real
         return out + [dict(action="SKIP", coin="-", reason="no qualified intraday setup this hour")]
     _, c, side = found[0]
     s, a, px = specs[c], datr.get(c), D["f"][c]["c"][-1]
-    if not a or not px or a <= 0:
-        return out + [dict(action="SKIP", coin=c, reason="daily ATR missing: no bracket possible")]
+
+    def pos(x):                                                   # finite and > 0, else None (fail closed)
+        try:
+            x = float(x)
+        except (TypeError, ValueError):
+            return None
+        return x if math.isfinite(x) and x > 0 else None
+    a, px, rate, bot_eq = pos(a), pos(px), pos(rate), pos(bot_eq)
+    step, max_ex = pos(s.get("step")), pos(s.get("max_leverage"))
+    if None in (a, px, rate, bot_eq, step, max_ex) or pos(s.get("min_qty")) is None \
+            or pos(s.get("min_notional")) is None:
+        return out + [dict(action="SKIP", coin=c, reason="price, ATR, rate, balance or contract spec invalid")]
     d = 1 if side == "LONG" else -1
     stop, target = px - d * s4.SL_DATR * a, px + d * s4.TP_DATR * a
     try:
@@ -211,12 +221,11 @@ def s4_orders(owned, opened_at, D, datr, specs, now, blocked, rate, bot_eq, real
         return out + [dict(action="SKIP", coin=c, reason=f"bracket/risk veto: {e}")]
     risk = min(s4.SET_RISK_INR, remaining)
     per_unit = s4.SL_DATR * a * rate
-    step = s["step"]
     qty = math.floor(risk / per_unit / step + 1e-9) * step
     alloc = min(float(bot_eq), float(s1.CAPITAL_CAP_INR))
     qty = min(qty, math.floor(s4.MAX_NOTIONAL_LEV * alloc / (px * rate) / step + 1e-9) * step)
     notional = qty * px * rate
-    max_lev = min(float(s.get("max_leverage") or 1), adaptive_risk.HARD_MAX_LEVERAGE)
+    max_lev = min(max_ex, adaptive_risk.HARD_MAX_LEVERAGE)
     lev = max(1, math.ceil(notional / alloc - 1e-9)) if alloc > 0 else 0
     if qty < s["min_qty"] or qty * px < s["min_notional"] or not lev or lev > max_lev:
         return out + [dict(action="SKIP", coin=c, reason="risk-sized order below Mudrex minimum or above margin")]
