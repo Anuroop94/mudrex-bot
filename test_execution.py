@@ -1416,6 +1416,21 @@ def test_boundary_valuation_needs_the_exchange_inr_rate():
     fake.stop()
 
 
+def test_upgrade_distrusts_baselines_written_by_older_code():
+    """Codex r12 HIGH: a trusted ledger row from the old local-mark rule must not survive the upgrade."""
+    path = os.path.join(tempfile.mkdtemp(), "old.db")
+    con = ex.db(path)
+    con.execute("DELETE FROM kv WHERE key='ledger_v3'")                 # simulate a database from older code
+    con.execute("INSERT OR REPLACE INTO ledger(day, start_equity, trusted) VALUES(?, 5000, 1)", (ex.ist_day(),))
+    con.close()
+    con = ex.db(path)                                                   # the upgrade runs once
+    assert con.execute("SELECT trusted FROM ledger WHERE day=?", (ex.ist_day(),)).fetchone()[0] == 0
+    con.execute("UPDATE ledger SET trusted=1")
+    con.close()
+    con = ex.db(path)                                                   # and never again
+    assert con.execute("SELECT trusted FROM ledger WHERE day=?", (ex.ist_day(),)).fetchone()[0] == 1
+
+
 if __name__ == "__main__":
     tests = [v for k, v in dict(globals()).items() if k.startswith("test_")]
     for t in tests:

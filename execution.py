@@ -129,6 +129,11 @@ def db(path=None):
         if con.execute("SELECT 1 FROM owned WHERE closed_at IS NULL").fetchone():
             con.execute("UPDATE ledger SET trusted=0 WHERE day=?", (ist_day(),))
         con.execute("INSERT INTO kv(key, value) VALUES('ledger_v2', 1)")
+    if con.execute("SELECT 1 FROM kv WHERE key='ledger_v3'").fetchone() is None:
+        # baselines written before the exchange-evidence rule (local marks, fallback INR rate) are not proof:
+        # recompute them (an untrusted day is re-evaluated by caps_state and upgraded only on exchange evidence)
+        con.execute("UPDATE ledger SET trusted=0")
+        con.execute("INSERT INTO kv(key, value) VALUES('ledger_v3', 1)")
     return con
 
 
