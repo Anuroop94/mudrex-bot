@@ -378,7 +378,7 @@ def plan(client=None, con=None):
     write_json(PLAN_PATH, p)
     write_json(STATE_PATH, st)
 
-    print(f"\nS1 plan {plan_id or '(none)'} for today (decision on {decision} close)")
+    print(f"\n{STRATEGY} plan {plan_id or '(none)'} (daily inputs from the {decision} close)")
     print(f"Bot equity Rs {bot_eq:,.2f} (allocation Rs {s1.CAPITAL_CAP_INR:,} + bot P&L); "
           f"today {caps['pnl']:+,.0f} vs caps +/-{caps['cap']:,.0f}; INR/USDT {rate or 'UNKNOWN'}")
     print(f"Market regime (BTC vs 200-day average): "
