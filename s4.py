@@ -10,7 +10,9 @@ only after the previous one has closed. Risk Rs150 per set at the stop.
 Evidence (s4_research.py, 40 coins, hourly, costs = fee+GST+0.05% slippage each side + hourly funding; 2026-09-27):
 28 intraday variants tested; 27 lost (most ruined the Rs5,000). This one: dev 2022-10..2025-09 +66% (2023 +41%,
 2024 +23%, 2025 -4%), max drawdown 46%, Newey-West t 0.99 (NOT significant; 1 winner of 28 is luck-level),
-0.52 sets/day, only 7% of days with 2+ sets. Post-split year +30% (descriptive). Backtests are not guarantees.
+0.52 sets/day, only 7% of days with 2+ sets. Post-split year +30% (descriptive).
+FRAGILE: re-run hours later, one of the 40 coins changed (TIA for FIL, today's volume ranking): dev +19.6%,
+drawdown 54%, t 0.51. Treat the edge as unproven. Backtests are not guarantees.
 """
 import math
 

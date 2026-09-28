@@ -115,7 +115,8 @@ def db(path=None):
                        # exchange facts for the exact IST-boundary baseline (caps_state): Mudrex open/close times,
                        # and the position's side/qty/entry/rate while it was open
                        ("owned", "ex_opened_at INTEGER"), ("owned", "ex_closed_at INTEGER"), ("owned", "ex_side TEXT"),
-                       ("owned", "ex_qty REAL"), ("owned", "ex_entry REAL"), ("owned", "ex_rate REAL")):
+                       ("owned", "ex_qty REAL"), ("owned", "ex_entry REAL"), ("owned", "ex_rate REAL"),
+                       ("orders", "strategy TEXT")):                 # which strategy opened it (S4 manages its own)
         if col.split()[0] not in {r["name"] for r in con.execute(f"PRAGMA table_info({table})")}:
             con.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
     if con.execute("SELECT 1 FROM kv WHERE key='marks_v2'").fetchone() is None:
@@ -270,11 +271,11 @@ def record_plan(con, decision_day, orders, payload):
                 set_id = cur_set.lastrowid
             cur_order = con.execute("""INSERT INTO orders(plan_id, seq, coin, action, client_order_id, state,
                            position_id, planned_price, planned_notional_inr, atr, updated_at, side, planned_stop,
-                           planned_target, planned_leverage, planned_risk_inr, planned_qty, set_id)
-                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           planned_target, planned_leverage, planned_risk_inr, planned_qty, set_id, strategy)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                            (pid, i, o["coin"], o["action"], cid, "PLANNED", o.get("position_id"),
                             o.get("planned_price"), o.get("notional_inr"), o.get("atr"), now, side, stop,
-                            target, lev, risk, o.get("qty"), set_id))
+                            target, lev, risk, o.get("qty"), set_id, o.get("strategy")))
             if set_id:
                 con.execute("UPDATE trade_sets SET order_id=? WHERE id=?", (cur_order.lastrowid, set_id))
         con.execute("COMMIT")

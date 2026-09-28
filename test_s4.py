@@ -78,6 +78,20 @@ def test_sets_are_sequential_and_time_exit_closes():
     assert not any(x["action"] == "OPEN" for x in old)                          # no new set until it has closed
 
 
+def test_legacy_position_is_never_time_exited_and_does_not_block_s4():
+    legacy = {"XRP": {"id": "old", "side": "LONG"}}
+    out = orders(owned=legacy, opened_at={"old": NOW - 30 * DAY}, s4_ids=set())
+    assert out[0]["action"] == "HOLD" and "another strategy" in out[0]["reason"]
+    assert not any(x["action"] == "CLOSE" for x in out)
+    new = [x for x in out if x["action"] == "OPEN"]
+    assert new and new[0]["coin"] != "XRP" and new[0]["strategy"] == "S4"      # never the held coin (one-way)
+
+
+def test_s4_position_with_unknown_open_time_is_closed():
+    out = orders(owned={"ADA": {"id": "p9", "side": "LONG"}}, opened_at={}, s4_ids={"p9"})
+    assert out[0]["action"] == "CLOSE" and "unknown open time" in out[0]["reason"]
+
+
 def test_blocked_or_no_slots_or_no_budget_never_opens():
     assert not any(x["action"] == "OPEN" for x in orders(blocked="STOP file present"))
     assert not any(x["action"] == "OPEN" for x in orders(available_slots=0))
@@ -128,6 +142,18 @@ def test_identical_close_plan_is_reused_not_recorded_every_15_minutes():
     assert lt.reuse_close_plan(con, close, now + ex.PLAN_MAX_AGE) is None   # nearly expired: a fresh plan
     opens = [dict(action="OPEN", coin="ADA")]
     assert lt.reuse_close_plan(con, opens, now) is None                # entries always use fresh prices
+
+
+def test_s4_positions_are_identified_from_their_opening_order():
+    import tempfile
+    import execution as ex
+    con = ex.db(os.path.join(tempfile.mkdtemp(), "exec.db"))
+    o = [x for x in orders() if x["action"] == "OPEN"][0]
+    pid = ex.record_plan(con, "d", [o], {})
+    cid = con.execute("SELECT client_order_id FROM orders WHERE plan_id=?", (pid,)).fetchone()[0]
+    con.execute("INSERT INTO owned(position_id, coin, client_order_id, opened_at) VALUES('s4pos',?,?,1)", (o["coin"], cid))
+    con.execute("INSERT INTO owned(position_id, coin, client_order_id, opened_at) VALUES('legacy','XRP','s1-7-0-XRP-O',1)")
+    assert lt.s4_position_ids(con) == {"s4pos"}
 
 
 def test_research_and_live_share_one_setup_function():

@@ -167,25 +167,35 @@ STRATEGY = "S4"          # "S4" intraday sets (owner's rule: intraday); "S1" = d
 
 
 def s4_orders(owned, opened_at, D, datr, specs, now, blocked, rate, bot_eq, realized_pnls=(),
-              active_stop_risks=(), available_slots=3, cost_buffer_inr=10.0):
-    """S4 plan actions (s4.py). Held bot positions: CLOSE once s4.HOLD_H hours old, else HOLD (the exchange
-    stop-loss / take-profit exits them). A new set ONLY when no bot position is open: sets are sequential.
-    owned: {coin: {id, side}}; opened_at: {position_id: exchange open time}; D: s4.setups input for the coins
-    that may be ENTERED (verified universe, no manual position, fresh hourly data); datr: {coin: last daily ATR}."""
+              active_stop_risks=(), available_slots=3, cost_buffer_inr=10.0, s4_ids=None):
+    """S4 plan actions (s4.py). Held S4 positions: CLOSE once s4.HOLD_H hours old (or open time unknown), else
+    HOLD (the exchange stop-loss / take-profit exits them). A new set ONLY when no S4 position is open: sets are
+    sequential. Bot positions opened by ANOTHER strategy (the legacy S1 XRP trade) are never time-exited by S4:
+    they keep their exchange stop until the owner decides; their stop risk still counts in active_stop_risks.
+    owned: {coin: {id, side}}; opened_at: {position_id: exchange open time}; s4_ids: position ids S4 opened
+    (None = all, for tests); D: s4.setups input for coins that may be ENTERED; datr: {coin: last daily ATR}."""
     out = []
+    mine = {c: h for c, h in owned.items() if s4_ids is None or h["id"] in s4_ids}
     for c, h in sorted(owned.items()):
-        age = now - (opened_at.get(h["id"]) or now)
-        if age >= s4.HOLD_H * HOUR:
+        if c not in mine:
+            out.append(dict(action="HOLD", coin=c, reason="opened by another strategy: S4 never time-exits it; "
+                                                         "it keeps its exchange stop-loss (owner decides)"))
+            continue
+        opened = opened_at.get(h["id"])
+        age = now - opened if opened else None
+        if age is None or age >= s4.HOLD_H * HOUR:
             out.append(dict(action="CLOSE", coin=c, position_id=h["id"],
-                            reason=f"S4 maximum hold of {s4.HOLD_H}h reached"))
+                            reason=f"S4 maximum hold of {s4.HOLD_H}h reached" if age is not None else
+                            "S4 position with unknown open time: closed so it cannot be held without limit"))
         else:
             out.append(dict(action="HOLD", coin=c, reason=f"S4 set open {age / 3600:.0f}h; exchange SL/TP manage it"))
-    why = ("a set is open; the next set starts after it closes" if owned else blocked or
+    why = ("a set is open; the next set starts after it closes" if mine else blocked or
            ("daily set limit reached" if available_slots <= 0 else None))
     if why:
         return out + [dict(action="SKIP", coin="-", reason=why)]
     t = now // HOUR * HOUR - HOUR                                  # last CLOSED hour
-    found = s4.setups(D, t)
+    held = set(owned)                                              # one-way per symbol: never a held coin
+    found = s4.setups(dict(D, coins=[c for c in D["coins"] if c not in held]), t)
     if not found:
         return out + [dict(action="SKIP", coin="-", reason="no qualified intraday setup this hour")]
     _, c, side = found[0]
@@ -213,10 +223,16 @@ def s4_orders(owned, opened_at, D, datr, specs, now, blocked, rate, bot_eq, real
     planned_risk = qty * per_unit + cost_buffer_inr
     out.append(dict(action="OPEN", coin=c, side=side, planned_price=px, notional_inr=round(notional, 2), qty=qty,
                     atr=a, stop_loss=stop, take_profit=target, est_stop=round(stop, 8), est_target=round(target, 8),
-                    leverage=float(lev), planned_risk_inr=round(planned_risk, 2), confidence=1.0,
+                    leverage=float(lev), planned_risk_inr=round(planned_risk, 2), confidence=1.0, strategy="S4",
                     volatility_tier="s4", reason=f"S4 {side.lower()} momentum (strongest 24h mover)"))
     return out
 
+
+
+def s4_position_ids(con):
+    """Bot positions whose opening order was an S4 order (orders.strategy)."""
+    return {r[0] for r in con.execute("SELECT w.position_id FROM owned w JOIN orders o ON "
+                                      "o.client_order_id=w.client_order_id WHERE o.strategy='S4'")}
 
 
 def reuse_close_plan(con, todo, now, margin=15 * 60):
@@ -332,8 +348,10 @@ def plan(client=None, con=None):
                 D["coins"].append(c)
         opened_at = {r["position_id"]: r["ex_opened_at"] or r["opened_at"]
                      for r in con.execute("SELECT position_id, opened_at, ex_opened_at FROM owned")}
+        s4_ids = s4_position_ids(con)
         orders = s4_orders(owned, opened_at, D, {c: atrs[c].get(last_closed) for c in basket}, specs, now, blocked,
-                           rate or config.INR_PER_USDT, bot_eq, realized_pnls, active_risks, available_slots)
+                           rate or config.INR_PER_USDT, bot_eq, realized_pnls, active_risks, available_slots,
+                           s4_ids=s4_ids)
     else:
         candidate_keys = [(c, "LONG" if targets.get(c, 0) > 0 else "SHORT")
                           for c in entry_basket if targets.get(c, 0)]
