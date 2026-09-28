@@ -45,12 +45,13 @@ ICONS = (("kill switch", "🛑"), ("stop file", "🛑"), ("guard tripped", "🚨
          ("no stop-loss", "🚨"), ("warning", "⚠️"), ("cannot", "⚠️"), ("not running", "⚠️"), ("stopped", "⚠️"),
          ("not confirmed", "⚠️"), ("failed", "❌"), ("refused", "❌"), ("closed", "✅"), ("finished", "✅"),
          ("started", "🟢"))
-EMOJI_START = ("🟢", "🔴", "🟡", "👀", "⛔", "💤", "🔒", "📊", "🛑", "🚨", "⚠️", "❌", "✅", "🤖", "🔔", "ℹ️")
+EMOJI_START = ("🟢", "🔴", "🟡", "👀", "⛔", "💤", "🔒", "📊", "🛑", "🚨", "⚠️", "❌", "✅", "🤖", "🔔", "ℹ️",
+               "⚡", "▶️", "🔌", "💰")
 
 
 def render(text):
-    """Plain text -> Telegram HTML. First line = bold title (an icon is added if it has none); lines between ```
-    fences = monospace block, so numbers line up. Everything is HTML-escaped."""
+    """Plain text -> Telegram HTML. The first line is the bold headline (an icon is added if it has none); a line
+    written as *text* is bold too; lines between ``` fences are monospace. Everything is HTML-escaped."""
     lines = str(text).split("\n")
     if lines and not lines[0].startswith(EMOJI_START) and lines[0].strip() != "```":
         low = lines[0].lower()
@@ -61,11 +62,15 @@ def render(text):
             out.append("</pre>" if pre else "<pre>")
             pre = not pre
             continue
+        bold = not pre and (n == 0 or (len(line) > 2 and line.startswith("*") and line.endswith("*")))
+        if bold and n:
+            line = line[1:-1]
         e = html.escape(line, quote=False)
-        out.append(f"<b>{e}</b>" if n == 0 and not pre else e)
+        out.append(f"<b>{e}</b>" if bold else e)
     if pre:
         out.append("</pre>")
     return "\n".join(out).replace("<pre>\n", "<pre>").replace("\n</pre>", "</pre>")
+
 
 def send(text, buttons=None):
     """Send to the configured chat. buttons: [[(label, callback_data), ...], ...] -> inline keyboard."""
@@ -95,69 +100,72 @@ def _pct(a, b):
         return ""
 
 
-def _order_block(o):
-    """Aligned card for one OPEN, or one line for a CLOSE."""
+def _order_lines(o):
+    """Clean trade card for one OPEN/PREVIEW, or one line for a CLOSE."""
     if o["action"] == "CLOSE":
-        return [f"🔒 Close {o['coin']} — {o.get('reason', '')}"]
-    side = o.get("side", "LONG")
-    entry = o.get("planned_price")
-    qty = o.get("qty")
-    size = f"{qty:g} {o['coin']} = ₹{o['notional_inr']:,.0f}" if qty else f"₹{o['notional_inr']:,.0f}"
-    return ["```",
-            f"Coin    {o['coin']}  {side}  {o.get('leverage', 1):g}x",
-            f"Entry   {_px(entry)}",
-            f"Target  {_px(o.get('est_target')):<12} {_pct(entry, o.get('est_target'))}",
-            f"Stop    {_px(o.get('est_stop')):<12} {_pct(entry, o.get('est_stop'))}",
-            f"Size    {size}",
-            f"Risk    ₹{o.get('planned_risk_inr', 0):,.0f}",
-            "```"]
+        return [f"🔒 *CLOSE {o['coin']}*", f"📝 {o.get('reason', '')}"]
+    short = o.get("side") == "SHORT"
+    entry, qty = o.get("planned_price"), o.get("qty")
+    size = f"{qty:g} {o['coin']} · ₹{o['notional_inr']:,.0f}" if qty else f"₹{o['notional_inr']:,.0f}"
+    return [f"*{'🔴 SELL (short)' if short else '🟢 BUY'} {o['coin']} near {_px(entry)}*",
+            "",
+            f"🎯 Target  {_px(o.get('est_target'))}  ({_pct(entry, o.get('est_target'))})",
+            f"🛑 SL  {_px(o.get('est_stop'))}  ({_pct(entry, o.get('est_stop'))})",
+            "",
+            f"📦 Size  {size} · {o.get('leverage', 1):g}x",
+            f"⚖️ Risk  ₹{o.get('planned_risk_inr', 0):,.0f} (incl. fees)"]
+
+
+def _limit_line(opens):
+    risk = sum(o.get("planned_risk_inr", 0) for o in opens)
+    return f"🧮 Reserved ₹{risk:,.0f} of today's ₹{trade_policy.DAILY_LOSS_LIMIT_INR:,.0f} limit"
+
+
+def _blocked_line(blocked):
+    return ("⛔ Not placed — STOP is on (dry run)" if "STOP" in str(blocked) else f"⛔ Not placed — {blocked}")
 
 
 def plan_message(p):
-    """(text, buttons) for a plan. Plain text with ``` blocks; render() styles it when it is sent."""
+    """(text, buttons) for a plan: clean lines with emojis; render() styles it when it is sent."""
     tag = _tag(p)
     todo = [o for o in p["orders"] if o["action"] in ("OPEN", "CLOSE")]
     previews = [o for o in p["orders"] if o["action"] == "PREVIEW"]
     if not todo and previews:                              # blocked (e.g. STOP = dry run): what it WOULD trade
-        f = previews[0]
-        lines = [f"👀 {tag} DRY RUN · would trade {f['coin']} {f.get('side', 'LONG')}"]
+        lines = [f"👀 DRY RUN · {tag} would trade", ""]
         for o in previews:
-            lines += _order_block(o)
-        return "\n".join(lines + [f"⛔ Not placed: {p.get('blocked')}"]), None
+            lines += _order_lines(o) + [""]
+        return "\n".join(lines + [_blocked_line(p.get("blocked"))]), None
     if not todo:
-        return (f"💤 {tag} · nothing to do now" +
-                (f"\n⛔ New trades blocked: {p['blocked']}" if p.get("blocked") else "")), None
+        return (f"💤 {tag} · no trade right now" +
+                (f"\n\n⛔ New trades blocked — {p['blocked']}" if p.get("blocked") else "")), None
     if not (p.get("plan_id") and p.get("live_enabled")):
-        return (f"⚠️ {tag} plan {p.get('plan_id')}: {len(todo)} order(s)\nLIVE_TRADING_ENABLED is false: "
+        return (f"⚠️ {tag} · plan {p.get('plan_id')} not placed\n\nLIVE_TRADING_ENABLED is false: "
                 "nothing can be placed."), None
     opens = [o for o in todo if o["action"] == "OPEN"]
     blocked = p.get("blocked")
-    first = opens[0] if opens else None
-    side_icon = "🔴" if first and first.get("side") == "SHORT" else "🟢"
     if not opens:
-        title = f"🔒 {tag} · closing"
+        title = f"🔒 {tag} · CLOSING A TRADE"
     elif blocked and "STOP" in str(blocked):
-        title = f"👀 {tag} DRY RUN · would trade" + (f" {first['coin']} {first.get('side', 'LONG')}" if first else "")
+        title = f"👀 DRY RUN · {tag} would trade"
     elif blocked:
-        title = f"⛔ {tag} · set blocked"
+        title = f"⛔ {tag} · TRADE BLOCKED"
     elif p.get("needs_approval"):
-        title = f"🟡 {tag} · extra set needs your OK"
+        title = f"🟡 {tag} · EXTRA TRADE NEEDS YOUR OK"
     else:
-        title = f"{side_icon} {tag} · new set" + (f" · {first['coin']} {first.get('side', 'LONG')}" if first else "")
-    lines = [title, f"Plan {p['plan_id']}"]
+        title = f"⚡ {tag} · NEW TRADE"
+    lines = [title, ""]
     for o in todo:
-        lines += _order_block(o)
-    risk = sum(o.get("planned_risk_inr", 0) for o in opens)
+        lines += _order_lines(o) + [""]
     if opens:
-        lines.append(f"🧮 Risk reserved ₹{risk:,.0f} · daily cap ₹{trade_policy.DAILY_LOSS_LIMIT_INR:,.0f}")
+        lines.append(_limit_line(opens))
     if not opens and trade_policy.migration_block_reason() is None:
-        return "\n".join(lines + ["🤖 Risk-reducing close: runs automatically (no tap needed)."]), None
+        return "\n".join(lines + ["🤖 Risk-reducing close: runs automatically"]), None
     if blocked and opens:
-        return "\n".join(lines + [f"⛔ Blocked: {blocked}", "Nothing will be placed."]), None
+        return "\n".join(lines + [_blocked_line(blocked)]), None
     if opens and not p.get("needs_approval"):
-        return "\n".join(lines + [f"🤖 Automatic (sets 1-{trade_policy.AUTONOMOUS_SETS_PER_CYCLE}): "
-                                   "no tap needed."]), None
-    lines.append("👆 Tap Approve within 15 min." if opens else "👆 Tap Approve to close (valid 3 hours).")
+        return "\n".join(lines + [f"🤖 Placing automatically (sets 1-{trade_policy.AUTONOMOUS_SETS_PER_CYCLE} "
+                                   "need no tap)"]), None
+    lines.append("👆 Tap Approve within 15 min" if opens else "👆 Tap Approve to close (valid 3 hours)")
     return "\n".join(lines), [[("✅ Approve", f"approve:{p['plan_id']}"), ("✖️ Reject", f"reject:{p['plan_id']}")]]
 
 

@@ -123,7 +123,7 @@ class AdaptiveRiskTests(unittest.TestCase):
                               notional_inr=100, est_stop=99, est_target=102,
                               planned_risk_inr=10)])
         text, buttons = telegram_bot.plan_message(p)
-        self.assertIn("daily cap ₹777", text)
+        self.assertIn("₹777 limit", text)
         self.assertIn("sets 1-4", text)
         self.assertIsNone(buttons)
     finally:

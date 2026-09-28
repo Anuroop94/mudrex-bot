@@ -390,7 +390,7 @@ def test_live_execute_requires_yes():
 
 
 def test_watcher_has_no_direct_exchange_writes():
-    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "watcher.py")).read()
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "watcher.py"), encoding="utf-8").read()
     for banned in ("place_market_long", "close_position", "set_stoploss", "set_leverage", ".post(",
                    "urllib.request", "claim("):
         assert banned not in src, banned
@@ -643,6 +643,7 @@ def test_telegram_render_escapes_and_aligns():
     assert "<pre>Entry   1.25</pre>" in h and "<urlopen" not in h
     assert tg.render("👀 S4 DRY RUN").startswith("<b>👀 S4 DRY RUN</b>")          # own icon kept, none added
     assert tg.render("```\nunclosed").endswith("</pre>")                         # never leaves a tag open
+    assert tg.render("title\n*🟢 BUY LINK*\nplain").split("\n")[1] == "<b>🟢 BUY LINK</b>"     # *line* = bold
 
 
 if __name__ == "__main__":

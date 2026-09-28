@@ -176,7 +176,7 @@ def deliver_alert(con, alert, row_id=None, critical_only=False):
     try:
         if alert is None:
             raise ConnectionError("Telegram callback unavailable")
-        delivered = alert(f"[event {row['event_id'] or row['id']}] {row['msg']}")
+        delivered = alert(row["msg"])            # the outbox id stays internal; the owner sees a clean message
         if delivered is not True and not (ALLOW_TEST_ALERT_SINK and delivered is None):
             raise ConnectionError("Telegram callback did not explicitly confirm delivery")
         con.execute("UPDATE telegram_outbox SET delivered_at=?,lease_token=NULL,lease_until=NULL,last_error=NULL "

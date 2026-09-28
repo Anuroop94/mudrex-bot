@@ -192,8 +192,8 @@ def test_dry_run_shows_a_preview_that_can_never_be_placed():
     assert "not placed: STOP file present" in prev[0]["reason"]
     text, buttons = tg.plan_message(dict(plan_id=None, live_enabled=True, blocked="STOP file present",
                                          strategy=s4.NAME, orders=out))
-    assert text.startswith("👀 S4 DRY RUN · would trade XRP LONG") and buttons is None
-    assert "Not placed: STOP file present" in text
+    assert text.startswith("👀 DRY RUN · S4 would trade") and "BUY XRP near" in text and buttons is None
+    assert "Not placed — STOP is on (dry run)" in text
     # live_trader.plan records only OPEN/CLOSE: a preview never becomes a plan, so it can never be executed
     import inspect
     assert 'o["action"] in ("OPEN", "CLOSE")' in inspect.getsource(lt.plan)

@@ -39,23 +39,24 @@ def status_text():
         s = json.load(f)
     b = s.get("bot", {})
     stop_on = os.path.exists(ex.STOP_PATH)
-    lines = ["📊 Bot status", "```",
-             f"Equity    ₹{b.get('equity', 0):,.0f}",
-             f"Today     ₹{b.get('day_pnl', 0):+,.0f}   (limit ±₹{b.get('cap', 0):,.0f})",
-             f"Cap hit   {b.get('cap_hit') or 'no'}",
-             f"Guard     {'TRIPPED' if s.get('guard', {}).get('tripped') else 'ok'}",
-             f"STOP      {'ON (dry run)' if stop_on else 'off'}",
-             f"Live      {'yes' if ex.live_enabled() else 'no'}",
-             "```", "Positions"]
+    guard = "TRIPPED" if s.get("guard", {}).get("tripped") else "ok"
+    lines = ["📊 BOT STATUS", "",
+             f"💰 Equity  ₹{b.get('equity', 0):,.0f}",
+             f"📅 Today  ₹{b.get('day_pnl', 0):+,.0f}  (limit ±₹{b.get('cap', 0):,.0f})",
+             f"🛡️ Guard {guard} · daily limit hit: {b.get('cap_hit') or 'no'}",
+             "🛑 STOP is ON — dry run, nothing is placed" if stop_on else "▶️ STOP is off — trading allowed",
+             f"🔌 Live trading: {'enabled' if ex.live_enabled() else 'disabled'}",
+             ""]
     pos = s.get("positions", [])
     if not pos:
-        return "\n".join(lines + ["none"])
-    lines.append("```")
+        return "\n".join(lines + ["📂 Open positions: none"])
+    lines.append("*📂 Open positions*")
     for p in pos:
-        lines.append(f"{p['symbol'].removesuffix('USDT'):<6} {p['side']:<5} ₹{p['upnl_inr']:+,.0f}"
-                     f"{'' if p.get('bot') else '  (manual)'}")
-        lines.append(f"  SL {p['sl'] or 'NONE'}   TP {p.get('tp') or 'NONE'}")
-    return "\n".join(lines + ["```"])
+        icon = "🟢" if p["side"] == "LONG" else "🔴"
+        lines.append(f"{icon} {p['symbol'].removesuffix('USDT')} {p['side']} · P&L ₹{p['upnl_inr']:+,.0f}"
+                     f"{'' if p.get('bot') else ' (manual)'}")
+        lines.append(f"      🛑 SL {p['sl'] or 'NONE'} · 🎯 TP {p.get('tp') or 'NONE'}")
+    return "\n".join(lines)
 
 
 def tg_alert(msg):

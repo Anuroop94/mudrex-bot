@@ -156,7 +156,8 @@ def maybe_plan(st, make_plan, now_hm=None, today=None, auto_execute=None, now=No
         if auto_execute and ((opens and actionable and not p.get("needs_approval")) or auto_close):
             try:
                 final, summary = auto_execute(p)
-                notify(f"Autonomous plan {p['plan_id']} finished {final}:\n" + "\n".join(summary))
+                notify(f"{'✅' if final == 'COMPLETE' else '⚠️'} TRADE RESULT · plan {p['plan_id']}: {final}\n\n"
+                       + "\n".join(f"• {x}" for x in summary))
             except Exception as e:  # delivery succeeded; never create a duplicate plan after an execution error
                 log(f"autonomous execution error: {type(e).__name__}: {e}")
                 notify(f"Autonomous plan {p['plan_id']} hit {type(e).__name__}; entries are halted. Check status.")
@@ -196,7 +197,8 @@ def journal_and_guard(st, con, client, bot_open_upnl):
                 w.writeheader()
             w.writerows(sorted(rows, key=lambda r: r["closed"]))
         for r in rows:
-            notify(f"S1 trade closed: {r['coin']} {r['outcome']} Rs {r['pnl_inr']:+,.0f} after {r['days']} days.")
+            notify(f"{'✅' if r['pnl_inr'] > 0 else '❌'} TRADE CLOSED · {r['coin']}\n\n"
+                   f"💵 Result  ₹{r['pnl_inr']:+,.0f} ({r['outcome']})\n⏱️ Held  {r['days']} days")
     st["journaled"] = sorted(done)
     # guard statistics come from the database (one row per position), never from the CSV, so a crash between
     # writing journal.csv and saving watcher state cannot double-count a trade
@@ -372,7 +374,7 @@ def check(st, client=None, con=None, make_plan=None):
 def main():
     st = load(STATE_PATH, {})
     log("watcher started")
-    notify("Mudrex watcher started: checking every 5 minutes.")
+    notify("🟢 BOT WATCHER STARTED\n\n🔎 Checking Mudrex every 5 minutes\n📨 Updates will arrive here")
     fails = 0
     while True:
         try:
