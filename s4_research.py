@@ -158,7 +158,7 @@ def run(D, kind, tp, sl, hold, max_coins=2, regime_filter=True, start=None, end=
             gross = p["qty"] * (x - p["entry"]) * d * RATE
             fee = p["qty"] * x * RATE * FEE
             eq += gross - fee
-            trades.append(dict(coin=p["c"], side=p["side"], entry_t=p["t"], exit_t=t, why=why,
+            trades.append(dict(coin=p["c"], side=p["side"], entry_t=p["t"], exit_t=t, why=why, entry=p["entry"], exit=x,
                                net=gross - fee - p["cost"] - p["fund"]))
         open_pos = still
         if abs(mark() - day_start) >= DAY_STOP:
@@ -169,7 +169,8 @@ def run(D, kind, tp, sl, hold, max_coins=2, regime_filter=True, start=None, end=
                 pending = found
     daily = [(marks[k + 1][0], marks[k + 1][1] / marks[k][1] - 1) for k in range(len(marks) - 1)]
     days = max(1, len(marks))
-    return dict(daily=daily, trades=trades, sets=sets, days=days, equity=eq, ruined=ruined,
+    return dict(daily=daily, trades=trades, sets=sets, days=days, equity=eq, ruined=ruined, open=open_pos,
+                blocked=blocked, per_day=per_day, marks=marks,
                 sets_per_day=sets / days, days_with_2=sum(v >= 2 for v in per_day.values()) / days)
 
 

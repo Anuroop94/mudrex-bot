@@ -21,7 +21,8 @@ STOP
 *.db-wal
 *.db-shm
 
-*_results.txt
+*_results*.txt
+*_heartbeat.json
 
 # new dashboard UI (mudrex-bot/ui)
 ui/node_modules/

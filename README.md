@@ -27,8 +27,10 @@ approval bound to exactly one immutable proposal. Every entry must have an excha
 | Data freshness | `live_trader.bad_data` | a coin with missing/gappy daily history gets no decision; unknown BTC regime blocks new entries |
 
 ## Modes
-- **Backtest / research**: `python research_small.py`, `python research_rules.py` (no account access).
-- **Paper**: `python paper_s1.py` (S1 + challengers), `python paper_portfolio.py` - simulated fills only, scheduled daily.
+- **Backtest / research**: `python s4_research.py` (S4), `python s1_audit.py` (S1) (no account access).
+- **Paper**: `python paper_s4.py` (S4, hourly) and `python paper_s1.py` (S1 + challengers, daily) - simulated fills only.
+- **Archive**: `archive/` holds the retired strategies (T1, Z8 portfolio bots, S2, S3) and their research code, kept
+  for reference only. Nothing runs them. Their tests: `python archive/test_archived.py`.
 - **Dry run (live data, no orders)**: `python live_trader.py plan` - reads the account, records a plan, places nothing.
 - **Live**: unavailable during migration even if `LIVE_TRADING_ENABLED=true`; the policy gate intentionally blocks new entries.
 
@@ -36,7 +38,8 @@ approval bound to exactly one immutable proposal. Every entry must have an excha
 1. ~05:35 IST the watcher builds the qualified plan and delivers it to Telegram before any autonomous dispatch.
 2. After certification, eligible sets 1-3 execute without a tap. An extra one-set plan shows Approve/Reject and its
    one-time approval expires after 15 minutes. Close-only plans remain explicitly owner-approved.
-3. `python dashboard.py` -> http://127.0.0.1:8765 for positions, caps, guard, paper leaderboards.
+3. `python dashboard.py` (or `start-dashboard.cmd`) -> http://127.0.0.1:8765: plain-English status, next trade idea,
+   open trades, trade history, safety checklist, bot health, S4/S1 paper trading, how-it-works glossary, logs.
 
 ## Emergency shutdown
 1. **Phone**: send `/stop` to the bot (creates `STOP`). **PC**: `python ops.py stop`.
@@ -68,7 +71,8 @@ short) on an S1 coin, the bot refuses to trade that coin and alerts you. Manual 
 ## Background tasks (Windows Task Scheduler)
 | Task | Runs | Places orders? |
 |---|---|---|
-| `MudrexPaperBot` | daily 20:15 local (05:45 IST): paper bots | No |
+| `MudrexPaperBot` | daily 20:15 local (05:45 IST): S1 paper (`paper_s1.py`) | No |
+| `MudrexPaperS4` | hourly: S4 paper (`paper_s4.py`) | No |
 | `MudrexWatcher` | at logon, 24/7: alerts, caps, guard, plan/dispatch | Sets 1-3 only after certification; currently migration-blocked |
 | `MudrexApprover` | at logon, 24/7 | Extra single-set and close-only actions after exact Telegram approval |
 
@@ -88,7 +92,7 @@ short) on an S1 coin, the bot refuses to trade that coin and alerts you. Manual 
 - **Rs500 is a threshold, not a guarantee**: gaps, slippage, fees and exchange outages can produce a larger loss.
 
 ## Tests
-`python test_core.py` (strategy, backtest, paper parity, planning, Telegram auth) and
+`python test_core.py` (strategy, planning, dashboard, Telegram auth), `python test_s4.py` (S4) and
 `python test_execution.py` (fake Mudrex: LONG/SHORT brackets, variable leverage, exact extra-set approval, races,
 crashes, timeouts, manual positions, STOP, gaps, protection failures, collective risk and margin). With
 `MUDREX_TEST_MODE=1`, neither test contacts the live API or loads `.env`.

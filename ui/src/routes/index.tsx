@@ -1,63 +1,27 @@
 import { createFileRoute } from "@tanstack/react-router";
 import {
-  Activity,
-  AlertCircle,
-  ArrowRight,
-  ArrowUpRight,
-  BriefcaseBusiness,
-  Check,
-  ChevronDown,
-  Clock3,
-  Gauge,
-  Info,
-  Landmark,
-  Shield,
-  ShieldAlert,
-  ShieldCheck,
-  TrendingUp,
-  Wallet,
-  type LucideIcon,
+  Activity, AlertCircle, BriefcaseBusiness, CalendarClock, Gauge, Info, Moon, ShieldCheck, TrendingDown,
+  TrendingUp, Wallet, type LucideIcon,
 } from "lucide-react";
-import { useState } from "react";
-import { sign, useLive, type Live } from "../lib/live";
-import { LogsView, PaperView } from "../components/PaperView";
-import {
-  Area,
-  AreaChart,
-  CartesianGrid,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
+import { useEffect, useState } from "react";
+import { hms, sign, useLive, useTick, type Idea, type Live } from "../lib/live";
+import { Chart, CheckList, Head, HowView, LogsView, PaperView, Stat, Table, TradesView, sideBadge } from "../components/Views";
 
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "Mudrex Monitor — Bot Dashboard" },
-      {
-        name: "description",
-        content:
-          "Live, read-only monitor for the Mudrex S1 bot. Data comes from the bot's own journal and Mudrex read-only calls.",
-      },
+      { title: "Mudrex Bot Dashboard" },
+      { name: "description", content: "Read-only dashboard for the Mudrex trading bot: live status, trades, paper trading and safety." },
     ],
   }),
-  component: MudrexDashboard,
+  component: Dashboard,
 });
 
+type View = "overview" | "trades" | "paper" | "how" | "logs";
+const VIEWS: [View, string][] = [
+  ["overview", "Overview"], ["trades", "Trade history"], ["paper", "Paper trading"], ["how", "How it works"], ["logs", "Logs"],
+];
 type Range = keyof Live["charts"];
-const activityIcons: Record<string, LucideIcon> = {
-  Activity,
-  ShieldAlert,
-  ShieldCheck,
-  TrendingUp,
-};
-
-const ranges: Range[] = ["1D", "7D", "30D"];
-
-function money(value: number) {
-  return `₹${value.toLocaleString("en-IN", { maximumFractionDigits: 0 })}`;
-}
 
 function Connecting({ error }: { error: string | null }) {
   return (
@@ -67,11 +31,7 @@ function Connecting({ error }: { error: string | null }) {
           <span className="status-mark" aria-hidden="true"><AlertCircle size={16} /></span>
           <div className="status-copy">
             <strong>{error ? "Cannot reach the bot" : "Connecting to the bot…"}</strong>
-            <span>
-              {error
-                ? `Start the bot dashboard server: python dashboard.py in the mudrex-bot folder (${error}).`
-                : "Loading live data from the bot."}
-            </span>
+            <span>{error ? `Start the dashboard: python dashboard.py in the mudrex-bot folder (${error}).` : "Loading live data."}</span>
           </div>
         </div>
       </header>
@@ -79,71 +39,75 @@ function Connecting({ error }: { error: string | null }) {
   );
 }
 
-function age(sec: number | null) {
-  if (sec === null) return "never";
-  return sec < 90 ? `${sec}s ago` : `${Math.round(sec / 60)} min ago`;
+function useHashView(): [View, (v: View) => void] {
+  const read = () => {
+    const h = typeof window === "undefined" ? "" : window.location.hash.slice(1);
+    return (VIEWS.some(([k]) => k === h) ? h : "overview") as View;
+  };
+  const [view, setView] = useState<View>(read);
+  useEffect(() => {
+    const on = () => setView(read());
+    window.addEventListener("hashchange", on);
+    return () => window.removeEventListener("hashchange", on);
+  }, []);
+  return [view, (v) => { window.location.hash = v; setView(v); }];
 }
 
-function MudrexDashboard() {
-  const [range, setRange] = useState<Range>("1D");
-  const [view, setView] = useState<"live" | "paper" | "logs">("live");
-  const { data, error, updated } = useLive();
-  if (!data) return <Connecting error={error} />;
-  const status = data.status;
-  const metrics = data.metrics;
-  const market = data.market;
-  const risk = data.risk;
-  const plan = data.plan;
-  const strategy = data.strategy;
-  const chart = data.charts[range];
-  const series = chart.points;
+function Kpi({ icon: I, tone, label, value, hint, children }: { icon: LucideIcon; tone: string; label: string; value: React.ReactNode; hint: React.ReactNode; children?: React.ReactNode }) {
+  return (
+    <section className="card kpi-card">
+      <div className="kpi-top"><span className={`kpi-icon ${tone}`}><I size={18} /></span><span className="eyebrow">{label}</span></div>
+      <div className="kpi-value">{value}</div>
+      <div className="kpi-hint">{hint}</div>
+      {children && <div className="kpi-foot">{children}</div>}
+    </section>
+  );
+}
 
-  const settings: [string, string][] = [
-    ["Signal", strategy.signal],
-    ["Market filter", strategy.marketFilter],
-    ["Basket", strategy.basket],
-    ["Entry mode", strategy.entryMode],
-    ["Stop model", strategy.stopModel],
-    ["Leverage", strategy.leverage],
-    ["Safety stop", strategy.stop],
-    ["BTC filter", strategy.btcFilter],
-    ["Allocation cap", strategy.allocationCap],
-    ["Target", strategy.target],
-    ["Stop-loss budget", strategy.tradeRisk],
-  ];
+function IdeaCard({ o, dryRun }: { o: Idea; dryRun: boolean }) {
+  return (
+    <div className="idea">
+      <div className="idea-top">
+        {sideBadge(o.side)}<strong>{o.coin}</strong><span className="muted">{o.verb}</span>
+        <span className={`badge ${o.placed && !dryRun ? "badge-good" : "badge-warning"}`}>{o.placed && !dryRun ? "being placed" : "dry run · not placed"}</span>
+      </div>
+      <div className="idea-grid">
+        <Stat label="Entry near" value={`$${o.entry}`} />
+        <Stat label="🎯 Target" value={`$${o.target}`} note={o.targetPct} tone="positive" />
+        <Stat label="🛑 Stop-loss" value={`$${o.stop}`} note={o.stopPct} tone="negative" />
+        <Stat label="Size" value={o.size} note={`${o.leverage} leverage`} />
+        <Stat label="Max loss" value={o.risk} note="if stop-loss hits, incl. fees" />
+      </div>
+    </div>
+  );
+}
+
+function Dashboard() {
+  const [view, setView] = useHashView();
+  const [range, setRange] = useState<Range>("7D");
+  const { data, error, updated } = useLive();
+  const tick = useTick(updated);
+  if (!data) return <Connecting error={error} />;
+  const { headline: h, money: m, today, next, market } = data;
+  const chart = data.charts[range];
+  const moodIcon = market.mood === "down" ? TrendingDown : TrendingUp;
+  const botPositions = data.positions.filter((p) => p.bot).length;
 
   return (
     <div className="app-shell">
-      <header
-        className={`statusbar ${status.ok ? "" : status.issues.length ? "status-problem" : "status-warning"}`}
-        role="status"
-        aria-live="polite"
-      >
+      <header className={`statusbar ${h.tone === "good" ? "" : h.tone === "bad" ? "status-problem" : "status-warning"}`} role="status" aria-live="polite">
         <div className="status-inner">
-          <span className="status-mark" aria-hidden="true">
-            {status.ok ? <ShieldCheck size={16} /> : <AlertCircle size={16} />}
-          </span>
+          <span className="status-mark" aria-hidden="true">{h.tone === "good" ? <ShieldCheck size={16} /> : <AlertCircle size={16} />}</span>
           <div className="status-copy">
-            <strong>
-              {status.ok
-                ? `All good — watching ${metrics.positionCount} position${metrics.positionCount === 1 ? "" : "s"} — live trading is ${status.live ? "ON" : "OFF"}`
-                : status.issues.join(" · ")}
-            </strong>
-            <span>
-              Watcher {age(status.watcherAgeSec)} · Telegram approver {age(status.approverAgeSec)} · marked{" "}
-              {data.markedAt}
-            </span>
+            <strong>{h.title}</strong>
+            <span>Last check {data.markedAt} · page refreshes every 30 s</span>
           </div>
-          <span className={`badge ${status.live && !status.stop ? "badge-good" : "badge-warning"}`}>
-            <span className="badge-dot" aria-hidden="true" />
-            {status.stop ? "STOP on" : status.live ? "Live" : "Live off"}
-          </span>
+          <span className={`badge ${h.live ? "badge-good" : "badge-warning"}`}><span className="badge-dot" aria-hidden="true" />{h.stop ? "STOP on · dry run" : h.live ? "Live" : "Live off"}</span>
         </div>
       </header>
       {error && (
         <div className="offline-banner" role="alert">
-          <AlertCircle size={16} /> Lost contact with the bot ({error}). Showing data from{" "}
-          {updated?.toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" }) ?? "earlier"}.
+          <AlertCircle size={16} /> Lost contact with the bot ({error}). Showing data from {updated?.toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" }) ?? "earlier"}.
         </div>
       )}
 
@@ -151,357 +115,144 @@ function MudrexDashboard() {
         <div className="page-heading">
           <div>
             <div className="brand-lockup">
-              <span className="brand-mark">
-                <Activity size={18} strokeWidth={2.3} />
-              </span>
-              <span>
-                mudrex <i>monitor</i>
-              </span>
-              <span className="environment-tag">MONITOR</span>
+              <span className="brand-mark"><Activity size={18} strokeWidth={2.3} /></span>
+              <span>mudrex <i>bot</i></span>
+              <span className="environment-tag">{data.strategy.live}</span>
             </div>
-            <h1>
-              Your bot, <span>at a glance.</span>
-            </h1>
-            <p>Know what’s happening, how your money is doing, and when you need to act.</p>
-          </div>
-          <div className="account-meta">
-            <span className="account-icon">
-              <Landmark size={17} />
-            </span>
-            <span>
-              <strong>Futures account</strong>
-              <small>Mudrex · INR · live, read-only</small>
-            </span>
+            <h1>Your trading bot, <span>in plain words.</span></h1>
+            <p>{data.dateLabel} · all times India (IST)</p>
           </div>
         </div>
 
-        <div className="range-tabs view-tabs" role="tablist" aria-label="Dashboard section">
-          {([["live", "Live trading"], ["paper", "Paper trading"], ["logs", "Logs"]] as const).map(([key, label]) => (
-            <button key={key} type="button" role="tab" aria-selected={view === key}
-              className={view === key ? "range-active" : ""} onClick={() => setView(key)}>
-              {label}
-            </button>
+        <nav className="range-tabs view-tabs" role="tablist" aria-label="Dashboard section">
+          {VIEWS.map(([key, label]) => (
+            <button key={key} type="button" role="tab" aria-selected={view === key} className={view === key ? "range-active" : ""} onClick={() => setView(key)}>{label}</button>
           ))}
-        </div>
+        </nav>
 
+        {view === "trades" && <TradesView t={data.trades} />}
         {view === "paper" && <PaperView paper={data.paper} />}
+        {view === "how" && <HowView s={data.strategy} />}
         {view === "logs" && <LogsView logs={data.paper.logs} />}
-        {view === "live" && (
-        <div className="dashboard-grid">
-          <section className={`card action-card ${plan.needsAction ? "action-waiting" : ""}`} aria-labelledby="action-title">
-            <div className="action-symbol" aria-hidden="true">
-              <Clock3 size={21} />
-            </div>
-            <div className="action-main">
-              <div className="eyebrow">{plan.needsAction ? "One thing needs your attention" : "Latest plan"}</div>
-              <h2 id="action-title">
-                {plan.title}
-                {plan.state ? ` — ${plan.state.replace(/_/g, " ").toLowerCase()}` : ""}
-              </h2>
-              <p>
-                {plan.message} <span className="coin-pair">{plan.time} · {plan.decisionLabel}</span>
-              </p>
-              <div className="order-list">
-                {plan.items.map((item) => {
-                  const idle = !("count" in item) || !item.count;
-                  return (
-                    <div className="order-row" key={`${item.label}-${item.detail}`}>
-                      <div className="order-coin">
-                        <span className="coin-avatar">{(item.label.split(" ")[1] ?? item.label).slice(0, 1)}</span>
-                        <strong>{item.label}</strong>
-                        <span className={`badge ${item.detail.startsWith("verified") ? "badge-good" : item.detail.startsWith("failed") ? "badge-warning" : "badge-neutral"}`}>
-                          {item.detail}
-                        </span>
-                      </div>
-                      <div className="order-amount">
-                        <strong>{idle ? "—" : item.count}</strong>
-                      </div>
-                    </div>
-                  );
-                })}
+        {view === "overview" && (
+          <div className="dashboard-grid">
+            <section className={`card span-12 hero hero-${h.tone}`}>
+              <div className="eyebrow">What is the bot doing right now?</div>
+              <h2>{h.title}</h2>
+              <p>{h.detail}</p>
+              <div className="hero-meta">
+                <span><CalendarClock size={15} /> New trading day in <strong>{hms(today.resetInSec - tick)}</strong> (00:00 IST)</span>
+                {today.nextCheckInSec !== null && <span><Moon size={15} /> Next market scan in <strong>{hms(Math.max(0, today.nextCheckInSec - tick))}</strong></span>}
               </div>
-              <div className="approval-instruction">
-                <Info size={17} />
-                <span>
-                  This page is read-only. Approve, reject, /plan, /status and /stop are in Telegram.
-                </span>
-              </div>
-            </div>
-            <span className={`badge ${plan.needsAction ? "badge-warning" : "badge-neutral"}`}>
-              <span className="badge-dot" aria-hidden="true" />
-              {plan.needsAction ? "Action needed" : "No action"}
-            </span>
-          </section>
+            </section>
 
-          <div className="kpi-grid">
-            <section className="card kpi-card">
-              <div className="kpi-top">
-                <span className="kpi-icon indigo"><Wallet size={18} /></span>
-                <span className="eyebrow">Bot balance</span>
-              </div>
-              <div className="kpi-value indigo">
-                {metrics.equityMajor}<span className="decimal">{metrics.equityDecimal}</span>
-              </div>
-              <div className="kpi-hint">₹5,000 allocation plus the bot’s own profit and loss (open and closed). {metrics.equityChange} {metrics.equityComparison}.</div>
-              <div className="kpi-foot">
-                <span className="kpi-meta"><span className="mini-dot" /> Mudrex · INR account</span>
-              </div>
-            </section>
-            <section className="card kpi-card">
-              <div className="kpi-top">
-                <span className="kpi-icon positive"><ArrowUpRight size={18} /></span>
-                <span className="eyebrow">Money made today</span>
-              </div>
-              <div className={`kpi-value ${sign(metrics.todayPnlMajor)}`}>
-                {metrics.todayPnlMajor}<span className="decimal">{metrics.todayPnlDecimal}</span>
-              </div>
-              <div className="kpi-hint">{metrics.todayPnlChange} compared with day start.</div>
-              <div className="kpi-foot">
-                <span className={`change-tag ${sign(metrics.todayPnlChange)}`}>
-                  {metrics.todayPnlChange.startsWith("-") ? "↓ Down" : "↑ Up"} · {metrics.todayPnlChange}
-                </span>
-              </div>
-            </section>
-            <section className="card kpi-card">
-              <div className="kpi-top">
-                <span className="kpi-icon"><BriefcaseBusiness size={18} /></span>
-                <span className="eyebrow">Open positions</span>
-              </div>
-              <div className="kpi-value indigo">
-                {metrics.positionCount}<span className="kpi-unit">/ {metrics.basketSize}</span>
-              </div>
-              <div className="kpi-hint">Bot-owned S1 positions, marked {data.markedAt}.</div>
-              <div className="kpi-foot">
-                <span className="change-tag">{metrics.positionCaption}</span>
-              </div>
-            </section>
-            <section className="card kpi-card">
-              <div className="kpi-top">
-                <span className="kpi-icon amber"><Gauge size={18} /></span>
-                <span className="eyebrow">Daily limit</span>
-              </div>
-              <div className="kpi-value indigo">{risk.threshold}</div>
-              <div className="kpi-hint">The daily profit and loss guardrail.</div>
-              <div className="kpi-foot">
+            <div className="kpi-grid">
+              <Kpi icon={Wallet} tone="indigo" label="Bot balance" value={m.equity}
+                hint={<>{m.allocation} given to the bot, plus everything it has won or lost. <span className={sign(m.equityChange)}>{m.equityChange}</span> overall.</>} />
+              <Kpi icon={Gauge} tone={sign(m.today) || "amber"} label="Today's result" value={<span className={sign(m.today)}>{m.today}</span>}
+                hint={`${m.todayPct} since 00:00 IST. The bot rests for the day at −${m.limit} or +${m.limit}.`}>
                 <div className="gauge-wrap">
-                  <div className="gauge" role="img" aria-label={`Daily P&L ${risk.dailyPnl} against a threshold of ${risk.threshold}`}>
-                    <span className="gauge-marker" style={{ left: `${Math.min(100, Math.max(0, risk.utilizationPercent))}%` }} />
-                  </div>
-                  <div className="gauge-labels">
-                    <span>−{risk.threshold.replace("±", "")}</span><span>Today {risk.dailyPnl}</span><span>+{risk.threshold.replace("±", "")}</span>
-                  </div>
+                  <div className="gauge" role="img" aria-label={`Today ${m.today} between minus and plus ${m.limit}`}><span className="gauge-marker" style={{ left: `${m.limitMarker}%` }} /></div>
+                  <div className="gauge-labels"><span>−{m.limit} stop</span><span>0</span><span>+{m.limit} stop</span></div>
+                </div>
+              </Kpi>
+              <Kpi icon={BriefcaseBusiness} tone="" label="Trades today" value={<>{today.setsDone}<span className="kpi-unit">of {today.setsTarget} planned</span></>}
+                hint={`Aims for ${today.setsTarget} a day, up to ${today.setsAuto} on its own. A 4th needs your Telegram OK. Weak days are skipped.`}>
+                <div className="dots" aria-hidden="true">
+                  {Array.from({ length: today.setsAuto + 1 }, (_, i) => <span key={i} className={i < today.setsDone ? "dot-on" : i >= today.setsAuto ? "dot-ask" : ""} />)}
+                </div>
+              </Kpi>
+              <Kpi icon={moodIcon} tone={market.mood === "up" ? "positive" : market.mood === "down" ? "negative" : "amber"} label="Market mood"
+                value={market.mood === "up" ? "Healthy ▲" : market.mood === "down" ? "Weak ▼" : "Unknown"}
+                hint={market.mood === "up" ? "Bot only buys (long) today." : market.mood === "down" ? "Bot only sells short today." : "Bot opens nothing."}>
+                <span className="kpi-meta">BTC {market.btcPrice} · {market.diff} vs 200-day avg</span>
+              </Kpi>
+            </div>
+
+            <section className={`card span-12 ${next.needsApproval ? "action-waiting" : ""}`}>
+              <Head eyebrow={`Latest plan · ${next.planTime}`} title={next.ideas.length ? "Next trade idea" : "No trade idea right now"}
+                note={next.ideas.length
+                  ? next.dryRun ? "The bot WOULD place this trade, but the STOP switch is on (dry run), so nothing is sent to Mudrex."
+                    : next.needsApproval ? "This is a 4th trade today: tap Approve in Telegram within 15 minutes, or it is skipped."
+                    : next.blocked ? `Not placed: ${next.blocked}` : "Placed automatically with its target and stop-loss."
+                  : next.blocked ? `New trades are paused: ${next.blocked}` : "No coin is moving strongly enough in the allowed direction. The bot checks again every 15 minutes — no trade is better than a bad trade."}
+                badge={next.needsApproval ? "Needs your tap" : undefined} />
+              {next.ideas.map((o) => <IdeaCard key={o.coin} o={o} dryRun={next.dryRun} />)}
+              {next.closes.map((c) => <p key={c.coin} className="muted">🔒 Closing {c.coin}: {c.reason}</p>)}
+            </section>
+
+            <section className="card span-12">
+              <Head eyebrow="Real money · Mudrex INR futures" title="Open trades" badge={`${data.positions.length} open`}
+                note="Every open position on your account. Ones you opened yourself are marked “yours” — the bot never touches them." />
+              <Table
+                head={["Coin", "Direction", "Who", "Price now", "Entry", "Value", "🎯 Target", "🛑 Stop-loss", "Result so far"]}
+                empty={botPositions === 0 ? "No open trades. The bot is waiting for a good setup." : ""}
+                rows={data.positions.map((p) => [
+                  <strong key="c">{p.coin}</strong>, sideBadge(p.side), p.bot ? "bot" : "yours", `$${p.price}`, `$${p.entry}`,
+                  <span key="v">{p.value}<span className="coin-pair"> · {p.leverage}</span></span>,
+                  p.target === "none" ? "—" : `$${p.target}`,
+                  p.protected ? `$${p.stop}` : <span key="s" className="badge badge-negative">none!</span>,
+                  <span key="p" className={sign(p.pnl)}>{p.pnl} ({p.pnlPct})</span>,
+                ])}
+              />
+            </section>
+
+            <section className="card span-7">
+              <div className="section-title-row">
+                <div><div className="eyebrow">Real money · balance over time</div><h2>Bot balance</h2><p>{chart.startLabel} · change <span className={sign(chart.change)}>{chart.change}</span></p></div>
+                <div className="range-tabs" role="group" aria-label="Chart period">
+                  {(Object.keys(data.charts) as Range[]).map((r) => <button key={r} type="button" className={range === r ? "range-active" : ""} onClick={() => setRange(r)}>{r}</button>)}
                 </div>
               </div>
+              <Chart points={chart.points} label="Bot balance" />
             </section>
-          </div>
 
-          <section className="card positions-card">
-            <div className="section-title-row">
-              <div>
-                <div className="eyebrow">Live · Mudrex INR futures</div>
-                <h2>Open positions</h2>
-                <p>Every open position on your INR futures account. Manual ones are marked; the bot never touches them.</p>
+            <section className="card span-5">
+              <Head eyebrow="Market" title="Market mood" note={market.asOf ? `Bitcoin daily close ${market.asOf}` : undefined} />
+              <p className="mood-text">{market.text}</p>
+              <div className="gauge-wrap">
+                <div className="gauge" role="img" aria-label={`BTC ${market.diff} versus its 200-day average`}><span className="gauge-marker" style={{ left: `${market.marker}%` }} /></div>
+                <div className="gauge-labels"><span>Weak (shorts)</span><span>BTC {market.diff}</span><span>Healthy (buys)</span></div>
               </div>
-              <span className="badge badge-neutral">{data.positions.length} open</span>
-            </div>
-            <div className="table-scroll">
-              <table className="data-table positions-table">
-                <thead>
-                  <tr>
-                    <th>Coin</th><th>Side</th><th className="numeric">Mark price</th>
-                    <th className="numeric">Entry</th><th className="numeric">Notional</th>
-                    <th className="numeric">Stop-loss</th><th className="numeric">Unrealized P&amp;L</th>
-                    <th>Protection</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {data.positions.length === 0 && (
-                    <tr>
-                      <td colSpan={8}>No open positions.</td>
-                    </tr>
-                  )}
-                  {data.positions.map((position) => (
-                    <tr key={position.symbol}>
-                      <td>
-                        <div className="coin-cell">
-                          <span className={`coin-avatar coin-${position.symbol.toLowerCase()}`}>{position.symbol.slice(0, 1)}</span>
-                          <strong>{position.symbol}</strong><span className="coin-pair">{position.name}</span>
-                        </div>
-                      </td>
-                      <td><span className={`badge ${position.side === "LONG" ? "badge-good" : "badge-negative"}`}>{position.side === "LONG" ? "Long" : "Short"}</span></td>
-                      <td className="numeric">${position.price}</td>
-                      <td className="numeric">${position.entry}</td>
-                      <td className="numeric">{position.notional}<span className="coin-pair"> · {position.leverage}</span></td>
-                      <td className="numeric">${position.stop}<span className="coin-pair"> · {position.stopLabel}</span></td>
-                      <td className="numeric"><span className={sign(position.pnl)}>{position.pnl} {position.pnlPct}</span></td>
-                      <td><span className={`badge ${position.state === "Protected" ? "badge-good" : "badge-warning"}`}>{position.state}</span></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </section>
+              <div className="stat-row compact">
+                <Stat label="Bitcoin" value={market.btcPrice} note={<span className={sign(market.btcChange)}>{market.btcChange} yesterday</span>} />
+                <Stat label="vs 200-day average" value={market.diff} />
+              </div>
+            </section>
 
-          <section className="card equity-card">
-            <div className="section-title-row">
-              <div>
-                <div className="eyebrow">Performance · live</div>
-                <h2>Equity curve</h2>
-                <p>Bot equity, recorded by the watcher every 5 minutes.</p>
-              </div>
-              <div className="range-tabs" role="group" aria-label="Equity curve period">
-                {ranges.map((item) => (
-                  <button key={item} type="button" className={range === item ? "range-active" : ""} onClick={() => setRange(item)}>{item}</button>
-                ))}
-              </div>
-            </div>
-            <div className="paper-summary">
-              <div>
-                <span className="summary-label">Equity</span>
-                <strong>{metrics.equityMajor}{metrics.equityDecimal}</strong>
-                <span className="summary-note">{chart.startLabel}</span>
-              </div>
-              <div className="return-box">
-                <span className="summary-label">Period return</span>
-                <strong className={sign(chart.change)}>{chart.change}</strong>
-                <span className={`return-note ${sign(chart.change)}`}>
-                  {chart.change.startsWith("-") ? "↓ Below start" : chart.change.startsWith("+") ? "↑ Above start" : "Flat"}
-                </span>
-              </div>
-            </div>
-            <div className="chart-legend">
-              <span><i className="legend-square" />Equity (₹)</span><span>{series.length} points</span>
-            </div>
-            <div className="equity-chart" role="img" aria-label="Bot equity history chart over time, in Indian rupees.">
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={series} margin={{ top: 14, right: 12, left: 3, bottom: 0 }}>
-                  <defs>
-                    <linearGradient id="equityFill" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor="var(--chart-green)" stopOpacity={0.18} />
-                      <stop offset="100%" stopColor="var(--chart-green)" stopOpacity={0.01} />
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid vertical={false} stroke="var(--border)" strokeDasharray="4 5" />
-                  <XAxis dataKey="label" tickLine={false} axisLine={false} minTickGap={30} tick={{ fill: "var(--muted)", fontSize: 12 }} tickMargin={10} />
-                  <YAxis domain={["dataMin - 100", "dataMax + 80"]} tickFormatter={(value: number) => `₹${(value / 1000).toFixed(1)}k`} tickLine={false} axisLine={false} width={64} tick={{ fill: "var(--muted)", fontSize: 12 }} />
-                  <Tooltip content={<ChartTooltip />} cursor={{ stroke: "var(--muted)", strokeDasharray: "4 4" }} />
-                  <Area type="monotone" dataKey="value" stroke="var(--chart-green)" strokeWidth={2.5} fill="url(#equityFill)" activeDot={{ r: 4, strokeWidth: 2 }} isAnimationActive={false} />
-                </AreaChart>
-              </ResponsiveContainer>
-            </div>
-            <div className="chart-axis-note">Time (IST) <span>•</span> Bot equity in Indian rupees</div>
-            <div className="plan-preview">
-              <div><span className="plan-check"><Check size={14} /></span><strong>Latest plan</strong></div>
-              {plan.items.map((item) => <span key={`${item.label}-${item.detail}`}>{item.label} — {item.detail}</span>)}
-            </div>
-          </section>
+            <section className="card span-7">
+              <Head eyebrow="Safety" title="Safety checklist" note="Green = fine. Amber = intentionally off or worth knowing. Red = check now." />
+              <CheckList items={data.safety} />
+            </section>
 
-          <section className="card regime-card">
-            <div className="section-title-row">
-              <div>
-                <div className="eyebrow">Market context</div><h2>Regime monitor</h2><p>{market.statusCaption}</p>
-              </div>
-              <span className="badge badge-indigo">Live</span>
-            </div>
-            <div className="regime-hero">
-              <span className="regime-icon" aria-hidden="true"><TrendingUp size={18} /></span>
-              <div className="regime-copy"><strong>{market.status}</strong><span>BTC / USDT · {market.btcPrice}</span></div>
-              <span className={`change-tag ${sign(market.btcChange)}`}>{market.btcChange}</span>
-            </div>
-            <div className="gauge-wrap regime-gauge">
-              <div className="gauge" role="img" aria-label={`${market.averageLabel}: ${market.averageDifference}`}>
-                <span className="gauge-marker" style={{ left: `${market.markerPercent}%` }} />
-              </div>
-              <div className="gauge-labels"><span>Below average</span><span>{market.averageDifference}</span><span>Above average</span></div>
-            </div>
-            <div className="leader-list regime-list">
-              <article className="leader-row">
-                <div className="leader-info"><div className="leader-name">Basket breadth</div><span>Coins with trend up in the latest plan</span></div>
-                <div className="leader-return positive">{market.breadthAbove}/{market.breadthTotal}<span>{market.breadthCaption}</span></div>
-              </article>
-              <article className="leader-row">
-                <div className="leader-info"><div className="leader-name">BTC mood gate</div><span>BTC daily close vs its 200-day average</span></div>
-                <div className="leader-return">{market.moodGate}<span>{market.moodCaption}</span></div>
-              </article>
-            </div>
-            <p className="fine-print">*When BTC closes below its 200-day average the bot holds nothing and buys nothing. It cannot predict the future.</p>
-          </section>
+            <section className="card span-5">
+              <Head eyebrow="Is everything running?" title="Bot health" note="The bot is made of small programs running on this PC." />
+              <CheckList items={data.health} />
+            </section>
 
-          <section className="card history-card">
-            <div className="section-title-row">
-              <div><div className="eyebrow">Recent events</div><h2>Activity</h2><p>Latest entries from the bot’s journal.</p></div>
-              <span className="badge badge-neutral">{data.activity.length} events</span>
-            </div>
-            <ol className="activity-list">
-              {data.activity.map((item, index) => {
-                const Icon = activityIcons[item.icon] ?? Activity;
-                return (
-                  <li className="activity-item" key={`${item.title}-${index}`}>
-                    <span className={`activity-icon event-${item.tone}`} aria-hidden="true"><Icon size={16} /></span>
+            <section className="card span-12">
+              <Head eyebrow="Journal" title="Recent activity" note="The latest events from the bot's own records." badge={`${data.activity.length} events`} />
+              {data.activity.length === 0 && <p className="muted">Nothing recorded yet.</p>}
+              <ol className="activity-list">
+                {data.activity.map((e, i) => (
+                  <li className="activity-item" key={i}>
+                    <span className={`activity-icon event-${e.tone}`} aria-hidden="true"><Info size={16} /></span>
                     <div className="activity-copy">
-                      <div><span className="badge badge-neutral">{item.title}</span><time>{item.time}</time></div>
-                      <p>{item.detail}</p>
+                      <div><span className="badge badge-neutral">{e.kind}</span><time>{e.time}</time></div>
+                      <p>{e.detail}</p>
                     </div>
                   </li>
-                );
-              })}
-            </ol>
-          </section>
-
-          <section className="card strategy-card">
-            <div className="section-title-row">
-              <div><div className="eyebrow">Active strategy · {status.live ? "live" : "live off"}</div><h2>{strategy.name}</h2><p>{strategy.description}</p></div>
-              <span className={`badge ${status.live ? "badge-good" : "badge-warning"}`}><span className="badge-dot" />{status.live ? "Live" : "Live off"}</span>
-            </div>
-            <div className="settings-grid strategy-settings">
-              <div className="setting-row"><span>Leverage</span><strong>{strategy.leverage}</strong></div>
-              <div className="setting-row"><span>Safety stop</span><strong>{strategy.stop}</strong></div>
-              <div className="setting-row"><span>BTC filter</span><strong>{strategy.btcFilter}</strong></div>
-              <div className="setting-row"><span>Allocation cap</span><strong>{strategy.allocationCap}</strong></div>
-            </div>
-            <p className="read-only-note"><Shield size={15} />Target: {strategy.target}. Changes are made in the bot’s code, not here.</p>
-          </section>
-
-          <details className="card details-card">
-            <summary>
-              <span><span className="eyebrow">For the curious</span><strong>Strategy and safety settings</strong><small>Read-only · from the bot’s code · click to expand</small></span>
-              <span className="details-chevron"><ChevronDown size={18} /></span>
-            </summary>
-            <div className="details-body">
-              <div className="settings-grid">
-                {settings.map(([label, value]) => <div className="setting-row" key={label}><span>{label}</span><strong>{value}</strong></div>)}
-                <div className="setting-row"><span>Connection</span><strong className={error ? "negative" : "positive"}>{error ? "Lost" : "Connected"}</strong></div>
-              </div>
-              <p className="read-only-note"><ShieldAlert size={15} />Shown for reference. Past results are not a guarantee of future returns.</p>
-            </div>
-          </details>
-        </div>
+                ))}
+              </ol>
+            </section>
+          </div>
         )}
 
         <footer className="page-footer">
-          <span><span className="footer-status" />Your dashboard is read-only</span>
-          <span>Refreshes every 30 s · updated {updated?.toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" }) ?? "—"} <span>·</span> All times IST</span>
+          <span><span className="footer-status" />Read-only: this page can never place or change a trade</span>
+          <span>Updated {updated?.toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" }) ?? "—"} IST</span>
         </footer>
       </main>
-    </div>
-  );
-}
-
-function ChartTooltip({
-  active,
-  payload,
-  label,
-}: {
-  active?: boolean;
-  payload?: { value: number }[];
-  label?: string;
-}) {
-  if (!active || !payload?.length) return null;
-  const first = payload[0];
-  if (!first) return null;
-  return (
-    <div className="chart-tooltip">
-      <span>{label}</span><strong>{money(first.value)}</strong><small>Bot equity</small>
     </div>
   );
 }

@@ -30,7 +30,7 @@ HISTORY_DAYS = 365
 IST_OFFSET = 19800           # daily loss cap resets at IST midnight
 
 # Money (backtest equity is in USDT-equivalent; live INR wallet converts via hedge_rate)
-# RESEARCH-ONLY risk settings (backtest.py / paper.py / walkforward.py). Live S1 does NOT use them: its limits
+# RESEARCH-ONLY risk settings (archive/: backtest.py / paper.py / walkforward.py). Live S1 does NOT use them: its limits
 # live in s1.py (allocation, leverage, stop, caps, loss budgets), execution.py and watcher.py (guard).
 START_EQUITY = 1000.0
 RISK_PCT = 0.01             # risk per trade, fraction of current equity
