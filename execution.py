@@ -568,7 +568,7 @@ def _num(x):
     return v if math.isfinite(v) and v > 0 else None
 
 
-def record_exchange_facts(con, p, closed=False):
+def record_exchange_facts(con, p, closed=False, position_id=None):
     """Keep Mudrex's own open/close times and the position's side/qty/entry/rate on the owned row (never overwrite
     a known value). These, not local discovery times, decide what was open at the IST boundary."""
     side = str(p.get("order_type") or p.get("position_type") or "").upper() or None
@@ -576,10 +576,55 @@ def record_exchange_facts(con, p, closed=False):
                    ex_qty=COALESCE(ex_qty, ?), ex_entry=COALESCE(ex_entry, ?), ex_rate=COALESCE(ex_rate, ?)
                    WHERE position_id=?""",
                 (exchange_ts(p.get("created_at")), side, _num(p.get("quantity")), _num(p.get("entry_price")),
-                 _num(p.get("entry_hedge_rate")), p["id"]))
-    if closed:
+                 _num(p.get("entry_hedge_rate")), position_id or p["id"]))
+    if closed:                          # a history row has its OWN id: always pass the owned position_id
         con.execute("UPDATE owned SET ex_closed_at=COALESCE(ex_closed_at, ?) WHERE position_id=?",
-                    (exchange_ts(p.get("updated_at")), p["id"]))
+                    (exchange_ts(p.get("updated_at")), position_id or p["id"]))
+
+
+def history_by_owned(con, rows):
+    """{owned position_id: Mudrex closed-position history row}.
+
+    Live Mudrex (2026-09-28) gives a CLOSED position a NEW id in its position history (open XRP position
+    01a0e398-6712..., its history row 01a0e434-98b6...: same symbol, side, entry, quantity and created_at).
+    So a row matches an owned position by id, or else by an exact fingerprint of the bot's own opening fill:
+    symbol, side, entry price, quantity and open time. An ambiguous or missing match stays unmatched, so the
+    caller keeps that position unconfirmed (fail closed)."""
+    rows = [r for r in rows if str(r.get("status") or "CLOSED").upper() == "CLOSED"]
+    by_id = {r.get("id"): r for r in rows}
+    out, used = {}, set()
+    owned = con.execute("SELECT w.position_id, w.coin, w.opened_at, w.ex_opened_at, o.side, o.fill_price, "
+                        "o.filled_qty FROM owned w LEFT JOIN orders o ON o.client_order_id=w.client_order_id"
+                        ).fetchall()
+    for w in owned:
+        if w["position_id"] in by_id:
+            out[w["position_id"]] = by_id[w["position_id"]]
+            used.add(w["position_id"])
+    for w in owned:
+        if w["position_id"] in out:
+            continue
+        cands = [r for r in rows if r.get("id") not in used and _same_position(w, r)]
+        if len(cands) == 1:
+            out[w["position_id"]] = cands[0]
+            used.add(cands[0].get("id"))
+    return out
+
+
+def _same_position(w, r):
+    fill, qty = w["fill_price"], w["filled_qty"]
+    if not fill or not qty or r.get("symbol") != f"{w['coin']}USDT":
+        return False
+    if str(r.get("position_type") or r.get("order_type") or "").upper() != str(w["side"] or "LONG").upper():
+        return False
+    entry, q, t = _num(r.get("entry_price")), _num(r.get("quantity")), exchange_ts(r.get("created_at"))
+    if entry is None or q is None or t is None:
+        return False
+    if abs(entry - fill) > max(1e-9, 1e-6 * fill) or abs(q - qty) > 1e-6 * qty + 1e-12:
+        return False
+    if w["ex_opened_at"]:
+        return abs(t - w["ex_opened_at"]) <= 5
+    # the bot notices a fill after it happens: the exchange open time is at or before our discovery time
+    return w["opened_at"] is not None and w["opened_at"] - 2 * 86400 <= t <= w["opened_at"] + 60
 
 
 def sync_owned(con, client, positions):
@@ -606,10 +651,10 @@ def sync_owned(con, client, positions):
                                 ).fetchall()
     unconfirmed = 0
     if absent or missing or no_close_time:
-        hist = {p["id"]: p for p in client.history("positions")[0]}
+        hist = history_by_owned(con, client.history("positions")[0])
         for pid in absent + [r["position_id"] for r in missing + no_close_time]:
             if pid in hist:
-                record_exchange_facts(con, hist[pid], closed=True)
+                record_exchange_facts(con, hist[pid], closed=True, position_id=pid)
         for pid in absent:                     # closed only when Mudrex history lists it; else still unknown
             if pid in hist:
                 con.execute("UPDATE owned SET closed_at=? WHERE position_id=?", (now, pid))
@@ -1188,13 +1233,14 @@ def exit_authorized(con, row):
         (row["position_id"], row["client_order_id"])).fetchone() is not None
 
 
-def position_state(client, pid):
+def position_state(client, pid, con=None):
     """('open', position) if Mudrex shows it; ('closed', None) only if it is absent AND listed in Mudrex's closed
     position history (authoritative); ('unknown', None) otherwise - one incomplete snapshot never ends an exit."""
     pos = next((p for p in client.positions() if p["id"] == pid), None)
     if pos is not None:
         return "open", pos
-    closed = {p.get("id") for p in client.history("positions")[0]}
+    rows = client.history("positions")[0]
+    closed = set(history_by_owned(con, rows)) if con is not None else {p.get("id") for p in rows}
     return ("closed" if pid in closed else "unknown"), None
 
 
@@ -1270,7 +1316,7 @@ def protective_close(con, client, row, why, sleep, alert):
                                                                      "to this order")
         event(con, "protect", f"{row['coin']}: cannot auto-exit (not this order's position). Check Mudrex now.", alert)
         return False
-    state, pos = position_state(client, pid)
+    state, pos = position_state(client, pid, con)
     if state == "closed":
         return exited(con, row, why, alert)
     busy = exit_in_flight(con, pid, row["id"])
@@ -1310,7 +1356,7 @@ def protective_close(con, client, row, why, sleep, alert):
     for i in range(POLL_TRIES):
         renew(con, row["plan_id"])                                   # a live wait keeps the lease
         try:
-            last = position_state(client, pid)[0]
+            last = position_state(client, pid, con)[0]
         except (Ambiguous, Locked):
             last = "unknown"
         if last == "closed":
@@ -1348,7 +1394,7 @@ def run_close(con, client, row, sleep, alert):
     if row["position_id"] not in owned_ids(con):
         set_order(con, row["id"], state="FAILED", error="refused: position not owned by the bot")
         return
-    state, pos = position_state(client, row["position_id"])
+    state, pos = position_state(client, row["position_id"], con)
     if state == "closed":
         set_order(con, row["id"], state="VERIFIED", error="already closed (stop hit?)")
         con.execute("UPDATE owned SET closed_at=? WHERE position_id=?", (int(time.time()), row["position_id"]))
@@ -1379,7 +1425,7 @@ def run_close(con, client, row, sleep, alert):
     for i in range(POLL_TRIES):
         renew(con, row["plan_id"])                                   # a live wait keeps the lease
         try:
-            gone = position_state(client, row["position_id"])[0] == "closed"
+            gone = position_state(client, row["position_id"], con)[0] == "closed"
         except (Ambiguous, Locked):
             gone = False
         if gone:
@@ -1738,7 +1784,7 @@ def resume_close(con, client, row, alert):
     finishing it: re-send only if never sent or the last send was >= EXIT_RETRY_AFTER ago (journaled first),
     at most EXIT_MAX_ATTEMPTS times, then hand over to the human. Only ever closes a bot-owned position."""
     now = int(time.time())
-    state, pos = position_state(client, row["position_id"])
+    state, pos = position_state(client, row["position_id"], con)
     if state == "closed":
         set_order(con, row["id"], state="VERIFIED")
         con.execute("UPDATE owned SET closed_at=? WHERE position_id=? AND closed_at IS NULL",

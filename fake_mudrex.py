@@ -33,6 +33,7 @@ class FakeMudrex:
         self.no_liq = False
         self.fill_after = 1                  # detail lookups before a CREATED order becomes FILLED
         self.never_fill = False
+        self.new_history_ids = True          # live Mudrex: closed positions get a NEW id in history
         self.boundary_prices = {}             # coin -> candle open at the IST boundary (default: live price)
         self.cid_detail = False              # live Mudrex: /orders/detail?client_order_id= is always 404
         self.leverage_store = {}
@@ -266,7 +267,8 @@ class FakeMudrex:
                         if pos is None:
                             return 404, {"success": False, "errors": [{"text": "Position not found"}]}
                         fake.positions.remove(pos)
-                        fake.closed.append(dict(id=pos["id"], symbol=pos["symbol"], position_type=pos["order_type"],
+                        fake.closed.append(dict(id=str(uuid.uuid4()) if fake.new_history_ids else pos["id"],
+                                                symbol=pos["symbol"], position_type=pos["order_type"],
                                                 status="CLOSED", entry_price=pos["entry_price"],
                                                 closed_price=pos["entry_price"], quantity=pos["quantity"], pnl="0",
                                                 created_at=pos.get("created_at"), updated_at=_iso(time.time())))

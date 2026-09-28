@@ -175,7 +175,7 @@ def maybe_plan(st, make_plan, now_hm=None, today=None, auto_execute=None, now=No
 def journal_and_guard(st, con, client, bot_open_upnl):
     # closed bot positions with confirmed P&L come from the local ledger (execution.sync_owned); timestamps are
     # our own observation times, because Mudrex position history has no documented timestamps
-    hist = {p["id"]: p for p in client.history("positions")[0]}
+    hist = ex.history_by_owned(con, client.history("positions")[0])
     done = set(st.setdefault("journaled", []))
     rows = []
     for r in con.execute("SELECT * FROM owned WHERE closed_at IS NOT NULL AND realized_pnl IS NOT NULL").fetchall():

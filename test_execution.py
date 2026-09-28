@@ -1431,6 +1431,28 @@ def test_upgrade_distrusts_baselines_written_by_older_code():
     assert con.execute("SELECT trusted FROM ledger WHERE day=?", (ex.ist_day(),)).fetchone()[0] == 1
 
 
+def test_closed_position_found_in_history_under_a_new_id():
+    """Live 2026-09-28: Mudrex listed the closed XRP position under a NEW id, so the bot never confirmed the close
+    and blocked every entry. History rows are matched by the opening fill's fingerprint."""
+    tmp, fake, client, con = setup()
+    con.execute("INSERT INTO orders(plan_id, seq, coin, action, client_order_id, state, side, fill_price, filled_qty) "
+                "VALUES(7, 0, 'XRP', 'OPEN', 's1-7-0-XRP-O', 'VERIFIED', 'LONG', 1.5154, 6.4)")
+    con.execute("INSERT INTO owned(position_id, coin, client_order_id, opened_at) "
+                "VALUES('01a0e398-6712', 'XRP', 's1-7-0-XRP-O', 1790526078)")      # discovered 16:21:18 UTC
+    row = dict(id="01a0e434-98b6", position_type="LONG", status="CLOSED", entry_price="1.5154", closed_price="1.5412",
+               quantity="6.4", pnl="16.84", created_at="2026-09-27T16:00:11Z", updated_at="2026-09-27T18:50:47Z",
+               symbol="XRPUSDT", entry_hedge_rate="102")
+    assert ex.history_by_owned(con, [row]) == {"01a0e398-6712": row}
+    assert ex.history_by_owned(con, [row, dict(row, id="twin")]) == {}             # ambiguous: stays unconfirmed
+    assert ex.history_by_owned(con, [dict(row, quantity="6.5")]) == {}             # different fill: no match
+    assert ex.history_by_owned(con, [dict(row, position_type="SHORT")]) == {}
+    fake.closed.append(row)                                                      # full path: sync confirms the close
+    assert ex.sync_owned(con, client, []) == 0
+    r = con.execute("SELECT * FROM owned").fetchone()
+    assert r["closed_at"] and r["realized_pnl"] == 16.84 and r["ex_closed_at"] == 1790535047
+    fake.stop()
+
+
 if __name__ == "__main__":
     tests = [v for k, v in dict(globals()).items() if k.startswith("test_")]
     for t in tests:

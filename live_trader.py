@@ -272,7 +272,7 @@ def plan(client=None, con=None):
     gone = [r for r in con.execute("SELECT position_id, coin FROM owned WHERE closed_at IS NULL").fetchall()
             if r["position_id"] not in {p["id"] for p in positions}]
     if gone:                                   # closed without our CLOSE => stop hit, but only if Mudrex confirms
-        closed = {p.get("id") for p in client.history("positions")[0]}
+        closed = set(ex.history_by_owned(con, client.history("positions")[0]))
         for r in gone:
             if r["position_id"] in closed:
                 con.execute("UPDATE owned SET closed_at=? WHERE position_id=?", (now, r["position_id"]))
