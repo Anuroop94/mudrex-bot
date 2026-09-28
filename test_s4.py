@@ -156,6 +156,23 @@ def test_s4_positions_are_identified_from_their_opening_order():
     assert lt.s4_position_ids(con) == {"s4pos"}
 
 
+def test_s4_plans_around_the_clock_but_s1_waits_for_the_daily_close():
+    import tempfile
+    import watcher
+    made = []
+    orig = (watcher.notify, watcher.LOG_PATH, lt.STRATEGY)
+    watcher.LOG_PATH = os.path.join(tempfile.mkdtemp(), "watcher.log")
+    watcher.notify = lambda msg, buttons=None: True
+    plan = lambda: made.append(1) or dict(plan_id=None, created_at=NOW, live_enabled=True, blocked=None, orders=[])  # noqa: E731
+    try:
+        lt.STRATEGY = "S4"
+        assert watcher.maybe_plan({}, plan, now_hm="02:00", today="2026-09-28", now=0) and made
+        lt.STRATEGY, made[:] = "S1", []
+        assert not watcher.maybe_plan({}, plan, now_hm="02:00", today="2026-09-28", now=0) and not made
+    finally:
+        watcher.notify, watcher.LOG_PATH, lt.STRATEGY = orig
+
+
 def test_research_and_live_share_one_setup_function():
     import s4_research
     assert s4_research.setups is s4.setups

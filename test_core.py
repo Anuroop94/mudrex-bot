@@ -422,7 +422,12 @@ def test_watcher_plan_failure_retry_and_repeats_within_cycle():
         assert watcher.maybe_plan(st, flaky, now_hm="06:15", today="2026-09-28",
                                   now=clock + watcher.PLAN_INTERVAL_SEC) is True
         assert len(calls) == 3
-        assert watcher.maybe_plan({}, flaky, now_hm="05:00", today="2026-09-29", now=clock) is False
+        import live_trader
+        strategy, live_trader.STRATEGY = live_trader.STRATEGY, "S1"     # S1 waits for the 05:30 IST daily close
+        try:
+            assert watcher.maybe_plan({}, flaky, now_hm="05:00", today="2026-09-29", now=clock) is False
+        finally:
+            live_trader.STRATEGY = strategy
     finally:
         watcher.notify, watcher.LOG_PATH = orig, orig_log
 

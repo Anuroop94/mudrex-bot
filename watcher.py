@@ -113,7 +113,9 @@ def maybe_plan(st, make_plan, now_hm=None, today=None, auto_execute=None, now=No
     """
     today = today or ist_str("%Y-%m-%d")
     now = time.time() if now is None else float(now)
-    if (now_hm or ist_str("%H:%M")) < PLAN_AFTER:
+    import live_trader
+    # S1 decides on the 05:30 IST daily close; S4 (intraday) plans around the clock: the 24-hour IST cycle
+    if live_trader.STRATEGY != "S4" and (now_hm or ist_str("%H:%M")) < PLAN_AFTER:
         return False
     if st.get("plan_cycle") == today and now < st.get("plan_next_at", 0):
         return False
