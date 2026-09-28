@@ -638,16 +638,11 @@ def test_dashboard_serves_ui_and_never_bot_files():
 
 def test_telegram_render_escapes_and_aligns():
     import telegram_bot as tg
-    h = tg.render("Watcher cannot reach Mudrex <urlopen error> & more
-```
-Entry   1.25
-```
-end")
+    h = tg.render("Watcher cannot reach Mudrex <urlopen error> & more\n```\nEntry   1.25\n```\nend")
     assert h.startswith("<b>⚠️ Watcher cannot reach Mudrex &lt;urlopen error&gt; &amp; more</b>")
     assert "<pre>Entry   1.25</pre>" in h and "<urlopen" not in h
     assert tg.render("👀 S4 DRY RUN").startswith("<b>👀 S4 DRY RUN</b>")          # own icon kept, none added
-    assert tg.render("```
-unclosed").endswith("</pre>")                         # never leaves a tag open
+    assert tg.render("```\nunclosed").endswith("</pre>")                         # never leaves a tag open
 
 
 if __name__ == "__main__":
