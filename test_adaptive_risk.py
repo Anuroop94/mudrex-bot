@@ -118,7 +118,7 @@ class AdaptiveRiskTests(unittest.TestCase):
     try:
         trade_policy.DAILY_LOSS_LIMIT_INR = 777.0
         trade_policy.AUTONOMOUS_SETS_PER_CYCLE = 4
-        p = dict(plan_id="p1", live_enabled=True, attempted_sets=0,
+        p = dict(plan_id="p1", live_enabled=True, completed_sets=0,
                  orders=[dict(action="OPEN", coin="BTC", side="LONG", leverage=2,
                               notional_inr=100, est_stop=99, est_target=102,
                               planned_risk_inr=10)])

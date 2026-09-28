@@ -109,7 +109,14 @@ def maybe_plan(st, make_plan, now_hm=None, today=None, auto_execute=None, now=No
             st["pending_plan"] = p
         import telegram_bot
         text, buttons = telegram_bot.plan_message(p)
-        sent = notify(text, buttons=buttons)
+        opens = [o for o in p.get("orders", []) if o.get("action") == "OPEN"]
+        actionable = bool(p.get("plan_id") and p.get("live_enabled") and not p.get("blocked"))
+        # Re-planning runs every 15 min: repeat a non-actionable message (nothing to do / blocked) only when it
+        # changes, or Telegram gets ~75 identical messages a day. Actionable plans are always sent.
+        sig = [p.get("blocked"), sorted((o.get("action"), o.get("coin"), o.get("side")) for o in p.get("orders", [])
+                                        if o.get("action") in ("OPEN", "CLOSE"))]
+        repeat = not actionable and st.get("last_plan_sig") == sig
+        sent = True if repeat else notify(text, buttons=buttons)
         if not sent:
             raise ConnectionError("Telegram delivery failed")                 # retry later; plan_day not saved
         # Keep plan_day for old dashboards, but plan_cycle/plan_next_at control the repeated cycle schedule.
@@ -117,8 +124,9 @@ def maybe_plan(st, make_plan, now_hm=None, today=None, auto_execute=None, now=No
         st["plan_last_at"], st["plan_next_at"] = now, now + PLAN_INTERVAL_SEC
         st["plan_fails"], st["plan_retry_at"] = 0, 0
         st.pop("pending_plan", None)
-        opens = [o for o in p.get("orders", []) if o.get("action") == "OPEN"]
-        if (auto_execute and opens and p.get("plan_id") and p.get("live_enabled") and not p.get("blocked")):
+        st["last_plan_sig"] = sig
+        # A set above the autonomous three waits for its own Telegram tap (approver runs it); never auto-run it.
+        if auto_execute and opens and actionable and not p.get("needs_approval"):
             try:
                 final, summary = auto_execute(p)
                 notify(f"Autonomous plan {p['plan_id']} finished {final}:\n" + "\n".join(summary))

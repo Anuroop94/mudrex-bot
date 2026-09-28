@@ -222,7 +222,10 @@ def run_backtest(data: Mapping[str, Sequence[Bar]], specs: Mapping[str, Spec] | 
                 if (c in positions or atrs[c][previous_i] is None or
                     (regime == "LONG" and w <= 0) or (regime == "SHORT" and w >= 0)):
                     continue
-                confidence = min(1.0, abs(w) * len(BASKET))
+                # Live parity: live_trader computes min(1, |basket weight| x basket size) where the basket
+                # weight is signal / basket size, i.e. the coin's own |signal|. signals() here is already
+                # the per-coin signal, so multiplying by the basket size again saturated confidence.
+                confidence = min(1.0, abs(w))
                 if confidence >= 0.55:
                     candidates.append((confidence, c, b, atrs[c][previous_i]))
             candidates.sort(reverse=True, key=lambda x: x[0])

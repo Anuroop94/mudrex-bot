@@ -60,7 +60,7 @@ def bad_data(uni, last_closed, days=400):
 
 def build_orders(targets, owned, manual_symbols, prices, atrs, specs, size_equity_inr, armed, entries_blocked,
                  rate, bad=(), realized_pnls=(), active_stop_risks=(), available_slots=3,
-                 candidate_cost_buffer_inr=10.0):
+                 candidate_cost_buffer_inr=10.0, completed_sets=0):
     """Build side-aware actions with quantity determined from the fixed rupee risk ledger.
 
     targets: {coin: signed 1x weight}; owned values may be a legacy position id or {id, side}.
@@ -100,7 +100,7 @@ def build_orders(targets, owned, manual_symbols, prices, atrs, specs, size_equit
     slots = max(0, min(int(available_slots), trade_policy.MAX_SETS_PER_CYCLE))
     opened = 0
     for confidence, c, side, px, s in sorted(candidates, reverse=True):
-        if opened >= slots or (opened >= trade_policy.TARGET_SETS_PER_CYCLE and confidence < 0.85):
+        if opened >= slots or (completed_sets + opened >= trade_policy.TARGET_SETS_PER_CYCLE and confidence < 0.85):
             out.append(dict(action="SKIP", coin=c, reason="daily set target filled; third set needs a very strong signal"))
             continue
         funding_rate = s.get("funding_fee_perc_hour")
@@ -201,12 +201,16 @@ def plan(client=None, con=None):
         realized_pnls, active_risks = (), ()
         blocked = blocked or f"collective risk is unknown ({e})"
     cycle = trade_policy.cycle_id(now)
-    attempted_sets = con.execute("SELECT COUNT(*) FROM trade_sets WHERE cycle=? AND attempted_at IS NOT NULL",
-                                 (cycle,)).fetchone()[0]
-    available_slots = max(0, trade_policy.MAX_SETS_PER_CYCLE - attempted_sets)
+    completed_sets, unresolved_sets = ex.cycle_set_counts(con, cycle)
+    if unresolved_sets:
+        blocked = blocked or "an earlier set is unresolved; reconciling it before any new set"
+    # Sets 1-3 are autonomous; above that ONE set per plan, so each extra set is bound to one Telegram approval.
+    needs_approval = completed_sets >= trade_policy.AUTONOMOUS_SETS_PER_CYCLE
+    available_slots = (1 if trade_policy.HUMAN_OVERRIDE_ABOVE_MAX else 0) if needs_approval else         trade_policy.MAX_SETS_PER_CYCLE - completed_sets
     orders = build_orders(targets, owned, manual, {c: closes[c].get(last_closed) for c in s1.BASKET},
                           {c: atrs[c].get(last_closed) for c in s1.BASKET}, specs, bot_eq, st["armed"], blocked,
-                          rate or config.INR_PER_USDT, bad, realized_pnls, active_risks, available_slots)
+                          rate or config.INR_PER_USDT, bad, realized_pnls, active_risks, available_slots,
+                          completed_sets=completed_sets)
     todo = [o for o in orders if o["action"] in ("OPEN", "CLOSE")]
     decision = time.strftime("%Y-%m-%d", time.gmtime(last_closed))
     plan_id = ex.record_plan(con, decision, todo, dict(orders=orders)) if todo else None
@@ -215,7 +219,8 @@ def plan(client=None, con=None):
     p = dict(plan_id=plan_id, created_at=now, decision_day=decision, strategy=s1.NAME,
              mood_ok=mood is True, bot_equity_inr=round(bot_eq, 2), caps=caps,
              hedge_rate=rate, live_enabled=ex.live_enabled(), blocked=blocked, orders=orders,
-             cycle=cycle, attempted_sets=attempted_sets, available_slots=available_slots)
+             cycle=cycle, completed_sets=completed_sets, available_slots=available_slots,
+             needs_approval=needs_approval and bool(plan_id) and any(o["action"] == "OPEN" for o in todo))
     write_json(PLAN_PATH, p)
     write_json(STATE_PATH, st)
 

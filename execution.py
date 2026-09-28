@@ -215,14 +215,16 @@ def journal_set_approval(con, plan_id, approver, ttl=15 * 60):
 
 
 def cycle_set_counts(con, cycle, exclude_set_id=None):
-    """Return verified completions and unresolved writes for one durable cycle.
+    """Return (sets used, unresolved writes) for one durable cycle.
 
-    A set is complete only after protect_and_check verifies entry, stop, and target.
-    An attempted row in any other nonterminal state is ambiguous/in-flight and blocks
-    a later set until reconciliation; definitively FAILED rows do not count as sets.
+    Used = verified COMPLETE sets plus FAILED sets whose entry FILLED (money moved: a fill followed by a fail-safe
+    exit still counts, so a coin whose bracket keeps failing cannot be re-entered every 15 minutes, paying fees
+    each round). A FAILED set that never filled (definite rejection) does not count. An attempted row in any
+    other nonterminal state is ambiguous/in-flight and blocks a later set until reconciliation.
     """
-    completed = con.execute("SELECT COUNT(*) FROM trade_sets WHERE cycle=? AND state='COMPLETE'",
-                            (cycle,)).fetchone()[0]
+    completed = con.execute("SELECT COUNT(*) FROM trade_sets s LEFT JOIN orders o ON o.id=s.order_id "
+                            "WHERE s.cycle=? AND (s.state='COMPLETE' OR (s.state='FAILED' AND "
+                            "COALESCE(o.filled_qty, 0) > 0))", (cycle,)).fetchone()[0]
     params = [cycle]
     exclusion = ""
     if exclude_set_id is not None:

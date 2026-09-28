@@ -5,7 +5,8 @@ position = votes x volatility scaling (50% vol target), rounded to what Mudrex a
 two-sided strategy; production entries are migration-gated until the owner's new contract is certified. Exits: the
 judges' trailing midpoint (trend exit, next open) plus a volatility-adaptive exchange bracket on every entry.
 Leverage varies by coin and volatility but never increases the risk-sized quantity. Capital is capped at Rs 5,000.
-Market mood: no positions while BTC is below its 200-day average; unknown mood blocks new entries.
+Market mood: LONG entries only while BTC closes at/above its 200-day average, SHORT entries only below it;
+unknown mood blocks new entries.
 Evidence status: the historical `s1_audit.py` run is NOT evidence for the current owner contract or this strategy
 configuration. It models legacy long-only S1 with fixed 3x ATR stop, no take-profit, fixed leverage, legacy
 percentage caps, and older execution assumptions; it does not implement adaptive risk sizing, two-sided regime

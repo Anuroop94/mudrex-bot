@@ -421,7 +421,7 @@ def test_watcher_undelivered_plan_is_resent_not_regenerated():
 
     def make():
         made.append(1)
-        return dict(plan_id=len(made), created_at=time.time(), live_enabled=True, blocked=None, attempted_sets=0,
+        return dict(plan_id=len(made), created_at=time.time(), live_enabled=True, blocked=None, completed_sets=0,
                     orders=[dict(action="OPEN", coin="XRP", side="LONG", leverage=2, notional_inr=1000,
                                  planned_price=1.5, est_stop=1.2, est_target=1.95, planned_risk_inr=210)])
     orig, orig_log = watcher.notify, watcher.LOG_PATH
@@ -435,6 +435,31 @@ def test_watcher_undelivered_plan_is_resent_not_regenerated():
         assert watcher.maybe_plan(st, make, now_hm="06:00", today="2026-09-28", auto_execute=auto) is True
         assert len(made) == 1                                        # same plan resent, no duplicate plan
         assert sends[0] is sends[1] is None and executions == [1]    # execution starts only after delivery succeeds
+    finally:
+        watcher.notify, watcher.LOG_PATH = orig, orig_log
+
+
+def test_watcher_never_auto_runs_an_approval_set_and_does_not_repeat_idle_messages():
+    import tempfile
+    import watcher
+    sends, runs = [], []
+    orig, orig_log = watcher.notify, watcher.LOG_PATH
+    watcher.LOG_PATH = os.path.join(tempfile.mkdtemp(), "watcher.log")
+    watcher.notify = lambda msg, buttons=None: sends.append(buttons) or True
+    auto = lambda p: runs.append(p["plan_id"]) or ("COMPLETE", [])  # noqa: E731
+    opens = [dict(action="OPEN", coin="XRP", side="LONG", leverage=2, notional_inr=1000, planned_price=1.5,
+                  est_stop=1.2, est_target=1.95, planned_risk_inr=210)]
+    try:
+        extra = lambda: dict(plan_id=9, created_at=time.time(), live_enabled=True, blocked=None,  # noqa: E731
+                             completed_sets=3, needs_approval=True, orders=opens)
+        assert watcher.maybe_plan({}, extra, now_hm="06:00", today="2026-09-28", now=0, auto_execute=auto)
+        assert runs == [] and sends[-1]                              # 4th set: buttons sent, never auto-run
+        st, n = {}, len(sends)
+        idle = lambda: dict(plan_id=None, created_at=time.time(), live_enabled=True, blocked="STOP file present",  # noqa: E731
+                            completed_sets=0, orders=[])
+        for k in range(4):                                           # four 15-minute re-plans, nothing changes
+            assert watcher.maybe_plan(st, idle, now_hm="06:00", today="2026-09-28", now=k * 901, auto_execute=auto)
+        assert len(sends) == n + 1                                   # one message, not four
     finally:
         watcher.notify, watcher.LOG_PATH = orig, orig_log
 

@@ -65,7 +65,7 @@ def plan_message(p):
              "\nValid 3 hours."))
     if p.get("blocked"):
         return text + f"\nBLOCKED: {p['blocked']}. Nothing will be placed.", None
-    if opens and p.get("attempted_sets", 0) < trade_policy.AUTONOMOUS_SETS_PER_CYCLE:
+    if opens and not p.get("needs_approval"):
         return (text + f"\nThese qualified sets are autonomous (sets 1-{trade_policy.AUTONOMOUS_SETS_PER_CYCLE}); "
                 "no approval tap is required.", None)
     return text, [[("Approve", f"approve:{p['plan_id']}"), ("Reject", f"reject:{p['plan_id']}")]]

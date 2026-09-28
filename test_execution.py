@@ -1203,6 +1203,20 @@ def test_reconcile_never_fails_a_young_or_acknowledged_order():
     fake.stop()
 
 
+def test_filled_then_failed_set_counts_but_rejected_set_does_not():
+    """A fill followed by a fail-safe exit used a set (money moved); a definite rejection did not."""
+    tmp, fake, client, con = setup()
+    cycle = trade_policy.cycle_id()
+    pid = plan(con, ["XRP", "ADA"])
+    rows = {r["coin"]: r for r in con.execute("SELECT * FROM orders WHERE plan_id=?", (pid,))}
+    for coin, filled in (("XRP", 6.4), ("ADA", None)):
+        con.execute("UPDATE trade_sets SET cycle=?, state='FAILED', attempted_at=? WHERE id=?",
+                    (cycle, int(time.time()), rows[coin]["set_id"]))
+        con.execute("UPDATE orders SET state='FAILED', filled_qty=? WHERE id=?", (filled, rows[coin]["id"]))
+    assert ex.cycle_set_counts(con, cycle) == (1, 0)
+    fake.stop()
+
+
 if __name__ == "__main__":
     tests = [v for k, v in dict(globals()).items() if k.startswith("test_")]
     for t in tests:
