@@ -22,6 +22,7 @@ import pick_coins
 import portfolio as pf
 import s1
 import s1_audit as audit
+import s4
 import strategy
 
 HOUR, DAY = 3600, 86400
@@ -62,16 +63,7 @@ def load(coins, rows):
             continue
         if len(cs) < 24 * 400:
             continue
-        closes = [x[4] for x in cs]
-        hh, ll = pf.prior_extremes([x[2] for x in cs], 24)[0], pf.prior_extremes([x[3] for x in cs], 24)[1]
-        sma, sd = [None] * len(cs), [None] * len(cs)
-        for i in range(20, len(cs)):
-            w = closes[i - 19:i + 1]
-            m = sum(w) / 20
-            sma[i], sd[i] = m, math.sqrt(sum((x - m) ** 2 for x in w) / 20)
-        D["f"][c] = dict(t=[x[0] for x in cs], o=[x[1] for x in cs], h=[x[2] for x in cs], l=[x[3] for x in cs],
-                         c=closes, atr=strategy.atr(cs, 14), rsi=strategy.rsi(closes, 14), hh=hh, ll=ll,
-                         sma=sma, sd=sd, idx={x[0]: i for i, x in enumerate(cs)})
+        D["f"][c] = s4.coin_features(cs)
         D["trend"][c] = pf.zarattini(daily, **kw)
         D.setdefault("datr", {})[c] = dict(zip([x[0] for x in daily], strategy.atr(daily, 14)))
         r = rows[c]
@@ -81,49 +73,7 @@ def load(coins, rows):
     return D
 
 
-def setups(D, t, kind, regime_filter=True):
-    """[(score, coin, side)] for signals at the CLOSE of hour t (entry at t+1's open), best first."""
-    day = (t // DAY) * DAY - DAY                                    # last CLOSED daily bar
-    mood = s1.btc_mood(D["btc"], day)
-    if mood is None:
-        return []
-    out = []
-    for c in D["coins"]:
-        f = D["f"][c]
-        i = f["idx"].get(t)
-        if i is None or i < 30 or not f["atr"][i]:
-            continue
-        tr = D["trend"][c].get(day, 0)
-        up_ok = tr > 0 and (mood or not regime_filter)
-        dn_ok = tr < 0 and (not mood or not regime_filter)
-        cl, a = f["c"][i], f["atr"][i]
-        if kind == "BRK":
-            if up_ok and f["hh"][i] and cl > f["hh"][i] and f["c"][i - 1] <= (f["hh"][i - 1] or 1e18):
-                out.append(((cl - f["hh"][i]) / a, c, "LONG"))
-            if dn_ok and f["ll"][i] and cl < f["ll"][i] and f["c"][i - 1] >= (f["ll"][i - 1] or 0):
-                out.append(((f["ll"][i] - cl) / a, c, "SHORT"))
-        elif kind == "PULL":
-            if up_ok and f["rsi"][i] < 30 <= f["rsi"][i - 1]:
-                out.append((30 - f["rsi"][i], c, "LONG"))
-            if dn_ok and f["rsi"][i] > 70 >= f["rsi"][i - 1]:
-                out.append((f["rsi"][i] - 70, c, "SHORT"))
-        elif kind == "MR" and f["sd"][i]:                         # fades extremes: ignores BTC mood on purpose,
-                                                                    # only refuses to fade the coin's own daily trend
-            z = (cl - f["sma"][i]) / f["sd"][i]
-            if z < -2.5 and f["rsi"][i] < 25 and tr >= 0:
-                out.append((-z, c, "LONG"))
-            if z > 2.5 and f["rsi"][i] > 75 and tr <= 0:
-                out.append((z, c, "SHORT"))
-        elif kind == "MOM" and i >= 24:
-            r24 = cl / f["c"][i - 24] - 1
-            if up_ok and r24 > 0:
-                out.append((r24 / (a / cl), c, "LONG"))
-            if dn_ok and r24 < 0:
-                out.append((-r24 / (a / cl), c, "SHORT"))
-    out.sort(reverse=True)
-    if kind == "MOM":                                               # momentum: only the single strongest per side
-        out = out[:1]
-    return out
+setups = s4.setups                                                  # shared with live trading
 
 
 def run(D, kind, tp, sl, hold, max_coins=2, regime_filter=True, start=None, end=None, scale="h", target_first=False):

@@ -134,7 +134,8 @@ def maybe_plan(st, make_plan, now_hm=None, today=None, auto_execute=None, now=No
         # changes, or Telegram gets ~75 identical messages a day. Actionable plans are always sent.
         sig = [p.get("blocked"), sorted((o.get("action"), o.get("coin"), o.get("side")) for o in p.get("orders", [])
                                         if o.get("action") in ("OPEN", "CLOSE"))]
-        repeat = not actionable and st.get("last_plan_sig") == sig
+        repeat = ((not actionable and buttons is None and st.get("last_plan_sig") == sig) or
+                  bool(p.get("plan_id") and p.get("plan_id") == st.get("last_plan_id")))   # same plan: sent already
         sent = True if repeat else notify(text, buttons=buttons)
         if not sent:
             raise ConnectionError("Telegram delivery failed")                 # retry later; plan_day not saved
@@ -143,9 +144,14 @@ def maybe_plan(st, make_plan, now_hm=None, today=None, auto_execute=None, now=No
         st["plan_last_at"], st["plan_next_at"] = now, now + PLAN_INTERVAL_SEC
         st["plan_fails"], st["plan_retry_at"] = 0, 0
         st.pop("pending_plan", None)
-        st["last_plan_sig"] = sig
+        st["last_plan_sig"], st["last_plan_id"] = sig, p.get("plan_id")
         # A set above the autonomous three waits for its own Telegram tap (approver runs it); never auto-run it.
-        if auto_execute and opens and actionable and not p.get("needs_approval"):
+        # A plan that only CLOSES bot positions (e.g. S4 maximum hold) is risk-reducing: it runs by itself once the
+        # autonomous mode is certified (execution still refuses while STOP is present).
+        closes = [o for o in p.get("orders", []) if o.get("action") == "CLOSE"]
+        auto_close = (bool(closes) and not opens and p.get("plan_id") and p.get("live_enabled")
+                      and trade_policy.migration_block_reason() is None)
+        if auto_execute and ((opens and actionable and not p.get("needs_approval")) or auto_close):
             try:
                 final, summary = auto_execute(p)
                 notify(f"Autonomous plan {p['plan_id']} finished {final}:\n" + "\n".join(summary))

@@ -46,24 +46,31 @@ def send(text, buttons=None):
     return call("sendMessage", **kw)
 
 
+def _tag(p):
+    return str(p.get("strategy") or "S1").split()[0]
+
+
 def plan_message(p):
     """Render every plan update; first-three qualified sets are informational, not approval-gated."""
     todo = [o for o in p["orders"] if o["action"] in ("OPEN", "CLOSE")]
     if not todo:
-        return "S1: no orders today." + (f" New entries blocked: {p['blocked']}." if p.get("blocked") else ""), None
+        return f"{_tag(p)}: nothing to do now." + (f" New entries blocked: {p['blocked']}." if p.get("blocked") else ""), None
     if not (p.get("plan_id") and p.get("live_enabled")):
-        return f"S1 plan {p.get('plan_id')}: {len(todo)} order(s), but LIVE_TRADING_ENABLED is false.", None
+        return f"{_tag(p)} plan {p.get('plan_id')}: {len(todo)} order(s), but LIVE_TRADING_ENABLED is false.", None
     opens = [o for o in todo if o["action"] == "OPEN"]
     lines = [f"{o['action']} {o['coin']}" + (f" {o.get('side', 'LONG')} {o.get('leverage', 0):g}x"
                                              f" ~Rs {o['notional_inr']:,.0f}, SL {o['est_stop']},"
                                              f" TP {o.get('est_target')}, risk Rs {o.get('planned_risk_inr', 0):,.0f}"
                                              if o["action"] == "OPEN" else "") for o in todo]
     risk = sum(o.get("planned_risk_inr", 0) for o in opens)
-    text = (f"S1 plan {p['plan_id']}: {len(todo)} order(s)\n" + "\n".join(lines) +
+    text = (f"{_tag(p)} plan {p['plan_id']}: {len(todo)} order(s)\n" + "\n".join(lines) +
             (f"\nPlanned collective reserve for these sets: Rs {risk:,.0f}; cycle hard cap Rs {trade_policy.DAILY_LOSS_LIMIT_INR:,.0f}."
              f"\nValid 15 min." if opens else
              "\nValid 3 hours."))
-    if p.get("blocked"):
+    if not opens and trade_policy.migration_block_reason() is None:
+        # closes only (e.g. S4 maximum hold): risk-reducing, run by the watcher; STOP still pauses them
+        return text + "\nRisk-reducing close: it runs automatically (no tap needed).", None
+    if p.get("blocked") and opens:
         return text + f"\nBLOCKED: {p['blocked']}. Nothing will be placed.", None
     if opens and not p.get("needs_approval"):
         return (text + f"\nThese qualified sets are autonomous (sets 1-{trade_policy.AUTONOMOUS_SETS_PER_CYCLE}); "

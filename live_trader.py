@@ -24,6 +24,7 @@ import execution as ex
 import pick_coins
 import portfolio as pf
 import s1
+import s4
 import trade_policy
 import live_universe
 from mudrex_client import Client
@@ -32,6 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PLAN_PATH = os.path.join(HERE, "live_plan.json")
 STATE_PATH = os.path.join(HERE, "live_state.json")
 DAY = pf.DAY
+HOUR = 3600
 
 
 def write_json(path, obj):
@@ -158,6 +160,79 @@ def build_orders(targets, owned, manual_symbols, prices, atrs, specs, size_equit
     return out
 
 
+
+# ---------- S4: intraday momentum sets (owner 2026-09-27)
+
+STRATEGY = "S4"          # "S4" intraday sets (owner's rule: intraday); "S1" = daily two-sided trend (Codex build)
+
+
+def s4_orders(owned, opened_at, D, datr, specs, now, blocked, rate, bot_eq, realized_pnls=(),
+              active_stop_risks=(), available_slots=3, cost_buffer_inr=10.0):
+    """S4 plan actions (s4.py). Held bot positions: CLOSE once s4.HOLD_H hours old, else HOLD (the exchange
+    stop-loss / take-profit exits them). A new set ONLY when no bot position is open: sets are sequential.
+    owned: {coin: {id, side}}; opened_at: {position_id: exchange open time}; D: s4.setups input for the coins
+    that may be ENTERED (verified universe, no manual position, fresh hourly data); datr: {coin: last daily ATR}."""
+    out = []
+    for c, h in sorted(owned.items()):
+        age = now - (opened_at.get(h["id"]) or now)
+        if age >= s4.HOLD_H * HOUR:
+            out.append(dict(action="CLOSE", coin=c, position_id=h["id"],
+                            reason=f"S4 maximum hold of {s4.HOLD_H}h reached"))
+        else:
+            out.append(dict(action="HOLD", coin=c, reason=f"S4 set open {age / 3600:.0f}h; exchange SL/TP manage it"))
+    why = ("a set is open; the next set starts after it closes" if owned else blocked or
+           ("daily set limit reached" if available_slots <= 0 else None))
+    if why:
+        return out + [dict(action="SKIP", coin="-", reason=why)]
+    t = now // HOUR * HOUR - HOUR                                  # last CLOSED hour
+    found = s4.setups(D, t)
+    if not found:
+        return out + [dict(action="SKIP", coin="-", reason="no qualified intraday setup this hour")]
+    _, c, side = found[0]
+    s, a, px = specs[c], datr.get(c), D["f"][c]["c"][-1]
+    if not a or not px or a <= 0:
+        return out + [dict(action="SKIP", coin=c, reason="daily ATR missing: no bracket possible")]
+    d = 1 if side == "LONG" else -1
+    stop, target = px - d * s4.SL_DATR * a, px + d * s4.TP_DATR * a
+    try:
+        trade_policy.validate_bracket(side, px, stop, target)
+        remaining = adaptive_risk.remaining_daily_risk(realized_pnls, active_stop_risks, cost_buffer_inr)
+    except ValueError as e:
+        return out + [dict(action="SKIP", coin=c, reason=f"bracket/risk veto: {e}")]
+    risk = min(s4.SET_RISK_INR, remaining)
+    per_unit = s4.SL_DATR * a * rate
+    step = s["step"]
+    qty = math.floor(risk / per_unit / step + 1e-9) * step
+    alloc = min(float(bot_eq), float(s1.CAPITAL_CAP_INR))
+    qty = min(qty, math.floor(s4.MAX_NOTIONAL_LEV * alloc / (px * rate) / step + 1e-9) * step)
+    notional = qty * px * rate
+    max_lev = min(float(s.get("max_leverage") or 1), adaptive_risk.HARD_MAX_LEVERAGE)
+    lev = max(1, math.ceil(notional / alloc - 1e-9)) if alloc > 0 else 0
+    if qty < s["min_qty"] or qty * px < s["min_notional"] or not lev or lev > max_lev:
+        return out + [dict(action="SKIP", coin=c, reason="risk-sized order below Mudrex minimum or above margin")]
+    planned_risk = qty * per_unit + cost_buffer_inr
+    out.append(dict(action="OPEN", coin=c, side=side, planned_price=px, notional_inr=round(notional, 2), qty=qty,
+                    atr=a, stop_loss=stop, take_profit=target, est_stop=round(stop, 8), est_target=round(target, 8),
+                    leverage=float(lev), planned_risk_inr=round(planned_risk, 2), confidence=1.0,
+                    volatility_tier="s4", reason=f"S4 {side.lower()} momentum (strongest 24h mover)"))
+    return out
+
+
+
+def reuse_close_plan(con, todo, now, margin=15 * 60):
+    """A close-only plan identical to the pending one is REUSED instead of recorded again every 15 minutes: the
+    owner's Approve button stays valid and Telegram is not flooded. Entry plans always use fresh prices."""
+    if not todo or any(o["action"] != "CLOSE" for o in todo):
+        return None
+    prev = ex.latest_plan(con)
+    if prev is None or prev["state"] != "PLANNED" or now - prev["created_at"] > ex.PLAN_MAX_AGE - margin:
+        return None
+    rows = con.execute("SELECT action, coin, position_id FROM orders WHERE plan_id=? ORDER BY coin",
+                       (prev["id"],)).fetchall()
+    want = sorted((o["action"], o["coin"], o.get("position_id")) for o in todo)
+    return prev["id"] if [tuple(r) for r in rows] == want else None
+
+
 # ---------- plan
 
 def plan(client=None, con=None):
@@ -242,23 +317,42 @@ def plan(client=None, con=None):
     # Sets 1-3 are autonomous; above that ONE set per plan, so each extra set is bound to one Telegram approval.
     needs_approval = completed_sets >= trade_policy.AUTONOMOUS_SETS_PER_CYCLE
     available_slots = (1 if trade_policy.HUMAN_OVERRIDE_ABOVE_MAX else 0) if needs_approval else         trade_policy.MAX_SETS_PER_CYCLE - completed_sets
-    candidate_keys = [(c, "LONG" if targets.get(c, 0) > 0 else "SHORT")
-                      for c in entry_basket if targets.get(c, 0)]
-    learned = bounded_learning.decisions_from_db(con, candidate_keys, now)
-    orders = build_orders(targets, owned, manual, {c: closes[c].get(last_closed) for c in basket},
-                          {c: atrs[c].get(last_closed) for c in basket}, specs, bot_eq, st["armed"], blocked,
-                          rate or config.INR_PER_USDT, bad, realized_pnls, active_risks, available_slots,
-                          completed_sets=completed_sets, basket=basket, model_decisions=learned,
-                          entry_basket=entry_basket)
+    if STRATEGY == "S4":
+        D = dict(coins=[], f={}, trend={}, btc=btc)
+        last_hour = now // HOUR * HOUR - HOUR
+        for c in entry_basket:
+            if c in manual or c in bad:
+                continue
+            try:
+                cs = data.load(s4.HOURLY_DAYS_LIVE, f"{c}/USDT", "1h", HOUR)
+            except Exception:                                   # noqa: BLE001 - no data: no decision for it
+                continue
+            if cs and cs[-1][0] == last_hour:                   # stale hourly data: no decision for this coin
+                D["f"][c], D["trend"][c] = s4.coin_features(cs), ctx["sig"].get(c, {})
+                D["coins"].append(c)
+        opened_at = {r["position_id"]: r["ex_opened_at"] or r["opened_at"]
+                     for r in con.execute("SELECT position_id, opened_at, ex_opened_at FROM owned")}
+        orders = s4_orders(owned, opened_at, D, {c: atrs[c].get(last_closed) for c in basket}, specs, now, blocked,
+                           rate or config.INR_PER_USDT, bot_eq, realized_pnls, active_risks, available_slots)
+    else:
+        candidate_keys = [(c, "LONG" if targets.get(c, 0) > 0 else "SHORT")
+                          for c in entry_basket if targets.get(c, 0)]
+        learned = bounded_learning.decisions_from_db(con, candidate_keys, now)
+        orders = build_orders(targets, owned, manual, {c: closes[c].get(last_closed) for c in basket},
+                              {c: atrs[c].get(last_closed) for c in basket}, specs, bot_eq, st["armed"], blocked,
+                              rate or config.INR_PER_USDT, bad, realized_pnls, active_risks, available_slots,
+                              completed_sets=completed_sets, basket=basket, model_decisions=learned,
+                              entry_basket=entry_basket)
     orders.extend(dict(action="HOLD", coin=c,
                        reason="held coin is absent from usable listing data; exchange bracket remains monitored")
                   for c in management_missing)
     todo = [o for o in orders if o["action"] in ("OPEN", "CLOSE")]
     decision = time.strftime("%Y-%m-%d", time.gmtime(last_closed))
-    plan_id = ex.record_plan(con, decision, todo, dict(orders=orders)) if todo else None
+    plan_id = reuse_close_plan(con, todo, now) or (ex.record_plan(con, decision, todo, dict(orders=orders))
+                                                   if todo else None)
     if not todo:
         ex.supersede_pending(con, "superseded by a newer plan with nothing to do")
-    p = dict(plan_id=plan_id, created_at=now, decision_day=decision, strategy=s1.NAME,
+    p = dict(plan_id=plan_id, created_at=now, decision_day=decision, strategy=s4.NAME if STRATEGY == "S4" else s1.NAME,
              mood_ok=mood is True, bot_equity_inr=round(bot_eq, 2), caps=caps,
              hedge_rate=rate, live_enabled=ex.live_enabled(), blocked=blocked, orders=orders,
              cycle=cycle, completed_sets=completed_sets, available_slots=available_slots,
