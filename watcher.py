@@ -244,7 +244,6 @@ def check_approver(st, now=None):
 def check(st, client=None, con=None, make_plan=None):
     client = client or Client()
     con = con or ex.db()
-    ex.retry_alerts(con, _telegram_send)
     ex.recover_ownership(con, client)
     positions = client.positions()
     owned = ex.owned_ids(con)
@@ -344,6 +343,9 @@ def check(st, client=None, con=None, make_plan=None):
             st["warned_stuck"].append(key)
 
     guard = journal_and_guard(st, con, client, sum(v["upnl_inr"] for v in view if v["bot"]))
+    # queued Telegram retries AFTER the position/bracket checks: a Telegram outage (up to one 40 s timeout per
+    # retry pass) must never delay stop-loss monitoring
+    ex.retry_alerts(con, _telegram_send)
     if make_plan is None:
         import live_trader
         make_plan = lambda: live_trader.plan(client, con)   # noqa: E731
