@@ -37,14 +37,25 @@ def status_text():
         return "watcher has not reported yet"
     with open(path) as f:
         s = json.load(f)
-    pos = "\n".join(f"  {p['symbol']} {p['side']} P&L Rs {p['upnl_inr']:+,.0f} "
-                    f"SL {p['sl'] or 'NONE'} TP {p.get('tp') or 'NONE'}"
-                    f"{'' if p.get('bot') else ' (manual)'}" for p in s.get("positions", [])) or "  none"
     b = s.get("bot", {})
-    return (f"Bot equity Rs {b.get('equity', 0):,.0f} | today {b.get('day_pnl', 0):+,.0f} (caps +/-{b.get('cap', 0):,.0f})"
-            f"\nCap hit: {b.get('cap_hit') or 'no'} | guard: {'TRIPPED' if s.get('guard', {}).get('tripped') else 'ok'}"
-            f" | STOP: {'ON' if os.path.exists(ex.STOP_PATH) else 'off'} | live enabled: {ex.live_enabled()}"
-            f"\nPositions:\n{pos}")
+    stop_on = os.path.exists(ex.STOP_PATH)
+    lines = ["📊 Bot status", "```",
+             f"Equity    ₹{b.get('equity', 0):,.0f}",
+             f"Today     ₹{b.get('day_pnl', 0):+,.0f}   (limit ±₹{b.get('cap', 0):,.0f})",
+             f"Cap hit   {b.get('cap_hit') or 'no'}",
+             f"Guard     {'TRIPPED' if s.get('guard', {}).get('tripped') else 'ok'}",
+             f"STOP      {'ON (dry run)' if stop_on else 'off'}",
+             f"Live      {'yes' if ex.live_enabled() else 'no'}",
+             "```", "Positions"]
+    pos = s.get("positions", [])
+    if not pos:
+        return "\n".join(lines + ["none"])
+    lines.append("```")
+    for p in pos:
+        lines.append(f"{p['symbol'].removesuffix('USDT'):<6} {p['side']:<5} ₹{p['upnl_inr']:+,.0f}"
+                     f"{'' if p.get('bot') else '  (manual)'}")
+        lines.append(f"  SL {p['sl'] or 'NONE'}   TP {p.get('tp') or 'NONE'}")
+    return "\n".join(lines + ["```"])
 
 
 def tg_alert(msg):
